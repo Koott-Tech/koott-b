@@ -45,6 +45,9 @@ const careerRoutes = require('./routes/careers');
 // Security routes removed - security page removed from admin dashboard
 // const securityRoutes = require('./routes/security');
 const betterParentingRoutes = require('./routes/betterParenting');
+const blogRoutes = require('./routes/blogs');
+const counsellingRoutes = require('./routes/counselling');
+const publicRoutes = require('./routes/public');
 const financeRoutes = require('./routes/finance');
 const wixWebhookRoutes = require('./routes/wixWebhooks');
 
@@ -870,6 +873,9 @@ app.use('/api/events', eventsRoutes);
 app.use('/api/assessments', assessmentsRoutes);
 app.use('/api/better-parenting', betterParentingRoutes);
 app.use('/api/careers', careerRoutes);
+app.use('/api/blogs', blogRoutes);
+app.use('/api/counselling', counsellingRoutes);
+app.use('/api/public', publicRoutes);
 app.use('/api/finance', financeRoutes);
 app.use('/api/wix/webhook', wixWebhookRoutes);
 

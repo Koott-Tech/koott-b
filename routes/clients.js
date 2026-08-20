@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const clientController = require('../controllers/clientController');
+const assessmentBookingController = require('../controllers/assessmentBookingController');
 const { authenticateToken, requireClient } = require('../middleware/auth');
 const { 
   validateClientProfile 
@@ -35,6 +36,12 @@ router.post('/book-remaining-session', clientController.bookRemainingSession);
 
 // Reserve time slot for payment
 router.post('/reserve-slot', clientController.reserveTimeSlot);
+
+// Assessment booking
+router.post('/assessments/reserve-slot', assessmentBookingController.reserveAssessmentSlot);
+router.post('/assessments/book', assessmentBookingController.bookAssessment);
+router.get('/assessments/sessions', assessmentBookingController.getAssessmentSessions);
+router.put('/assessments/sessions/:assessmentSessionId/reschedule', assessmentBookingController.rescheduleAssessmentSession);
 
 
 
