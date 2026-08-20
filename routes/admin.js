@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
 const sessionController = require('../controllers/sessionController');
+const psychologistController = require('../controllers/psychologistController');
 const { authenticateToken, requireAdmin, requireEventOrganizer } = require('../middleware/auth');
 const { createRateLimiters } = require('../middleware/security');
 const multer = require('multer');
@@ -280,6 +281,12 @@ router.get('/bookings/packages-with-remaining', adminController.getPackagesWithR
 router.get('/bookings/package-labels', adminController.getPackageLabels);
 
 // Reschedule request handling
+// Assessment sessions. deleteAssessmentSession already branches on an admin role
+// (admins may delete any session, psychologists only their own), but its only route lived
+// under /api/psychologists, which requirePsychologist blocks admins from — so the admin UI's
+// delete button 404'd. This is the route it has always called.
+router.delete('/assessment-sessions/:assessmentSessionId', psychologistController.deleteAssessmentSession);
+
 router.get('/reschedule-requests', adminController.getRescheduleRequests);
 
 // Assessment session rescheduling (admin can reschedule directly)
