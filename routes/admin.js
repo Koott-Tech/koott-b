@@ -202,6 +202,9 @@ router.post('/upload/document', requireEventOrganizer, uploadDoc.single('file'),
 // Psychologists accessible by both Admin and Event Organizer (for dropdowns)
 router.get('/psychologists', requireEventOrganizer, adminController.getAllPsychologists);
 
+// Therapist roster with booking activity (replaces the old Wix therapist-discovery screen)
+router.get('/therapists/summary', adminController.getTherapistsSummary);
+
 // All remaining routes require Admin
 router.use(requireAdmin);
 

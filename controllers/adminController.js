@@ -12,7 +12,7 @@ const { deriveSessionCount } = require('../services/packageService');
 const availabilityService = require('../utils/availabilityCalendarService');
 const { getMeetEventDurationMinutes } = require('../utils/sessionMeetDuration');
 const { getBookingTimeColumnKey } = require('../utils/sessionsBookingTimeColumn');
-const { getCalendarYmdInTimeZone } = require('../utils/sessionBookingCreatedAt');
+const { getCalendarYmdInTimeZone, getSessionBookingCreatedAtIso } = require('../utils/sessionBookingCreatedAt');
 const {
   buildKoottSessionDescription,
   buildKoottSessionTitle,
@@ -5550,7 +5550,128 @@ const deleteEventRegistration = async (req, res) => {
   }
 };
 
+
+/**
+ * Therapist roster with booking activity — the native replacement for the old
+ * Wix "therapists discovered from the booking mirror" screen.
+ *
+ * That screen existed because Wix bookings carried a therapist NAME with no foreign key,
+ * so therapists had to be discovered from booking payloads and matched back to the
+ * psychologists table by name/email. Native bookings carry psychologist_id, so this
+ * aggregates sessions by that FK instead — no fuzzy matching, no unlinked rows.
+ *
+ * Optional ?dateFrom / ?dateTo (IST calendar YYYY-MM-DD) scope the counts the same way the
+ * bookings page does: a session counts if it was SCHEDULED in the range or BOOKED in it.
+ */
+const getTherapistsSummary = async (req, res) => {
+  try {
+    const { dateFrom, dateTo } = req.query;
+
+    const { data: psychologists, error: psychErr } = await supabaseAdmin
+      .from('psychologists')
+      .select('id, email, first_name, last_name, phone, designation, profile_picture_url, cover_image_url, description, experience_years, area_of_expertise, created_at, google_calendar_credentials')
+      .limit(5000);
+
+    if (psychErr) {
+      return res.status(500).json(errorResponse('Failed to load psychologists', psychErr.message));
+    }
+
+    let sessionQuery = supabaseAdmin
+      .from('sessions')
+      .select('id, psychologist_id, status, price, scheduled_date, created_at, booking_created_at, source')
+      .neq('session_type', 'free_assessment');
+
+    if (dateFrom && dateTo) {
+      sessionQuery = sessionQuery.or(
+        `and(scheduled_date.gte.${dateFrom},scheduled_date.lte.${dateTo}),` +
+        `and(created_at.gte.${dateFrom}T00:00:00.000+05:30,created_at.lte.${dateTo}T23:59:59.999+05:30)`
+      );
+    } else if (dateFrom) {
+      sessionQuery = sessionQuery.gte('created_at', `${dateFrom}T00:00:00.000+05:30`);
+    } else if (dateTo) {
+      sessionQuery = sessionQuery.lte('created_at', `${dateTo}T23:59:59.999+05:30`);
+    }
+
+    const { data: sessions, error: sessErr } = await sessionQuery;
+    if (sessErr) {
+      return res.status(500).json(errorResponse('Failed to load sessions', sessErr.message));
+    }
+
+    // Aggregate per psychologist_id.
+    const stats = new Map();
+    let unassignedBookings = 0;
+    for (const s of sessions || []) {
+      if (!s.psychologist_id) { unassignedBookings += 1; continue; }
+      let row = stats.get(s.psychologist_id);
+      if (!row) {
+        row = { bookingsCount: 0, completedCount: 0, revenue: 0, latestBookingAt: null };
+        stats.set(s.psychologist_id, row);
+      }
+      row.bookingsCount += 1;
+      if (String(s.status || '').toLowerCase() === 'completed') row.completedCount += 1;
+      row.revenue += parseFloat(s.price) || 0;
+      const bookedAt = getSessionBookingCreatedAtIso(s);
+      if (bookedAt && (!row.latestBookingAt || bookedAt > row.latestBookingAt)) {
+        row.latestBookingAt = bookedAt;
+      }
+    }
+
+    const therapists = (psychologists || []).map((p) => {
+      const st = stats.get(p.id) || { bookingsCount: 0, completedCount: 0, revenue: 0, latestBookingAt: null };
+      return {
+        name: `${p.first_name || ''} ${p.last_name || ''}`.trim() || null,
+        email: p.email || null,
+        phone: p.phone || null,
+        bookingsCount: st.bookingsCount,
+        completedCount: st.completedCount,
+        revenue: Math.round(st.revenue),
+        latestBookingAt: st.latestBookingAt,
+        psychologist: {
+          id: p.id,
+          email: p.email,
+          phone: p.phone,
+          firstName: p.first_name,
+          lastName: p.last_name,
+          designation: p.designation,
+          profilePictureUrl: p.profile_picture_url,
+          // Snake_case duplicates: the therapists page prefills its edit form straight from
+          // this object and reads the DB column names.
+          profile_picture_url: p.profile_picture_url,
+          cover_image_url: p.cover_image_url,
+          description: p.description,
+          experience_years: p.experience_years,
+          area_of_expertise: p.area_of_expertise,
+          createdAt: p.created_at,
+          google_calendar_connected: !!p.google_calendar_credentials,
+        },
+      };
+    }).sort((a, b) => {
+      // Most recently active first; never-booked therapists fall to the bottom by name.
+      if (a.latestBookingAt && b.latestBookingAt) return b.latestBookingAt.localeCompare(a.latestBookingAt);
+      if (a.latestBookingAt) return -1;
+      if (b.latestBookingAt) return 1;
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+
+    return res.json(successResponse({
+      therapists,
+      summary: {
+        therapistCount: therapists.length,
+        // The page's footer reads this name.
+        psychologistsTableCount: therapists.length,
+        linkedCount: therapists.filter((t) => t.bookingsCount > 0).length,
+        bookingsScanned: (sessions || []).length,
+        unassignedBookings,
+      },
+    }));
+  } catch (error) {
+    console.error('[getTherapistsSummary]', error);
+    return res.status(500).json(errorResponse('Failed to build therapist summary', error.message));
+  }
+};
+
 module.exports = {
+  getTherapistsSummary,
   getAllUsers,
   getUserDetails,
   updateUserRole,

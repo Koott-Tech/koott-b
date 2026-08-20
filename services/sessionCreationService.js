@@ -114,7 +114,12 @@ const createSessionFromSlotLock = async (slotLock) => {
       status: 'booked',
       price: paymentRecord.amount,
       payment_id: paymentRecord.id,
-      original_scheduled_date: slotLock.scheduled_date
+      original_scheduled_date: slotLock.scheduled_date,
+      // Bookings the client made themselves on the site. Admin-created rows carry
+      // 'admin_manual'; labelling these explicitly lets the admin list separate the two
+      // rather than inferring "website" from a NULL source.
+      source: 'website',
+      booking_created_at: new Date().toISOString()
     };
 
     // Add package_id if available (not individual session)

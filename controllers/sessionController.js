@@ -476,6 +476,10 @@ const getAllSessions = async (req, res) => {
     };
     const applySourceFilter = (q) => {
       if (!sourceFilter || sourceFilter === 'all') return q;
+      // Client-made bookings are labelled 'website'. Rows created before that label existed
+      // have a NULL source and are also client bookings, so treat NULL as website too —
+      // otherwise the Website tab silently hides them.
+      if (sourceFilter === 'website') return q.or('source.is.null,source.eq.website');
       return q.eq('source', sourceFilter);
     };
 
