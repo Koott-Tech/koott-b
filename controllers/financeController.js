@@ -24,7 +24,6 @@ const FINANCE_BOOKING_TOTAL_STATUSES = [
 const IST_DAY_START_SUFFIX = 'T00:00:00.000+05:30';
 const IST_DAY_END_SUFFIX = 'T23:59:59.999+05:30';
 const { getBookingTimeColumnKey, appendBookingTimeSelectFragment } = require('../utils/sessionsBookingTimeColumn');
-const { enrichSessionRowDisplayFields, hydrateSessionsWixPayloadFromMirror } = require('../utils/wixSessionRowEnrichment');
 
 const dayjs = require('dayjs');
 const timezone = require('dayjs/plugin/timezone');
@@ -221,23 +220,9 @@ function sanitizeReceiptFileName(value = 'koott-receipt.pdf') {
   return cleaned.toLowerCase().endsWith('.pdf') ? cleaned : `${cleaned || 'koott-receipt'}.pdf`;
 }
 
-function isHiddenWixListRow(session) {
-  const src = String(session?.source || '').toLowerCase();
-  if (src !== 'wix') return false;
-  const wp = session?.wix_payload;
-  const missingSessionId = !wp || typeof wp !== 'object' || !wp.sessionId;
-  const isUndefinedWix = !session?.payment_id && missingSessionId;
-  const isPackageChild = Number(session?.package_session_number || 1) > 1;
-  return isUndefinedWix || isPackageChild;
-}
-
 function isCoupleSessionLike(session) {
   const sessionTypeText = String(session?.session_type || '').toLowerCase();
-  const payloadText = `${session?.wix_payload?.bookingType || ''} ${session?.wix_payload?.booking_type || ''} ${session?.wix_payload?.session_type || ''}`.toLowerCase();
-  return sessionTypeText.includes('couple') ||
-    sessionTypeText.includes('cpl') ||
-    payloadText.includes('couple') ||
-    payloadText.includes('cpl');
+  return sessionTypeText.includes('couple') || sessionTypeText.includes('cpl');
 }
 
 function getFinancePackageType(session, packageMeta = null) {
@@ -575,7 +560,7 @@ const getDashboard = async (req, res) => {
       const buildDashSessionsQuery = () => {
         let q = supabaseAdmin
           .from('sessions')
-          .select(`id, scheduled_date, original_scheduled_date, price, psychologist_id, client_id, status, payment_id, session_type, created_at, booking_created_at, ${dashBcf} wix_payload, package_id, source, package_session_number, session_count`)
+          .select(`id, scheduled_date, original_scheduled_date, price, psychologist_id, client_id, status, payment_id, session_type, created_at, booking_created_at, ${dashBcf} package_id, source, package_session_number, session_count`)
           .in('status', ['completed', 'booked', 'pending', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
           .neq('session_type', 'free_assessment');
         // Not all-time: from the start of the year, enough for the MTD/QTD/YTD cards.
@@ -589,7 +574,7 @@ const getDashboard = async (req, res) => {
       if (sessionsError && String(sessionsError.message || '').includes('payment_id')) {
         let fbQuery1 = supabaseAdmin
           .from('sessions')
-          .select(`id, scheduled_date, original_scheduled_date, price, psychologist_id, client_id, status, session_type, created_at, booking_created_at, ${dashBcf} wix_payload, package_id, source, package_session_number, session_count`)
+          .select(`id, scheduled_date, original_scheduled_date, price, psychologist_id, client_id, status, session_type, created_at, booking_created_at, ${dashBcf} package_id, source, package_session_number, session_count`)
           .in('status', ['completed', 'booked', 'pending', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
           .neq('session_type', 'free_assessment');
         if (!allTimeMode) {
@@ -597,11 +582,11 @@ const getDashboard = async (req, res) => {
         }
         ({ data: sessions, error: sessionsError } = await fbQuery1.order('created_at', { ascending: false }).limit(5000));
       }
-      // Optional column until migration applies — still derives booking time from wix_payload / created_at
+      // Optional column until migration applies — still derives booking time from created_at
       if (sessionsError && /booking_created_at/i.test(String(sessionsError.message || ''))) {
         let fbQuery2 = supabaseAdmin
           .from('sessions')
-          .select(`id, scheduled_date, original_scheduled_date, price, psychologist_id, client_id, status, payment_id, session_type, created_at, ${dashBcf} wix_payload, package_id, source, package_session_number, session_count`)
+          .select(`id, scheduled_date, original_scheduled_date, price, psychologist_id, client_id, status, payment_id, session_type, created_at, ${dashBcf} package_id, source, package_session_number, session_count`)
           .in('status', ['completed', 'booked', 'pending', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
           .neq('session_type', 'free_assessment');
         if (!allTimeMode) {
@@ -614,7 +599,7 @@ const getDashboard = async (req, res) => {
         ) {
           let fbQuery3 = supabaseAdmin
             .from('sessions')
-            .select(`id, scheduled_date, original_scheduled_date, price, psychologist_id, client_id, status, session_type, created_at, ${dashBcf} wix_payload, package_id, source, package_session_number, session_count`)
+            .select(`id, scheduled_date, original_scheduled_date, price, psychologist_id, client_id, status, session_type, created_at, ${dashBcf} package_id, source, package_session_number, session_count`)
             .in('status', ['completed', 'booked', 'pending', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
             .neq('session_type', 'free_assessment');
           if (!allTimeMode) {
@@ -654,7 +639,7 @@ const getDashboard = async (req, res) => {
     // Calculate revenue metrics
     // Include all sessions where payment was made (regardless of final status)
     // Statuses: completed, booked, rescheduled, reschedule_requested, no_show, cancelled
-    // Dashboard picker (mtdFrom/mtdTo): IST calendar strings; booking-day rollups match Wix Admin India + DB +05:30 bounds below.
+    // Dashboard picker (mtdFrom/mtdTo): IST calendar strings; booking-day rollups use the DB +05:30 bounds below.
     // QTD/YTD tiles: remain on therapy/scheduled date (original_scheduled_date) for fiscal-style rollups.
     const calculateRevenue = (sessions, fromDate, toDate, opts = {}) => {
       if (!sessions || !Array.isArray(sessions)) {
@@ -897,7 +882,7 @@ const getDashboard = async (req, res) => {
       .in('status', ['booked'])
       .gte('scheduled_date', today.toISOString().split('T')[0]);
 
-    // Total sessions card: distinct bookings (packages share payment_id; Wix shares wix_payload.sessionId). IST booking day; same psych roster as doctors.
+    // Total sessions card: distinct bookings (a package's sessions share one payment_id). IST booking day; same psych roster as doctors.
     let totalSessions = 0;
     try {
       const rowsForCard = sessionsData.filter((s) => {
@@ -1015,7 +1000,7 @@ const getDashboard = async (req, res) => {
       .slice(0, 3)
       .map(([id, data]) => ({ psychologist_id: id, total_commission: data.revenue, session_count: data.session_count }));
 
-    // Get recent bookings: latest 3 by client booking instant (Wix createdDate when known)
+    // Get recent bookings: latest 3 by client booking instant
     const recentSessionsFiltered = filteredSessionsForDisplay
       .filter(shouldIncludeInRevenue)
       .sort((a, b) => {
@@ -1068,7 +1053,7 @@ const getDashboard = async (req, res) => {
       const pkgBcf = appendBookingTimeSelectFragment(dashBookingTimeCol);
       const { data: allPkgSessions } = await supabaseAdmin
         .from('sessions')
-        .select(`id, client_id, package_id, created_at, ${pkgBcf} wix_payload, source`)
+        .select(`id, client_id, package_id, created_at, ${pkgBcf} source`)
         .in('package_id', recentPackageIds)
         .order(dashBookingTimeCol, { ascending: true });
       const counterByClientPackage = {};
@@ -1183,7 +1168,7 @@ const getDashboard = async (req, res) => {
         // We'll filter in the processing loop based on different criteria for each metric
         let allSessionsQuery = supabaseAdmin
           .from('sessions')
-          .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, payment_id, created_at, updated_at, completion_date, package_session_number, session_count, booking_created_at, wix_payload, source')
+          .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, payment_id, created_at, updated_at, completion_date, package_session_number, session_count, booking_created_at, source')
           .not('psychologist_id', 'is', null)
           .neq('session_type', 'free_assessment')
           .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
@@ -1204,7 +1189,7 @@ const getDashboard = async (req, res) => {
         if (allSessionsError && String(allSessionsError.message || '').includes('payment_id')) {
           allSessionsQuery = supabaseAdmin
             .from('sessions')
-            .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, created_at, updated_at, completion_date, package_session_number, session_count, booking_created_at, wix_payload, source')
+            .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, created_at, updated_at, completion_date, package_session_number, session_count, booking_created_at, source')
             .not('psychologist_id', 'is', null)
             .neq('session_type', 'free_assessment')
             .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
@@ -1217,7 +1202,7 @@ const getDashboard = async (req, res) => {
         if (allSessionsError && /booking_created_at/i.test(String(allSessionsError.message || ''))) {
           allSessionsQuery = supabaseAdmin
             .from('sessions')
-            .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, payment_id, created_at, updated_at, completion_date, package_session_number, session_count, wix_payload, source')
+            .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, payment_id, created_at, updated_at, completion_date, package_session_number, session_count, source')
             .not('psychologist_id', 'is', null)
             .neq('session_type', 'free_assessment')
             .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
@@ -1229,7 +1214,7 @@ const getDashboard = async (req, res) => {
           if (allSessionsError && String(allSessionsError.message || '').includes('payment_id')) {
             allSessionsQuery = supabaseAdmin
               .from('sessions')
-              .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, created_at, updated_at, completion_date, package_session_number, session_count, wix_payload, source')
+              .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, created_at, updated_at, completion_date, package_session_number, session_count, source')
               .not('psychologist_id', 'is', null)
               .neq('session_type', 'free_assessment')
               .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
@@ -2489,16 +2474,14 @@ const getSessions = async (req, res) => {
     const normalizedDateBasis = String(dateBasis || 'scheduled').toLowerCase() === 'booked' ? 'booked' : 'scheduled';
     const shouldIncludeUnpaid = String(includeUnpaid || 'false').toLowerCase() === 'true';
 
-    // Exclude free assessments. Finance sessions can optionally include unpaid Wix rows
-    // so the page can mirror the admin/Wix booking lists when needed.
+    // Exclude free assessments. Finance sessions can optionally include unpaid rows
+    // so the page can mirror the admin booking list when needed.
     let query = supabaseAdmin
       .from('sessions')
       .select(`
         id,
         created_at,
         ${sessBcf}
-        wix_payload,
-        wix_booking_id,
         scheduled_date,
         scheduled_time,
         price,
@@ -2508,7 +2491,6 @@ const getSessions = async (req, res) => {
         client_id,
         session_type,
         source,
-        wix_order_number,
         package_session_number,
         session_count,
         package_id,
@@ -2519,13 +2501,12 @@ const getSessions = async (req, res) => {
 
     if (!shouldIncludeUnpaid) {
       // Include paid sessions OR manual/plan-credit sessions (price > 0, no payment_id)
-      // Plan-credit Wix sessions (inPerson vendor) have no payment_id but are real paid sessions.
-      // Also include ₹0 package follow-ups (they belong to a paid package) so a package's later
-      // sessions show alongside its paid first session — matching the Wix Discovery page.
+      // Also include ₹0 package follow-ups (they belong to a paid package) so a package's
+      // later sessions show alongside its paid first session.
       query = query.or('payment_id.not.is.null,source.eq.admin_manual,price.gt.0,package_group_id.not.is.null');
     }
 
-    // Apply date filter. Match the admin Wix Discovery page: a session belongs to a month if
+    // Apply date filter. A session belongs to a month if
     // it was either SCHEDULED in that month OR BOOKED in that month (OR-union). So a
     // July-booked / August-scheduled session shows under BOTH July AND August — otherwise the
     // 'booked' basis hides August-scheduled bookings from the August view (they were booked in
@@ -2573,13 +2554,6 @@ const getSessions = async (req, res) => {
     // Ensure sessions is an array
     let sessionsData = sessions || [];
 
-    // Upgrade bare therapist-only wix_payload stubs to the full Wix payload from the
-    // wix_bookings mirror — otherwise Wix rows (which have null client_id/psychologist_id)
-    // have no client name/email/therapist to display. Mirrors the admin Wix Discovery page.
-    if (sessionsData.length) {
-      await hydrateSessionsWixPayloadFromMirror(supabaseAdmin, sessionsData);
-    }
-
     // Apply search filter after fetching (search by session ID only)
     if (search) {
       const searchLower = search.toLowerCase();
@@ -2609,25 +2583,19 @@ const getSessions = async (req, res) => {
       }
     }
 
-    // A Wix booking counts as PAID via its wix_payload (paymentState COMPLETE/PAID, or a
-    // real positive price) even when it has no row in the `payments` table — Wix payments
-    // live in wix_payload, not `payments`. Without this, Wix sessions (the bulk of a month,
-    // e.g. August) silently vanish from the finance list even though they show on the admin
-    // Wix Discovery page. Mirrors that page's "real paid booking" rule.
-    const isPaidWixRow = (s) => {
-      if (!s.wix_booking_id && String(s.source || '').toLowerCase() !== 'wix') return false;
-      const p = s.wix_payload || {};
-      const state = String(p.paymentState || p.paymentDetails?.state || '').toUpperCase();
-      if (state === 'COMPLETE' || state === 'PAID') return true;
-      if (Number(s.price) > 0) return true;                       // real-priced Wix booking
-      // ₹0 package follow-up belonging to a (paid) package
+    // A session with no `payments` row still counts as PAID when it is an admin-recorded
+    // booking with a real price, or a ₹0 package follow-up belonging to an already-paid
+    // package. Without this, every later session of a package silently vanishes from the
+    // finance list even though its package was paid for up front.
+    const isPaidWithoutPaymentRow = (s) => {
+      if (Number(s.price) > 0) return true;
       if (s.package_group_id || s.package_id || Number(s.session_count) > 1) return true;
       return false;
     };
 
     const sessionsForResponse = shouldIncludeUnpaid
       ? sessionsData
-      : sessionsData.filter(s => (s.payment_id && successfulPaymentIds.includes(s.payment_id)) || isPaidWixRow(s));
+      : sessionsData.filter(s => (s.payment_id && successfulPaymentIds.includes(s.payment_id)) || isPaidWithoutPaymentRow(s));
 
     // Get commission data for each session
     const sessionIds = sessionsForResponse.map(s => s?.id).filter(Boolean);
@@ -2662,28 +2630,12 @@ const getSessions = async (req, res) => {
     psychologists.push(...(psychRes.data || []));
     clients.push(...(clientRes.data || []));
 
-    // Wix rows have null client_id/psychologist_id — their client & therapist live in the
-    // wix_bookings mirror's flat columns (exactly what the admin Wix Discovery page reads).
-    // Batch-fetch them so finance rows show the same name/email/phone/therapist.
-    const wixBookingIds = [...new Set(sessionsData.map(s => s?.wix_booking_id).filter(Boolean))];
-    const wixMirrorMap = {};
-    {
-      const { data: wbRows } = await selectByIdsChunked(
-        'wix_bookings',
-        'wix_booking_id, client_full_name, client_first_name, client_last_name, client_email, client_phone, therapist_name',
-        'wix_booking_id', wixBookingIds);
-      (wbRows || []).forEach(r => { wixMirrorMap[r.wix_booking_id] = r; });
-    }
-
     const sessionsWithCommission = sessionsForResponse.map(session => {
       if (!session) return null;
       const commission = commissions.find(c => c.session_id === session.id);
       const psychologist = psychologists.find(p => p.id === session.psychologist_id);
       const client = clients.find(c => c.id === session.client_id);
-      
-      const mirror = session.wix_booking_id ? wixMirrorMap[session.wix_booking_id] : null;
 
-      // Client: FK client → Wix mirror flat columns → (wix_payload via enrich below).
       let clientObj = client ? {
         id: client.id,
         first_name: client.first_name,
@@ -2691,32 +2643,15 @@ const getSessions = async (req, res) => {
         child_name: client.child_name,
         phone_number: client.phone_number || null,
         email: client.email || null,
-        // Frontend reads client.user.email (mirrors the admin/Wix pages) — nest it too.
+        // Frontend reads client.user.email — nest it too.
         user: client.email ? { email: client.email } : undefined,
       } : null;
-      if (!clientObj && mirror && (mirror.client_full_name || mirror.client_first_name || mirror.client_email)) {
-        clientObj = {
-          id: null,
-          first_name: mirror.client_first_name || mirror.client_full_name || null,
-          last_name: mirror.client_last_name || null,
-          child_name: null,
-          phone_number: mirror.client_phone || null,
-          email: mirror.client_email || null,
-          user: mirror.client_email ? { email: mirror.client_email } : undefined,
-        };
-      }
 
-      // Therapist: FK psychologist → Wix mirror therapist_name.
       let psychObj = psychologist ? {
         id: psychologist.id,
         first_name: psychologist.first_name,
         last_name: psychologist.last_name,
       } : null;
-      if (!psychObj && mirror?.therapist_name) {
-        const parts = String(mirror.therapist_name).trim().split(/\s+/);
-        psychObj = { id: null, first_name: parts[0] || mirror.therapist_name, last_name: parts.slice(1).join(' ') || null };
-      }
-
       const built = {
         ...session,
         booking_created_at: getSessionBookingCreatedAtIso(session),
@@ -2731,16 +2666,12 @@ const getSessions = async (req, res) => {
         net_company_revenue: commission?.net_company_revenue || 0,
         commission_payment_status: commission?.payment_status || null,
         source: session.source || 'platform',
-        wix_order_number: session.wix_order_number,
         package_session_number: session.package_session_number,
         session_count: session.session_count,
         package_id: session.package_id,
         // Payment proof image for manual booking approval popup
         receipt_url: session.payment_id ? (paymentReceiptMap[session.payment_id] || null) : null,
       };
-      // For Wix rows the FK client/psychologist are null — fill name/email/therapist/price
-      // from wix_payload so the finance list shows the same detail as the Wix Discovery page.
-      enrichSessionRowDisplayFields(built);
       return built;
     }).filter(Boolean);
     
@@ -2758,7 +2689,6 @@ const getSessions = async (req, res) => {
       });
     }
 
-    finalSessions = finalSessions.filter((s) => !isHiddenWixListRow(s));
     const totalVisibleSessions = finalSessions.length;
     const offset = (safePage - 1) * safeLimit;
     const paginatedSessions = finalSessions.slice(offset, offset + safeLimit);
@@ -2837,7 +2767,7 @@ const buildDoctorFinanceProfilePayload = async (psychologistId, { dateFrom, date
 
     let q = supabaseAdmin
       .from('sessions')
-      .select('id, scheduled_date, scheduled_time, status, session_type, session_count, package_id, package_group_id, package_session_number, price, amount, therapist_commission, client_id, source, wix_order_number, payment_id, completion_date, created_at, booking_created_at, wix_payload')
+      .select('id, scheduled_date, scheduled_time, status, session_type, session_count, package_id, package_group_id, package_session_number, price, amount, therapist_commission, client_id, source, payment_id, completion_date, created_at, booking_created_at')
       .eq('psychologist_id', psychologistId)
       .neq('session_type', 'free_assessment');
 
@@ -2860,7 +2790,6 @@ const buildDoctorFinanceProfilePayload = async (psychologistId, { dateFrom, date
       throw err;
     }
     if (sessions?.length) {
-      await hydrateSessionsWixPayloadFromMirror(supabaseAdmin, sessions);
     }
 
     // Client names/emails. Keep this flat and fast: embedded user joins are noticeably
@@ -2984,13 +2913,12 @@ const buildDoctorFinanceProfilePayload = async (psychologistId, { dateFrom, date
       for (let i = 0; i < groupIds.length; i += 100) {
         const { data: sib } = await supabaseAdmin
           .from('sessions')
-          .select('id, status, session_type, session_count, package_id, package_group_id, package_session_number, price, amount, therapist_commission, wix_payload')
+          .select('id, status, session_type, session_count, package_id, package_group_id, package_session_number, price, amount, therapist_commission')
           .eq('psychologist_id', psychologistId)
           .in('package_group_id', groupIds.slice(i, i + 100));
         siblings.push(...(sib || []));
       }
       if (siblings.length) {
-        await hydrateSessionsWixPayloadFromMirror(supabaseAdmin, siblings);
       }
       for (const sib of siblings) {
         if (TERMINAL_UNPAID.includes(String(sib.status || '').toLowerCase())) continue;
@@ -3047,7 +2975,7 @@ const buildDoctorFinanceProfilePayload = async (psychologistId, { dateFrom, date
       const paymentSource = isAdminPayment ? 'admin' : (s.source || 'razorpay');
       return {
         session_id: s.id,
-        order_id: s.wix_order_number || s.payment_id || null,
+        order_id: s.payment_id || null,
         session_date: s.scheduled_date,
         session_time: s.scheduled_time,
         booked_at: s.booking_created_at || s.created_at,
@@ -3156,7 +3084,7 @@ const getDoctorBookings = async (req, res) => {
     let query = supabaseAdmin
       .from('sessions')
       .select(
-        `id,${docSelBcf}created_at,wix_payload,source,scheduled_date,scheduled_time,status,payment_id,wix_order_number,client_id`,
+        `id,${docSelBcf}created_at,source,scheduled_date,scheduled_time,status,payment_id,client_id`,
         { count: 'exact' }
       )
       .eq('psychologist_id', psychologistId)
@@ -3213,7 +3141,7 @@ const getDoctorBookings = async (req, res) => {
       const c = clientById.get(s.client_id);
       return {
         id: s.id,
-        order_id: s.wix_order_number || s.payment_id || s.id,
+        order_id: s.payment_id || s.id,
         booked_at: getSessionBookingCreatedAtIso(s),
         session_date: s.scheduled_date || null,
         session_time: s.scheduled_time || null,
@@ -3383,18 +3311,6 @@ const getSessionDetails = async (req, res) => {
       }
     }
 
-    // Extract Razorpay / payment gateway info from wix_payload for Wix sessions
-    const wixPayDetails = session.wix_payload?.paymentDetails || null;
-    const wixVendorDetails = wixPayDetails?.wixPayMultipleDetails?.[0] || null;
-    const wixPaymentInfo = wixVendorDetails ? {
-      vendor: wixVendorDetails.paymentVendorName || null,           // e.g. "Razorpay"
-      razorpay_order_id: wixVendorDetails.orderId || null,          // Razorpay order ID from Wix
-      wix_transaction_id: wixVendorDetails.txId || null,            // Wix transaction ID
-      order_status: wixVendorDetails.orderStatus || null,           // e.g. "COMPLETE"
-      amount: wixVendorDetails.orderAmount || null,
-      approved_at: wixVendorDetails.orderApprovalTime || null,
-    } : null;
-
     // Get commission data
     const { data: commission } = await supabaseAdmin
       .from('commission_history')
@@ -3456,7 +3372,7 @@ const getSessionDetails = async (req, res) => {
         doctorAmount = parseFloat(dp.couple_session ?? dp.cpl_session ?? cs.doctor_commission_individual ?? 0) || 0;
       } else if (isPackage) {
         doctorAmount = parseFloat(dp.package_followup ?? cs.doctor_commission_followup_package ?? cs.doctor_commission_followup ?? 0) || 0;
-        // If the package doctor rate exceeds the session price (e.g. per-session Wix package priced
+        // If the package doctor rate exceeds the session price (e.g. per-session package priced
         // individually), fall back to the per-session individual followup rate to avoid company = 0.
         if (doctorAmount >= amount) {
           const fallback = parseFloat(cs.doctor_commission_followup ?? cs.doctor_commission_individual ?? 0) || 0;
@@ -3524,9 +3440,6 @@ const getSessionDetails = async (req, res) => {
       session: {
         id: session.id,
         source: session.source || null,
-        wix_booking_id: session.wix_booking_id || null,
-        wix_order_number: session.wix_order_number || null,
-        wix_payload: session.wix_payload || null,
         scheduled_date: session.scheduled_date,
         scheduled_time: session.scheduled_time,
         session_date: session.scheduled_date,   // legacy alias
@@ -3560,7 +3473,6 @@ const getSessionDetails = async (req, res) => {
           email: session.client.email || session.client.user?.email || null,
         } : null,
         payment: paymentDetails,
-        wix_payment: wixPaymentInfo,
         receipt: receiptDetails,
         is_first_session: isFirstSession,
         commission: commission || null,
@@ -4886,7 +4798,7 @@ const getCommissions = async (req, res) => {
     // This ensures: Completed + Pending = Total (always consistent)
     // ─────────────────────────────────────────────────────────────────────────
 
-    const sessionSelectFields = `id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, status, created_at, completion_date, ${commSessionsBcf} wix_payload, source, package_session_number, session_count`;
+    const sessionSelectFields = `id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, status, created_at, completion_date, ${commSessionsBcf} source, package_session_number, session_count`;
 
     // Derive view-month IST date boundaries
     let viewMonthStart = null;
@@ -4963,7 +4875,7 @@ const getCommissions = async (req, res) => {
       
       // For each client, mark the first paid session as first session
       Object.values(sessionsByClient).forEach(clientSessions => {
-        // Sort by client booking instant (Wix payload time when available), then scheduled date.
+        // Sort by client booking instant, then scheduled date.
         const sortedSessions = clientSessions.sort((a, b) => {
           const dateA = new Date(getSessionBookingCreatedAtIso(a) || a.scheduled_date || 0);
           const dateB = new Date(getSessionBookingCreatedAtIso(b) || b.scheduled_date || 0);
@@ -5363,8 +5275,6 @@ const getCommissions = async (req, res) => {
         upcoming_sessions: unifiedUpcomingSessions,
         completed_sessions: unifiedCompletedSessions,
         cancelled_sessions: 0,
-        wix_bookings_count: 0,
-        latest_wix_booking_at: null,
         total_revenue: unifiedGrossRevenue,
         gross_revenue: unifiedGrossRevenue,
         total_commission_to_company: unifiedCompanyEarnings,
@@ -5896,7 +5806,6 @@ const getPendingPayouts = async (req, res) => {
         psychologist_id,
         client_id,
         session_type,
-        wix_booking_id,
         package_id,
         package_session_number,
         scheduled_date,
@@ -5907,7 +5816,6 @@ const getPendingPayouts = async (req, res) => {
         payment_id,
         price,
         session_count,
-        wix_payload,
         psychologist:psychologists!sessions_psychologist_id_fkey(id, first_name, last_name, email, phone, cover_image_url)
       `;
     const completedSessionFallbackSelect = listOnly
@@ -5923,7 +5831,6 @@ const getPendingPayouts = async (req, res) => {
         psychologist_id,
         client_id,
         session_type,
-        wix_booking_id,
         package_id,
         package_session_number,
         scheduled_date,
@@ -5934,7 +5841,6 @@ const getPendingPayouts = async (req, res) => {
         payment_id,
         price,
         session_count,
-        wix_payload,
         psychologist:psychologists!sessions_psychologist_id_fkey(id, first_name, last_name, email, phone)
       `;
     const completedScheduledFallbackSelect = listOnly
@@ -5951,7 +5857,6 @@ const getPendingPayouts = async (req, res) => {
         psychologist_id,
         client_id,
         session_type,
-        wix_booking_id,
         package_id,
         package_session_number,
         scheduled_date,
@@ -5960,7 +5865,6 @@ const getPendingPayouts = async (req, res) => {
         payment_id,
         price,
         session_count,
-        wix_payload,
         psychologist:psychologists!sessions_psychologist_id_fkey(id, first_name, last_name, email, phone)
       `;
     const notDueSessionSelect = listOnly
@@ -6046,7 +5950,6 @@ const getPendingPayouts = async (req, res) => {
     // Payout eligibility is based on completion status, not payment row availability.
     const completedSessionsWithPayments = completedSessions || [];
     if (!listOnly && completedSessionsWithPayments.length) {
-      await hydrateSessionsWixPayloadFromMirror(supabaseAdmin, completedSessionsWithPayments);
     }
 
     let notDueSessions = null;
@@ -6081,7 +5984,6 @@ const getPendingPayouts = async (req, res) => {
 
     const visibleNotDueSessions = notDueSessions || [];
     if (!listOnly && visibleNotDueSessions.length) {
-      await hydrateSessionsWixPayloadFromMirror(supabaseAdmin, visibleNotDueSessions);
     }
 
     if (sessionsError) throw sessionsError;

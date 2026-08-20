@@ -21,39 +21,6 @@ const {
 const { assertClientPackageHasAvailableSlot } = require('../services/packageService');
 const { notifySessionTransfer } = require('../utils/sessionTransferNotifier');
 const { getMeetEventDurationMinutes } = require('../utils/sessionMeetDuration');
-const {
-  enrichSessionRowDisplayFields,
-  hydrateSessionsWixPayloadFromMirror,
-} = require('../utils/wixSessionRowEnrichment');
-
-/**
- * isHiddenWixListRow expressed as a PostgREST filter, so the admin list can paginate in SQL
- * instead of pulling every row and filtering in memory.
- *
- * Keep the two in lockstep. Verified equal across all 3012 sessions (2696 visible by both).
- * A row is VISIBLE when it is not a Wix row, or it is a Wix row that both has an identity
- * (payment_id, or a sessionId/id in wix_payload) and is not a package follow-up.
- */
-const VISIBLE_LIST_ROWS_FILTER = [
-  'source.is.null',
-  'source.neq.wix',
-  'and(' +
-    'or(package_session_number.is.null,package_session_number.lte.1),' +
-    'or(payment_id.not.is.null,wix_payload->>sessionId.not.is.null,wix_payload->>id.not.is.null)' +
-  ')',
-].join(',');
-
-function isHiddenWixListRow(session) {
-  const src = String(session?.source || '').toLowerCase();
-  if (src !== 'wix') return false;
-  const wp = session?.wix_payload;
-  // wp.id is the Wix booking ID — treat it as equivalent to sessionId
-  const missingSessionId = !wp || typeof wp !== 'object' || (!wp.sessionId && !wp.id);
-  const isUndefinedWix = !session?.payment_id && missingSessionId;
-  const isPackageChild = Number(session?.package_session_number || 1) > 1;
-  return isUndefinedWix || isPackageChild;
-}
-
 function isPendingAdminSessionStatus(status) {
   return ['booked', 'scheduled', 'rescheduled', 'reschedule_requested', 'confirmed'].includes(
     String(status || '').toLowerCase()
@@ -356,7 +323,7 @@ const getAllSessions = async (req, res) => {
     const { supabaseAdmin } = require('../config/supabase');
     const adminBookingTimeCol = await getBookingTimeColumnKey(supabaseAdmin);
 
-    const { page = 1, limit = 10, status, session_type, psychologist_id, client_id, date, dateFrom, dateTo, sort = 'created_at', order = 'desc', search = '', wix_booking_id, source } = req.query;
+    const { page = 1, limit = 10, status, session_type, psychologist_id, client_id, date, dateFrom, dateTo, sort = 'created_at', order = 'desc', search = '', source } = req.query;
     const pageNumber = Math.max(1, parseInt(String(page), 10) || 1);
     const pageLimit = Math.min(500, Math.max(1, parseInt(String(limit), 10) || 10));
     const startIndex = (pageNumber - 1) * pageLimit;
@@ -379,10 +346,7 @@ const getAllSessions = async (req, res) => {
     };
 
     let statusList = normalizeStatusList(status);
-    const wixBookingIds = normalizeTextList(wix_booking_id);
-    const requestReferrer = String(req.get('referer') || req.get('referrer') || '');
-    const isWixDiscoverReferrer = /\/admin\/wix-discover(?:[/?#]|$)/.test(requestReferrer);
-    const sourceFilter = String(source || (isWixDiscoverReferrer ? 'non_wix' : '')).trim().toLowerCase();
+    const sourceFilter = String(source || '').trim().toLowerCase();
     const isPendingFilter = statusList.length === 1 && statusList[0].toLowerCase() === 'pending';
     const searchTerm = String(search || '').trim();
     const loweredSearchTerm = searchTerm.toLowerCase();
@@ -512,12 +476,6 @@ const getAllSessions = async (req, res) => {
     };
     const applySourceFilter = (q) => {
       if (!sourceFilter || sourceFilter === 'all') return q;
-      if (['non_wix', 'non-wix', 'platform'].includes(sourceFilter)) {
-        return q.or('source.is.null,source.neq.wix');
-      }
-      if (sourceFilter === 'wix') {
-        return q.eq('source', 'wix');
-      }
       return q.eq('source', sourceFilter);
     };
 
@@ -532,9 +490,6 @@ const getAllSessions = async (req, res) => {
       countQuery = countQuery.neq('status', 'cancelled');
     }
 
-    // Exclude the rows isHiddenWixListRow would drop, so `total` matches what is rendered.
-    countQuery = countQuery.or(VISIBLE_LIST_ROWS_FILTER);
-
     // Apply same filters for count
     countQuery = applySessionStatusFilter(countQuery);
     countQuery = applySourceFilter(countQuery);
@@ -546,11 +501,6 @@ const getAllSessions = async (req, res) => {
     }
     if (client_id) {
       countQuery = countQuery.eq('client_id', client_id);
-    }
-    if (wixBookingIds.length === 1) {
-      countQuery = countQuery.eq('wix_booking_id', wixBookingIds[0]);
-    } else if (wixBookingIds.length > 1) {
-      countQuery = countQuery.in('wix_booking_id', wixBookingIds);
     }
     if (date) {
       countQuery = countQuery.eq('scheduled_date', date);
@@ -587,16 +537,10 @@ const getAllSessions = async (req, res) => {
     // this project's schema cache. Email is fetched separately below and
     // reattached as client.user.email so the frontend contract is preserved.
     //
-    // NOTE: We intentionally do NOT select `wix_payload` here. It is a large JSONB
-    // blob (~2.4KB/row) and this query fetches ALL matching rows (900+) before
-    // in-memory pagination. Including it produced a ~4MB response that got truncated
-    // mid-stream by the hosting proxy → "SyntaxError: Expected ',' or '}' after
-    // property value" in postgrest-js JSON.parse. wix_payload is re-loaded in small
-    // id-chunks below (loadWixPayloadForSessions) before enrichment needs it.
     let query = supabaseAdmin
       .from('sessions')
       .select(`
-        id,client_id,psychologist_id,package_id,session_type,status,scheduled_date,scheduled_time,original_scheduled_date,original_scheduled_time,google_meet_link,google_meet_join_url,google_meet_start_url,google_calendar_link,notes,summary,summary_notes,report,completion_date,feedback,rating,client_feedback,price,amount,created_at,updated_at,source,wix_booking_id,locally_modified,therapist_commission,package_group_id,package_session_number,session_count,payment_id,session_summary,session_notes,wix_order_number,booking_created_at,notified_at,google_calendar_event_id,reminder_sent,is_first_session,payment_verified,payment_verified_at,original_psychologist_id,google_calendar_id,email_sent_at,whatsapp_sent_at,email_error,whatsapp_error,notification_alert_sent,
+        id,client_id,psychologist_id,package_id,session_type,status,scheduled_date,scheduled_time,original_scheduled_date,original_scheduled_time,google_meet_link,google_meet_join_url,google_meet_start_url,google_calendar_link,notes,summary,summary_notes,report,completion_date,feedback,rating,client_feedback,price,amount,created_at,updated_at,source,locally_modified,therapist_commission,package_group_id,package_session_number,session_count,payment_id,session_summary,session_notes,booking_created_at,notified_at,google_calendar_event_id,reminder_sent,is_first_session,payment_verified,payment_verified_at,original_psychologist_id,google_calendar_id,email_sent_at,whatsapp_sent_at,email_error,whatsapp_error,notification_alert_sent,
         client:clients(
           id,
           user_id,
@@ -618,9 +562,6 @@ const getAllSessions = async (req, res) => {
     if (!isCancelledTab) {
       query = query.neq('status', 'cancelled'); // Hide cancelled rows for non-cancelled tabs
     }
-    // Same visibility rule as the count, so SQL pagination returns exactly the rendered rows.
-    query = query.or(VISIBLE_LIST_ROWS_FILTER);
-
     console.log('Supabase query built, executing...');
 
     // Apply filters
@@ -634,11 +575,6 @@ const getAllSessions = async (req, res) => {
     }
     if (client_id) {
       query = query.eq('client_id', client_id);
-    }
-    if (wixBookingIds.length === 1) {
-      query = query.eq('wix_booking_id', wixBookingIds[0]);
-    } else if (wixBookingIds.length > 1) {
-      query = query.in('wix_booking_id', wixBookingIds);
     }
     if (date) {
       query = query.eq('scheduled_date', date);
@@ -670,19 +606,8 @@ const getAllSessions = async (req, res) => {
       }
     }
 
-    // Database pagination used to require a source filter, because isHiddenWixListRow ran in
-    // JavaScript and so the page counts could not be computed in SQL. On the default admin view
-    // that meant fetching EVERY matching row to render ten — and PostgREST caps a plain select
-    // at 1000, so with 2961 matching sessions, 1961 of them could not appear on ANY page
-    // (nothing booked before 12 Jul 2026 was reachable).
-    //
-    // VISIBLE_ROWS_FILTER below is the same rule expressed in SQL. It was verified row-by-row
-    // against isHiddenWixListRow across all 3012 sessions: identical sets, zero divergence.
-    // With it applied to both the count and the data query, pagination is correct in SQL and
-    // the JS filter downstream becomes a harmless safety net.
-    //
-    // Still excluded: the "pending" tab (past-due is computed from wall-clock in JS) and the
-    // scheduled_date sort (re-sorted in JS with a time tiebreaker).
+    // Excluded from SQL pagination: the "pending" tab (past-due is computed from wall-clock
+    // in JS) and the scheduled_date sort (re-sorted in JS with a time tiebreaker).
     const canUseDatabasePagination = !isPendingFilter && sort !== 'scheduled_date';
 
     if (canUseDatabasePagination) {
@@ -691,7 +616,6 @@ const getAllSessions = async (req, res) => {
 
     console.log('[getAllSessions] query mode:', {
       sourceFilter: sourceFilter || null,
-      isWixDiscoverReferrer,
       sort,
       statusList,
       page: pageNumber,
@@ -720,47 +644,6 @@ const getAllSessions = async (req, res) => {
       });
     }
 
-    // Re-load wix_payload separately, in small id-chunks, only for Wix-linked rows.
-    // It is excluded from the bulk select above to keep that response small enough to
-    // avoid mid-stream truncation by the hosting proxy. Enrichment (below) only reads
-    // wix_payload for rows where source==='wix' or wix_booking_id is set, so we skip
-    // the rest. Each chunk stays well under the size that corrupts in transit.
-    if (sessions && sessions.length) {
-      const wixLinked = sessions.filter(
-        (s) => String(s.source || '').toLowerCase() === 'wix' || s.wix_booking_id
-      );
-      if (wixLinked.length) {
-        const byId = new Map(wixLinked.map((s) => [s.id, s]));
-        const wixIds = [...byId.keys()];
-        const WP_CHUNK = 150;
-        for (let i = 0; i < wixIds.length; i += WP_CHUNK) {
-          const chunk = wixIds.slice(i, i + WP_CHUNK);
-          const { data: wpRows, error: wpErr } = await supabaseAdmin
-            .from('sessions')
-            .select('id, wix_payload')
-            .in('id', chunk);
-          if (wpErr) {
-            console.warn('[getAllSessions] wix_payload chunk load failed:', wpErr.message || wpErr);
-            continue;
-          }
-          for (const r of wpRows || []) {
-            const s = byId.get(r.id);
-            if (s) s.wix_payload = r.wix_payload;
-          }
-        }
-      }
-    }
-
-    // Replace Velo therapist-only stubs on sessions.wix_payload with full payload from wix_bookings when present
-    if (sessions && sessions.length) {
-      await hydrateSessionsWixPayloadFromMirror(supabaseAdmin, sessions);
-    }
-
-    // Wix rows may lack client/psychologist FKs and DB date/price; derive from wix_payload for list UIs
-    if (sessions && sessions.length) {
-      sessions.forEach((s) => enrichSessionRowDisplayFields(s));
-    }
-
     // Fetch package data for sessions that have package_id
     // Since there's no direct foreign key relationship, fetch separately
     if (sessions && sessions.length > 0) {
@@ -782,7 +665,7 @@ const getAllSessions = async (req, res) => {
           const pkgBcf = appendBookingTimeSelectFragment(adminBookingTimeCol);
           const { data: allPackageSessions, error: allPackageSessionsError } = await supabaseAdmin
             .from('sessions')
-            .select(`id, package_id, client_id, status, created_at, ${pkgBcf} wix_payload, source`)
+            .select(`id, package_id, client_id, status, created_at, ${pkgBcf} source`)
             .in('package_id', packageIds)
             .order(adminBookingTimeCol, { ascending: true });
 
@@ -953,7 +836,7 @@ const getAllSessions = async (req, res) => {
       });
     }
 
-    let visibleSessions = allSessions.filter((s) => !isHiddenWixListRow(s));
+    let visibleSessions = allSessions.slice();
 
     if (isPendingFilter) {
       const nowMs = Date.now();
@@ -1052,16 +935,6 @@ const getAllSessions = async (req, res) => {
       errorResponse('Internal server error while fetching sessions')
     );
   }
-};
-
-const getWixDiscoverPlatformSessions = async (req, res) => {
-  req.query = {
-    ...req.query,
-    source: 'non_wix',
-    sort: req.query.sort || 'created_at',
-    order: req.query.order || 'desc',
-  };
-  return getAllSessions(req, res);
 };
 
 // Get sessions for a specific client
@@ -1936,7 +1809,7 @@ const deleteSession = async (req, res) => {
     // Check if session exists
     const { data: session, error: sessionError } = await supabaseAdmin
       .from('sessions')
-      .select('id, status, wix_booking_id')
+      .select('id, status')
       .eq('id', sessionId)
       .single();
 
@@ -1989,45 +1862,19 @@ const deleteSession = async (req, res) => {
       }
     }
 
-    // Wix sessions: soft-delete (status=cancelled + notified_at=now) so the interval sync
-    // never re-inserts and re-fires notifications. Non-Wix sessions: hard delete as normal.
-    if (session.wix_booking_id) {
-      const { error: softDeleteError } = await supabaseAdmin
-        .from('sessions')
-        .update({
-          status: 'cancelled',
-          notified_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', sessionId);
+    const { error: deleteError } = await supabaseAdmin
+      .from('sessions')
+      .delete()
+      .eq('id', sessionId);
 
-      if (softDeleteError) {
-        console.error('Delete session error (soft):', softDeleteError);
-        return res.status(500).json(errorResponse('Failed to delete session'));
+    if (deleteError) {
+      console.error('Delete session error:', deleteError);
+      if (deleteError.code === '23503') {
+        return res.status(400).json(
+          errorResponse('Cannot delete session: it is still linked to a package. Unlink it first or try again.')
+        );
       }
-
-      // Also mark in wix_bookings so the discover page hides it
-      await supabaseAdmin
-        .from('wix_bookings')
-        .update({ status: 'cancelled', updated_at: new Date().toISOString() })
-        .eq('wix_booking_id', session.wix_booking_id);
-
-    } else {
-      // Hard delete for non-Wix sessions
-      const { error: deleteError } = await supabaseAdmin
-        .from('sessions')
-        .delete()
-        .eq('id', sessionId);
-
-      if (deleteError) {
-        console.error('Delete session error:', deleteError);
-        if (deleteError.code === '23503') {
-          return res.status(400).json(
-            errorResponse('Cannot delete session: it is still linked to a package. Unlink it first or try again.')
-          );
-        }
-        return res.status(500).json(errorResponse('Failed to delete session'));
-      }
+      return res.status(500).json(errorResponse('Failed to delete session'));
     }
 
     res.json(
@@ -2397,18 +2244,6 @@ const completeSession = async (req, res) => {
       );
     }
 
-    // Mirror status to wix_bookings so Wix Discovery page shows completed
-    if (updatedSession?.wix_booking_id) {
-      try {
-        await supabaseAdmin
-          .from('wix_bookings')
-          .update({ status: 'completed', synced_at: new Date().toISOString() })
-          .eq('wix_booking_id', updatedSession.wix_booking_id);
-      } catch (wixMirrorErr) {
-        console.warn('⚠️ Failed to mirror completed status to wix_bookings:', wixMirrorErr.message);
-      }
-    }
-
     // If this is a free assessment, also update the free_assessments table status
     if (isFreeAssessment) {
       try {
@@ -2637,18 +2472,6 @@ const markSessionAsNoShow = async (req, res) => {
       return res.status(500).json(
         errorResponse('Failed to mark session as no-show')
       );
-    }
-
-    // Mirror status to wix_bookings so Wix Discovery page shows no_show
-    if (updatedSession?.wix_booking_id) {
-      try {
-        await supabaseAdmin
-          .from('wix_bookings')
-          .update({ status: 'no_show', synced_at: new Date().toISOString() })
-          .eq('wix_booking_id', updatedSession.wix_booking_id);
-      } catch (wixMirrorErr) {
-        console.warn('⚠️ Failed to mirror no_show status to wix_bookings:', wixMirrorErr.message);
-      }
     }
 
     // No WhatsApp, email, or in-app notification for no-show (per product requirement)
@@ -2909,7 +2732,7 @@ async function transferSession(req, res) {
     if (hasOrigPsychCol && !session.original_psychologist_id) {
       updates.original_psychologist_id = session.psychologist_id;
     }
-    // A transfer that also moves the slot is a reschedule — same rule as the Wix path and
+    // A transfer that also moves the slot is a reschedule — and
     // adminController.updateSession, so the admin list doesn't keep showing "booked".
     if (
       (new_date || new_time) &&
@@ -3000,7 +2823,7 @@ async function transferSession(req, res) {
         // Email the client and the NEW therapist that the session was transferred.
         // This used to send a generic "session confirmation", which never said the therapist
         // had changed — the client just got what looked like a duplicate booking mail. Uses
-        // the same shared notifier as the Wix transfer path so the two cannot diverge.
+        // the shared transfer notifier, so transfer paths cannot diverge.
         const oldPsychForMail = Array.isArray(session.psychologist) ? session.psychologist[0] : session.psychologist;
         await notifySessionTransfer({
           clientName,
@@ -3061,7 +2884,6 @@ module.exports = {
   getClientSessions,
   getPsychologistSessions,
   getAllSessions,
-  getWixDiscoverPlatformSessions,
   getSessionById,
   updateSessionStatus,
   deleteSession,
@@ -3095,7 +2917,7 @@ async function verifyPayment(req, res) {
         updated_at: new Date().toISOString(),
       })
       .eq('id', sessionId)
-      .select('id, payment_verified, payment_verified_at, wix_booking_id')
+      .select('id, payment_verified, payment_verified_at')
       .single();
 
     if (error) {
@@ -3106,23 +2928,6 @@ async function verifyPayment(req, res) {
         ));
       }
       return res.status(500).json(errorResponse(error.message));
-    }
-
-    // Mirror to wix_bookings if linked (store in payload for display)
-    if (data?.wix_booking_id) {
-      try {
-        const { data: wb } = await supabaseAdmin
-          .from('wix_bookings')
-          .select('payload')
-          .eq('wix_booking_id', data.wix_booking_id)
-          .single();
-        if (wb) {
-          await supabaseAdmin
-            .from('wix_bookings')
-            .update({ payload: { ...(wb.payload || {}), payment_verified: true, payment_verified_at: data.payment_verified_at } })
-            .eq('wix_booking_id', data.wix_booking_id);
-        }
-      } catch (_) { /* non-critical */ }
     }
 
     console.log(`✅ [verifyPayment] Session ${sessionId} payment verified by ${verifiedBy}`);
@@ -3145,7 +2950,7 @@ async function cancelRefundSession(req, res) {
     const { data: session, error: fetchErr } = await supabaseAdmin
       .from('sessions')
       .select(`
-        id, status, psychologist_id, client_id, wix_booking_id,
+        id, status, psychologist_id, client_id,
         scheduled_date, scheduled_time, google_calendar_event_id,
         client:clients(id, first_name, last_name, child_name, user:users(email)),
         psychologist:psychologists!sessions_psychologist_id_fkey(id, first_name, last_name, email, google_calendar_credentials)
@@ -3162,14 +2967,6 @@ async function cancelRefundSession(req, res) {
       .update({ status: 'refunded', updated_at: new Date().toISOString() })
       .eq('id', sessionId);
     if (updateErr) return res.status(500).json(errorResponse(updateErr.message));
-
-    // Mirror to wix_bookings if linked
-    if (session.wix_booking_id) {
-      await supabaseAdmin
-        .from('wix_bookings')
-        .update({ status: 'cancelled', synced_at: new Date().toISOString() })
-        .eq('wix_booking_id', session.wix_booking_id);
-    }
 
     // Remove Google Calendar event from therapist's calendar
     let calendarEventRemoved = false;
@@ -3255,14 +3052,14 @@ async function cancelRefundSession(req, res) {
 
 /**
  * PATCH /admin/sessions/:sessionId/cancel-only
- * Platform-session equivalent of cancelOnlyWixBooking. For a client who can't attend but
+ * For a client who can't attend but
  * doesn't want a refund and will reschedule later (date not yet confirmed):
  * - status → 'on_hold' (NOT a refund; money is retained)
  * - Frees the slot: removes the Google Calendar event(s) from the therapist's/client's
  *   calendars so the time reopens.
  * - Keeps the session row (and clears the dead meet/calendar fields) so it can be
  *   rescheduled later once the client confirms a new date/time.
- * - Sends NO notifications — silent pause, matching the Wix On Hold flow.
+ * - Sends NO notifications — silent pause.
  */
 async function cancelOnlySession(req, res) {
   try {
@@ -3271,7 +3068,7 @@ async function cancelOnlySession(req, res) {
     const { data: session, error: fetchErr } = await supabaseAdmin
       .from('sessions')
       .select(`
-        id, status, psychologist_id, wix_booking_id, google_calendar_event_id,
+        id, status, psychologist_id, google_calendar_event_id,
         psychologist:psychologists!sessions_psychologist_id_fkey(id, google_calendar_credentials)
       `)
       .eq('id', sessionId)
@@ -3306,7 +3103,7 @@ async function cancelOnlySession(req, res) {
     }
 
     // 2. Session → on_hold; clear the now-dead calendar/meet fields but keep the row so it
-    //    stays reschedulable. locally_modified stops the next Wix sync from resurrecting it.
+    //    stays reschedulable.
     const { error: updateErr } = await supabaseAdmin
       .from('sessions')
       .update({
@@ -3322,14 +3119,6 @@ async function cancelOnlySession(req, res) {
       })
       .eq('id', sessionId);
     if (updateErr) return res.status(500).json(errorResponse(updateErr.message));
-
-    // 3. Mirror to wix_bookings if linked.
-    if (session.wix_booking_id) {
-      await supabaseAdmin
-        .from('wix_bookings')
-        .update({ status: 'on_hold', locally_modified: true, synced_at: new Date().toISOString() })
-        .eq('wix_booking_id', session.wix_booking_id);
-    }
 
     console.log(`⏸️  [cancelOnlySession] ${sessionId} → on_hold (no refund); slot freed.`);
     return res.json({

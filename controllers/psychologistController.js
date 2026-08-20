@@ -313,46 +313,6 @@ const getSessions = async (req, res) => {
       // Unassigned pending sessions (psychologist_id = null) can be scheduled by any psychologist
       let assessmentSessions = [];
 
-      // ── Wix package session numbering ────────────────────────────────────────
-      // Wix parent sessions (original booking) have package_session_number=null.
-      // Admin follow-ups (book-next) get 2, 3, … so null → infer as #1.
-      // Also propagate session_count across sibling sessions (same client+psychologist)
-      // because admin-created follow-up rows sometimes have session_count=null.
-      const wixPkgSessions = enrichedRegular.filter(
-        s => s.session_type === 'package' && !s.package_id
-      );
-      if (wixPkgSessions.length > 0) {
-        // Group by client_id + psychologist_id to find siblings
-        const groups = {};
-        wixPkgSessions.forEach(s => {
-          const key = `${s.client_id}_${s.psychologist_id}`;
-          if (!groups[key]) groups[key] = [];
-          groups[key].push(s);
-        });
-
-        Object.values(groups).forEach(grp => {
-          // Find the best session_count across all siblings (prefer the highest non-null value)
-          const bestCount = grp.reduce((best, s) => {
-            const c = parseInt(s.session_count, 10);
-            return (!isNaN(c) && c > best) ? c : best;
-          }, 0);
-
-          grp.forEach(s => {
-            // Propagate session_count
-            if (bestCount > 0 && !(parseInt(s.session_count, 10) > 0)) {
-              s.session_count = bestCount;
-            }
-            // Infer session #1 for parent Wix session (null pkg number)
-            if (
-              s.source === 'wix' &&
-              (s.package_session_number === null || s.package_session_number === undefined)
-            ) {
-              s.package_session_number = 1;
-            }
-          });
-        });
-      }
-      // ─────────────────────────────────────────────────────────────────────────
 
       // ── Commission: attach doctor_wallet to each regular session ──────────
       // Priority: 1) commission_history  2) therapist_commission > 0  3) doctor_commissions rates
@@ -394,7 +354,7 @@ const getSessions = async (req, res) => {
           if (!a.scheduled_date && b.scheduled_date) return -1;
           if (a.scheduled_date && !b.scheduled_date) return 1;
           if (!a.scheduled_date && !b.scheduled_date) {
-            // Both pending — order by booking instant when available (Wix), else created_at
+            // Both pending — order by booking instant when available, else created_at
             const tb = getSessionBookingCreatedAtIso(b) || b.created_at;
             const ta = getSessionBookingCreatedAtIso(a) || a.created_at;
             return new Date(tb || 0) - new Date(ta || 0);
@@ -1368,7 +1328,7 @@ const addRecurringBlock = async (req, res) => {
       console.error('Add recurring block error:', error);
       return res.status(500).json(errorResponse(error.message || 'Failed to add recurring block'));
     }
-    // Sync future availability so blocked day has empty/reduced slots in DB (Wix etc. see it as blocked)
+    // Sync future availability so a blocked day has empty/reduced slots in the DB
     await syncFutureAvailabilityForRecurringBlockDay(psychologistId, dayNum, { useDefaultSlots: false });
     res.json(successResponse(block, 'Recurring block saved. It will apply to all future weeks.'));
   } catch (err) {
@@ -1406,7 +1366,7 @@ const deleteRecurringBlock = async (req, res) => {
       console.error('Delete recurring block error:', error);
       return res.status(500).json(errorResponse('Failed to delete recurring block'));
     }
-    // Restore default slots for that day in future availability (so Wix etc. see it as available again)
+    // Restore default slots for that day in future availability (visible as available again)
     if (block?.day_of_week != null) {
       await syncFutureAvailabilityForRecurringBlockDay(psychologistId, block.day_of_week, { useDefaultSlots: true });
     }
@@ -1576,7 +1536,7 @@ const completeSession = async (req, res) => {
 
         // ── TEMPORARILY PAUSED: client follow-up WhatsApp on completion ──
         // Flip to true to re-enable. Only pauses this therapist-marks-complete path;
-        // admin-side completion (wixBookingsController / sessionController) is untouched.
+        // admin-side completion (sessionController) is untouched.
         const DISABLE_CLIENT_FOLLOWUP_WHATSAPP_ON_COMPLETE = true;
         if (DISABLE_CLIENT_FOLLOWUP_WHATSAPP_ON_COMPLETE) {
           console.log(`⏸️ session_follow_up_v2 to client SKIPPED (temporarily paused) for session ${sessionId}`);

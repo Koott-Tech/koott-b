@@ -2436,7 +2436,7 @@ const handlePaymentSuccess = async (req, res) => {
           console.log('📱 Psychologist phone:', psychologistDetails.phone);
           console.log('📱 Meet link available:', !!meetData?.meetLink);
           console.log('📱 Receipt URL available:', !!receiptResult?.fileUrl);
-      // WhatsApp via Interakt templates (same as Wix flow)
+      // WhatsApp via Interakt templates
       const interaktService = require('../utils/interaktService');
 
       const clientName = getClientDisplayName(clientDetails, 'Client');

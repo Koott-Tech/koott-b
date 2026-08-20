@@ -3,9 +3,7 @@
  * built on top of it.
  *
  * Booking time is read from the persisted `booking_created_at` column, falling back to
- * the row's `created_at`. (This module previously also mined Wix booking payloads for a
- * created date; with native booking, `booking_created_at` is written at checkout and is
- * authoritative.)
+ * the row's `created_at`, which is written at checkout.
  */
 function parseIsoFlexible(value) {
   if (value == null || value === '') return null;

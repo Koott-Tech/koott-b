@@ -388,7 +388,7 @@ class CalendarConflictMonitorService {
    * Fix 5 — Detect same-slot double-bookings among ACTIVE sessions.
    * A slot is double-booked when 2+ active sessions share the same
    * psychologist_id + scheduled_date + scheduled_time. This is the symptom of the
-   * Wix-availability/reschedule race; surfacing it lets ops intervene before the
+   * availability/reschedule race; surfacing it lets ops intervene before the
    * sessions actually clash. Returns the number of double-booked slots found.
    */
   async checkSameSlotDoubleBookings() {

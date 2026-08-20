@@ -246,7 +246,7 @@ class SessionReminderService {
       // Therapists do not receive automatic reminders (per product spec).
 
       // Re-fetch the meet link fresh from DB right before sending — the link may have been
-      // created after the initial batch-fetch (e.g. wixMeetNotifyService runs concurrently).
+      // created after the initial batch-fetch (e.g. the Meet repair job runs concurrently).
       const { data: freshRow } = await supabaseAdmin
         .from('sessions')
         .select('google_meet_link')

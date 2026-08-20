@@ -2,8 +2,8 @@
  * Transfer notifications, shared by BOTH transfer endpoints.
  *
  * There are two ways a session changes therapist — `transferSession` (admin-booked / platform)
- * and `transferWixBooking` (Wix). They used to notify differently: the platform path sent a
- * generic "session confirmation" and the Wix path sent NOTHING AT ALL, so a client could have
+ * across transfer paths. They used to notify differently: one path sent a generic
+ * "session confirmation" and the other sent NOTHING AT ALL, so a client could have
  * their therapist and time changed without ever being told. Both now call this, so the two
  * cannot drift apart again.
  *

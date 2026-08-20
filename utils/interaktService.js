@@ -174,7 +174,7 @@ async function sendTemplateWithRetry(toPhone, templateName, languageCode = 'en',
   return result;
 }
 
-// ─── Convenience wrappers for Wix booking flow ─────────────────────────────
+// ─── Convenience wrappers for the booking flow ─────────────────────────────
 
 // Template names — update these to match your actual Interakt template code names.
 // You must create and get these templates approved in Meta Business Manager,
@@ -231,7 +231,7 @@ async function sendBookingConfirmation(toPhone, details) {
 
   return sendTemplateWithRetry(toPhone, TEMPLATES.BOOKING_CONFIRMATION, 'en', {
     bodyValues: [client, specialist, formattedDate, formattedTime, link],
-    callbackData: 'wix_booking_confirmation',
+    callbackData: 'booking_confirmation',
   });
 }
 

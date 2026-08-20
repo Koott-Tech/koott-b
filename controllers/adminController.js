@@ -71,189 +71,6 @@ async function writeSessionDeliveryMarkers(sessionId, fields) {
   }
 }
 
-const buildAdminManualWixMirror = ({
-  syntheticWixBookingId,
-  scheduledDate,
-  scheduledTime,
-  durationMinutes,
-  sessionType,
-  sessionCount,
-  therapistName,
-  therapistEmail,
-  therapistPhone,
-  psychologistId,
-  client,
-  amount,
-  currency = 'INR',
-  packageId = null,
-  sessionId = null,
-  title = null,
-  notes = null,
-}) => {
-  const { startTimeIso, endTimeIso } = buildWixMirrorIsoWindow(scheduledDate, scheduledTime, durationMinutes);
-
-  return {
-    wix_booking_id: syntheticWixBookingId,
-    wix_session_id: syntheticWixBookingId,
-    status: 'booked',
-    session_type: sessionType || 'individual',
-    session_count: sessionCount || 1,
-    package_session_number: sessionCount && sessionCount > 1 ? 1 : null,
-    therapist_name: therapistName || null,
-    client_full_name: `${client?.first_name || ''} ${client?.last_name || ''}`.trim() || client?.child_name || null,
-    client_first_name: client?.first_name || null,
-    client_last_name: client?.last_name || null,
-    client_email: Array.isArray(client?.user) ? client?.user?.[0]?.email || null : client?.user?.email || null,
-    client_phone: client?.phone_number || null,
-    contact_id: client?.user_id || client?.id || null,
-    service_id: psychologistId || null,
-    title: title || therapistName || 'Manual booking',
-    // notes column not present on wix_bookings — pushed into payload instead (see below)
-    start_time: startTimeIso,
-    end_time: endTimeIso,
-    price: amount,
-    currency,
-    synced_at: new Date().toISOString(),
-    locally_modified: true,
-    payload: {
-      id: syntheticWixBookingId,
-      status: 'booked',
-      bookingStatus: 'booked',
-      title: title || therapistName || 'Manual booking',
-      serviceName: therapistName || null,
-      bookingType: sessionType || 'individual',
-      paymentState: 'COMPLETE',
-      startTime: startTimeIso,
-      endTime: endTimeIso,
-      therapist: {
-        name: therapistName || null,
-        email: therapistEmail || null,
-        phone: therapistPhone || null,
-        staffId: psychologistId || null,
-      },
-      client: {
-        firstName: client?.first_name || null,
-        lastName: client?.last_name || null,
-        fullName: `${client?.first_name || ''} ${client?.last_name || ''}`.trim() || client?.child_name || null,
-        email: Array.isArray(client?.user) ? client?.user?.[0]?.email || null : client?.user?.email || null,
-        phone: client?.phone_number || null,
-        contactId: client?.user_id || client?.id || null,
-      },
-      isAdminManual: true,
-      manualBooking: true,
-      packageId,
-      sessionId,
-      notes: notes || null,
-      paymentDetails: {
-        wixPayMultipleDetails: [
-          { paymentVendorName: 'inPerson' }
-        ]
-      }
-    }
-  };
-};
-
-const normalizeManualSessionSelection = (rawType, packageData = null) => {
-  const input = String(rawType || '').trim().toLowerCase();
-  const packageType = String(packageData?.package_type || '').trim().toLowerCase();
-
-  if (packageData) {
-    const isCouplePackage = packageType.includes('couple');
-    return {
-      sessionType: isCouplePackage ? 'couple' : 'package',
-      sessionCount: Number(packageData.session_count) || 1,
-      isPackage: true,
-      isCouplePackage,
-    };
-  }
-
-  if (input === 'couple') {
-    return { sessionType: 'couple', sessionCount: 1, isPackage: false, isCouplePackage: false };
-  }
-  if (input === 'package_3') {
-    return { sessionType: 'package', sessionCount: 3, isPackage: true, isCouplePackage: false };
-  }
-  if (input === 'package_6') {
-    return { sessionType: 'package', sessionCount: 6, isPackage: true, isCouplePackage: false };
-  }
-  if (input === 'package_9') {
-    return { sessionType: 'package', sessionCount: 9, isPackage: true, isCouplePackage: false };
-  }
-  if (input === 'couple_package_3') {
-    return { sessionType: 'couple', sessionCount: 3, isPackage: true, isCouplePackage: true };
-  }
-
-  // Generic package_N / couple_package_N so an admin can book a custom size (e.g. package_5).
-  // Without this, anything other than the hardcoded 3/6/9 fell through to "individual" and the
-  // package silently became a single session.
-  const couplePkg = /^couple_package_(\d+)$/.exec(input);
-  if (couplePkg) {
-    const n = parseInt(couplePkg[1], 10);
-    if (n > 0) return { sessionType: 'couple', sessionCount: n, isPackage: n > 1, isCouplePackage: n > 1 };
-  }
-  const pkg = /^package_(\d+)$/.exec(input);
-  if (pkg) {
-    const n = parseInt(pkg[1], 10);
-    if (n > 0) return { sessionType: 'package', sessionCount: n, isPackage: n > 1, isCouplePackage: false };
-  }
-
-  return { sessionType: 'individual', sessionCount: 1, isPackage: false, isCouplePackage: false };
-};
-
-const getManualSessionDurationMinutes = (sessionType, packageData = null) => {
-  if (packageData?.package_type) {
-    const pkgType = String(packageData.package_type).toLowerCase();
-    if (pkgType.includes('couple')) return 80;
-    return getMeetEventDurationMinutes(packageData.package_type);
-  }
-
-  if (sessionType === 'couple' || sessionType === 'couple_package') {
-    return 80;
-  }
-
-  return 50;
-};
-
-const getManualSessionLabel = (sessionType, sessionStage, packageData = null, sessionCount = 1) => {
-  const stageLabel = sessionStage === 'follow_up' ? 'Follow-up' : 'First session';
-  const totalSessions = Number(packageData?.session_count) || Number(sessionCount) || 1;
-  if (totalSessions > 1) {
-    const prefix = sessionType === 'couple' ? 'Couple package' : 'Package';
-    return `${prefix} of ${totalSessions} (${stageLabel})`;
-  }
-  if (sessionType === 'couple') return `Couple session (${stageLabel})`;
-  return `Individual session (${stageLabel})`;
-};
-
-// Helper function to get availability dates for a day of the week
-const getAvailabilityDatesForDay = (dayName, numOccurrences = 1) => {
-  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-  const dayIndex = days.indexOf(dayName);
-  if (dayIndex === -1) return [];
-  
-  // Use local date directly without timezone conversion
-  const today = new Date();
-  const currentDay = today.getDay();
-  let daysUntilNext = dayIndex - currentDay;
-  
-  // If today is the target day, start from today
-  if (daysUntilNext === 0) {
-    daysUntilNext = 0;
-  } else if (daysUntilNext < 0) {
-    // If the day has passed this week, start from next week
-    daysUntilNext += 7;
-  }
-  
-  const dates = [];
-  for (let occurrence = 0; occurrence < numOccurrences; occurrence++) {
-    const date = new Date(today);
-    date.setDate(today.getDate() + daysUntilNext + (occurrence * 7));
-    dates.push(date);
-  }
-  
-  return dates;
-};
-
 // Escape SQL LIKE/ILIKE special characters (%, _, \) so search string is treated literally
 const escapeLike = (str) => {
   if (str == null || typeof str !== 'string') return '';
@@ -261,27 +78,6 @@ const escapeLike = (str) => {
     .replace(/\\/g, '\\\\')
     .replace(/%/g, '\\%')
     .replace(/_/g, '\\_');
-};
-
-const buildWixMirrorIsoWindow = (scheduledDate, scheduledTime, durationMinutes = 50) => {
-  if (!scheduledDate || !scheduledTime) {
-    return { startTimeIso: null, endTimeIso: null };
-  }
-
-  try {
-    const startLocal = new Date(`${scheduledDate}T${String(scheduledTime).slice(0, 5)}:00+05:30`);
-    if (Number.isNaN(startLocal.getTime())) {
-      return { startTimeIso: null, endTimeIso: null };
-    }
-
-    const safeDuration = Number.isFinite(durationMinutes) && durationMinutes > 0 ? durationMinutes : 50;
-    return {
-      startTimeIso: startLocal.toISOString(),
-      endTimeIso: new Date(startLocal.getTime() + safeDuration * 60000).toISOString(),
-    };
-  } catch (_) {
-    return { startTimeIso: null, endTimeIso: null };
-  }
 };
 
 // NOTE: This file was partially overwritten. Only createManualBooking function is present.
@@ -298,11 +94,11 @@ const buildWixMirrorIsoWindow = (scheduledDate, scheduledTime, durationMinutes =
 // ============================================================================
 // Multi-session package booking — schedule ALL sessions of a package upfront.
 // Creates ONE payment + N sessions (each with its own Google Calendar event,
-// Meet link, Wix-mirror row, and email/WhatsApp), linked by a shared
+// Meet link, and email/WhatsApp), linked by a shared
 // package_group_id. Isolated from createManualBooking (single-session path).
 // ============================================================================
 async function createOneManualPackageSession({
-  client, psychologist, paymentId, packageGroupId, syntheticWixBookingId,
+  client, psychologist, paymentId, packageGroupId,
   sessionType, sessionCount, sessionNumber,
   scheduledDate, scheduledTime, durationMinutes,
   price, therapistCommission, notes,
@@ -354,15 +150,6 @@ async function createOneManualPackageSession({
     updated_at: new Date().toISOString(),
     booking_created_at: new Date().toISOString(),
     original_scheduled_date: scheduledDate,
-    wix_payload: {
-      bookingType: sessionType,
-      packageType: sessionType === 'couple' ? `couple_package_${sessionCount}` : `package_${sessionCount}`,
-      planSessionNumber: sessionNumber,
-      creditsAvailable: sessionCount,
-      isAdminManual: true,
-      manualBooking: true,
-    },
-    // NOTE: wix_booking_id is set AFTER the mirror row exists (FK constraint) — see below.
   };
   if (meetData.eventId) sessionRow.google_calendar_event_id = meetData.eventId;
   if (meetData.meetLink) { sessionRow.google_meet_link = meetData.meetLink; sessionRow.google_meet_join_url = meetData.meetLink; sessionRow.google_meet_start_url = meetData.meetLink; }
@@ -371,31 +158,7 @@ async function createOneManualPackageSession({
   const { data: session, error: sessionError } = await supabaseAdmin.from('sessions').insert([sessionRow]).select('*').single();
   if (sessionError) throw new Error(`Session ${sessionNumber} creation failed: ${sessionError.message}`);
 
-  // 3. Wix discovery mirror row
-  try {
-    const wixMirrorRow = buildAdminManualWixMirror({
-      syntheticWixBookingId, scheduledDate, scheduledTime, durationMinutes,
-      sessionType, sessionCount,
-      therapistName: `${psychologist.first_name || ''} ${psychologist.last_name || ''}`.trim(),
-      therapistEmail: psychologist.email || null, therapistPhone: psychologist.phone || null,
-      psychologistId: psychologist.id, client, amount: price, currency: 'INR',
-      packageId: packageId || null, sessionId: session.id,
-      title: `${psychologist.first_name || ''} ${psychologist.last_name || ''}`.trim() || 'Manual booking', notes: notes || null,
-    });
-    wixMirrorRow.package_session_number = sessionNumber;
-    wixMirrorRow.payload.planSessionNumber = sessionNumber;
-    wixMirrorRow.payload.creditsAvailable = sessionCount;
-    const { error: mirrorErr } = await supabaseAdmin.from('wix_bookings').insert([wixMirrorRow]);
-    if (!mirrorErr) {
-      // Link the session to the mirror only after the mirror row exists (FK constraint).
-      await supabaseAdmin.from('sessions').update({ wix_booking_id: syntheticWixBookingId }).eq('id', session.id);
-      session.wix_booking_id = syntheticWixBookingId;
-    } else {
-      console.warn('[manualPackage] wix mirror insert failed (non-fatal):', mirrorErr.message);
-    }
-  } catch (e) { console.warn('[manualPackage] wix mirror failed (non-fatal):', e.message); }
-
-  // 4. Block the slot in availability
+  // 3. Block the slot in availability
   try { await availabilityService.updateAvailabilityOnBooking(psychologist.id, scheduledDate, scheduledTime); }
   catch (e) { console.warn('[manualPackage] availability update failed (non-fatal):', e.message); }
 
@@ -521,7 +284,6 @@ const createManualPackageBooking = async (req, res) => {
       for (let i = 0; i < schedules.length; i++) {
         const sess = await createOneManualPackageSession({
           client, psychologist, paymentId: payment.id, packageGroupId,
-          syntheticWixBookingId: `admin_manual_pkg_${Date.now()}_${i + 1}`,
           sessionType: selection.sessionType, sessionCount, sessionNumber: i + 1,
           scheduledDate: schedules[i].date, scheduledTime: normTime(schedules[i].time),
           durationMinutes,
@@ -1124,14 +886,14 @@ const createManualBooking = async (req, res) => {
     // STEP 8: CREATE SESSION
     // ============================================
     // DUPLICATE GUARD — refuse to create a second record for a session that already exists.
-    // Wix-synced sessions are already in the table, so manually "recording" one again produced
-    // a duplicate row AND a phantom package group, which then swallowed follow-up bookings
+    // Manually "recording" a session that already exists produced a duplicate row AND a
+    // phantom package group, which then swallowed follow-up bookings
     // (a real incident: the same 8pm session existed twice, splitting a client's package).
     // A therapist cannot hold two sessions at the same instant, so this is always an error.
     {
       const { data: clash } = await supabaseAdmin
         .from('sessions')
-        .select('id, status, source, wix_booking_id')
+        .select('id, status, source')
         .eq('client_id', client.id)
         .eq('psychologist_id', psychologist_id)
         .eq('scheduled_date', scheduled_date)
@@ -1224,66 +986,6 @@ const createManualBooking = async (req, res) => {
 
     session = createdSession;
     console.log('✅ [MANUAL BOOKING] Session created:', session.id);
-
-    // ============================================
-    // STEP 8.5: CREATE WIX DISCOVERY MIRROR ROW
-    // ============================================
-    try {
-      const manualMeetMinutes = resolveMeetMinutes();
-      const syntheticWixBookingId = `admin_manual_${Date.now()}`;
-      const wixMirrorRow = buildAdminManualWixMirror({
-        syntheticWixBookingId,
-        scheduledDate: scheduled_date,
-        scheduledTime: scheduledTimeNormalized,
-        durationMinutes: manualMeetMinutes,
-        sessionType: manualSessionType,
-        sessionCount: manualSessionCount,
-        therapistName: `${psychologist.first_name || ''} ${psychologist.last_name || ''}`.trim(),
-        therapistEmail: psychologist.email || null,
-        therapistPhone: psychologist.phone || null,
-        psychologistId: psychologist_id,
-        client,
-        amount,
-        currency: 'INR',
-        packageId: package_id || null,
-        sessionId: session.id,
-        title: psychologist.first_name ? `${psychologist.first_name} ${psychologist.last_name || ''}`.trim() : 'Manual booking',
-        notes: notes || null,
-      });
-
-      wixMirrorRow.package_session_number = manualPackageSessionNumber;
-      wixMirrorRow.payload.planSessionNumber = manualPackageSessionNumber;
-      wixMirrorRow.payload.creditsAvailable = manualSessionCount;
-      wixMirrorRow.payload.manualSessionStage = manualSessionStage;
-      wixMirrorRow.payload.manualSessionLabel = getManualSessionLabel(
-        manualSessionType,
-        manualSessionStage,
-        packageData,
-        manualSessionCount
-      );
-
-      const { error: wixMirrorError } = await supabaseAdmin
-        .from('wix_bookings')
-        .insert([wixMirrorRow]);
-
-      if (wixMirrorError) {
-        console.warn('⚠️ [MANUAL BOOKING] Failed to create wix_bookings mirror row:', wixMirrorError.message);
-      } else {
-        const { error: linkSessionError } = await supabaseAdmin
-          .from('sessions')
-          .update({ wix_booking_id: syntheticWixBookingId })
-          .eq('id', session.id);
-
-        if (linkSessionError) {
-          console.warn('⚠️ [MANUAL BOOKING] Failed to link session to wix_bookings mirror:', linkSessionError.message);
-        } else {
-          session.wix_booking_id = syntheticWixBookingId;
-          console.log('✅ [MANUAL BOOKING] Wix discovery mirror created:', syntheticWixBookingId);
-        }
-      }
-    } catch (wixMirrorCreateError) {
-      console.warn('⚠️ [MANUAL BOOKING] Unexpected wix mirror creation error:', wixMirrorCreateError.message);
-    }
 
     // ============================================
     // STEP 9: UPDATE AVAILABILITY
@@ -1444,7 +1146,7 @@ const createManualBooking = async (req, res) => {
     }
 
     try {
-      // WhatsApp notifications via Interakt templates (same as Wix-flow bookings)
+      // WhatsApp notifications via Interakt templates
       const interaktService = require('../utils/interaktService');
 
       // Use the shared display-name resolver — handles "Not provided", "Pending" etc.
@@ -1840,46 +1542,6 @@ const createRecordOnlyBooking = async (req, res) => {
           .from('client_packages')
           .insert([clientPackageData]);
       }
-    }
-
-    // Create wix_bookings mirror so this record appears on the Wix Discovery page
-    try {
-      const syntheticWixBookingId = `admin_manual_${Date.now()}`;
-      const sessionType = package_id && packageData
-        ? (packageData.package_type?.includes('couple') ? 'couple' : 'package')
-        : 'individual';
-      const sessionCount = packageData?.session_count || 1;
-
-      const wixMirrorRow = buildAdminManualWixMirror({
-        syntheticWixBookingId,
-        scheduledDate: scheduled_date,
-        scheduledTime: scheduledTimeNormalized,
-        durationMinutes: 50,
-        sessionType,
-        sessionCount,
-        therapistName: `${psychologist.first_name || ''} ${psychologist.last_name || ''}`.trim(),
-        therapistEmail: psychologist.email || null,
-        psychologistId: psychologist_id,
-        client,
-        amount,
-        currency: 'INR',
-        packageId: package_id || null,
-        sessionId: session.id,
-        title: `${psychologist.first_name || ''} ${psychologist.last_name || ''}`.trim() || 'Record-only booking',
-        notes: notes || null,
-      });
-      wixMirrorRow.status = sessionStatus;
-      wixMirrorRow.payload.status = sessionStatus;
-
-      const { error: mirrorErr } = await supabaseAdmin.from('wix_bookings').insert([wixMirrorRow]);
-      if (mirrorErr) {
-        console.warn('⚠️ [RECORD ONLY] Failed to create wix_bookings mirror:', mirrorErr.message);
-      } else {
-        await supabaseAdmin.from('sessions').update({ wix_booking_id: syntheticWixBookingId }).eq('id', session.id);
-        console.log('✅ [RECORD ONLY] Wix discovery mirror created:', syntheticWixBookingId);
-      }
-    } catch (mirrorCreateErr) {
-      console.warn('⚠️ [RECORD ONLY] Unexpected wix mirror error:', mirrorCreateErr.message);
     }
 
     const { data: completeSession } = await supabaseAdmin
@@ -2287,7 +1949,7 @@ const getPlatformStats = async (req, res) => {
     const start_date = req.query.start_date;
     const end_date = req.query.end_date;
 
-    // Today in IST calendar (matches Wix / finance dashboards for India site)
+    // Today in IST calendar (matches the finance dashboards)
     const today = getCalendarYmdInTimeZone(new Date().toISOString(), 'Asia/Kolkata');
 
     const bookingTimeCol = await getBookingTimeColumnKey(supabaseAdmin);
@@ -2717,8 +2379,7 @@ const createPsychologist = async (req, res) => {
       psychiatrist_30min_price,
       specialist_category,
       child_specialist_pricing,
-      better_parent_pricing,
-      wix_staff_id
+      better_parent_pricing
     } = req.body;
 
     // Keep email as-is (don't normalize dots away)
@@ -2791,7 +2452,6 @@ const createPsychologist = async (req, res) => {
       designation: designation?.trim() || null,
       experience_years: experience_years || 0,
       cover_image_url: cover_image_url || null,
-      wix_staff_id: wix_staff_id || null,
     };
     // child_specialist_pricing exists on the table — include it only when provided.
     if (child_specialist_pricing != null) {
@@ -4387,98 +4047,6 @@ const updateSession = async (req, res) => {
       });
     }
 
-    if (updatedSession?.wix_booking_id) {
-      const wixMirrorUpdates = {
-        locally_modified: true,
-        synced_at: new Date().toISOString(),
-      };
-
-      const nextWixStatus = updateData.status || updatedSession.status;
-      if (nextWixStatus) {
-        wixMirrorUpdates.status = nextWixStatus;
-      }
-
-      if (session_type !== undefined) {
-        wixMirrorUpdates.session_type = session_type;
-      }
-      if (session_count !== undefined) {
-        wixMirrorUpdates.session_count = (session_count === null || session_count === '') ? null : parseInt(session_count, 10);
-      }
-      if (package_session_number !== undefined) {
-        wixMirrorUpdates.package_session_number = (package_session_number === null || package_session_number === '') ? null : parseInt(package_session_number, 10);
-      }
-      if (package_group_id !== undefined) {
-        wixMirrorUpdates.package_group_id = package_group_id || null;
-      }
-      if (notes !== undefined) {
-        wixMirrorUpdates.notes = notes || null;
-      }
-
-      if (scheduleChanged || scheduled_date || scheduled_time) {
-        const mirrorDate = updatedSession.scheduled_date || effectiveDate;
-        const mirrorTime = updatedSession.scheduled_time || effectiveTime;
-        const { startTimeIso, endTimeIso } = buildWixMirrorIsoWindow(
-          mirrorDate,
-          mirrorTime,
-          adminRescheduleMeetMinutes
-        );
-
-        if (startTimeIso) wixMirrorUpdates.start_time = startTimeIso;
-        if (endTimeIso) wixMirrorUpdates.end_time = endTimeIso;
-      }
-
-      try {
-        const { data: wixMirrorRow, error: wixFetchError } = await supabaseAdmin
-          .from('wix_bookings')
-          .select('id, payload')
-          .eq('wix_booking_id', updatedSession.wix_booking_id)
-          .maybeSingle();
-
-        if (wixFetchError) {
-          console.warn('[admin.updateSession] failed to fetch linked wix_bookings row:', wixFetchError.message);
-        } else if (wixMirrorRow?.id) {
-          const existingPayload = wixMirrorRow.payload && typeof wixMirrorRow.payload === 'object'
-            ? { ...wixMirrorRow.payload }
-            : {};
-
-          if (wixMirrorUpdates.start_time) existingPayload.startTime = wixMirrorUpdates.start_time;
-          if (wixMirrorUpdates.end_time) existingPayload.endTime = wixMirrorUpdates.end_time;
-          if (wixMirrorUpdates.status) {
-            existingPayload.status = wixMirrorUpdates.status;
-            existingPayload.bookingStatus = wixMirrorUpdates.status;
-          }
-          if (session_type !== undefined) {
-            existingPayload.bookingType = session_type;
-          }
-          if (session_count !== undefined) {
-            existingPayload.creditsAvailable = (session_count === null || session_count === '') ? null : parseInt(session_count, 10);
-          }
-          if (package_session_number !== undefined) {
-            existingPayload.planSessionNumber = (package_session_number === null || package_session_number === '') ? null : parseInt(package_session_number, 10);
-          }
-          if (package_id !== undefined) {
-            existingPayload.packageId = package_id || null;
-          }
-          if (notes !== undefined) {
-            existingPayload.notes = notes || null;
-          }
-
-          wixMirrorUpdates.payload = existingPayload;
-
-          const { error: wixUpdateError } = await supabaseAdmin
-            .from('wix_bookings')
-            .update(wixMirrorUpdates)
-            .eq('id', wixMirrorRow.id);
-
-          if (wixUpdateError) {
-            console.warn('[admin.updateSession] failed to mirror session update into wix_bookings:', wixUpdateError.message);
-          }
-        }
-      } catch (mirrorErr) {
-        console.warn('[admin.updateSession] unexpected error while mirroring to wix_bookings:', mirrorErr.message);
-      }
-    }
-
     // Update payment details if provided
     if (payment_method || transaction_id || razorpay_order_id || razorpay_payment_id) {
       const { data: payment } = await supabaseAdmin
@@ -5258,81 +4826,7 @@ const bookPackageNextSession = async (req, res) => {
       // booking_created_at MUST be set — the admin sessions list filters the "All" tab by this
       // column, and a NULL value would silently hide the row from the bookings page.
       booking_created_at: nowIso,
-      wix_payload: {
-        bookingType: sessionTypeForPackage,
-        packageType: clientPackage.package?.package_type || null,
-        planSessionNumber: nextSessionNumber,
-        creditsAvailable: totalSessionsCount,
-        isAdminManual: true,
-        manualBooking: true,
-      },
     };
-
-    // ── wix_bookings MIRROR ──────────────────────────────────────────────────
-    // Create the mirror row BEFORE the session (sessions.wix_booking_id FKs to it), exactly as
-    // bookWixNextSession does. Without it these sessions had no wix_booking_id at all, so the
-    // Wix Discovery page could only surface them through its unpaginated "platform sessions"
-    // side-channel — where they were silently dropped (a 6-session package showed 1/6 and 5/6
-    // while 2/6, 3/6 and 4/6 vanished). With a mirror they are ordinary Wix rows: paginated,
-    // searchable, and visible like every other booking.
-    const syntheticWixBookingId = `admin_manual_${Date.now()}`;
-    try {
-      const [{ data: mirrorClient }, { data: mirrorPsych }] = await Promise.all([
-        supabaseAdmin.from('clients').select('first_name, last_name, phone_number, email, user_id').eq('id', client_id).maybeSingle(),
-        supabaseAdmin.from('psychologists').select('first_name, last_name').eq('id', psychologistId).maybeSingle(),
-      ]);
-      let mirrorEmail = mirrorClient?.email || null;
-      if (!mirrorEmail && mirrorClient?.user_id) {
-        const { data: u } = await supabaseAdmin.from('users').select('email').eq('id', mirrorClient.user_id).maybeSingle();
-        mirrorEmail = u?.email || null;
-      }
-      const clientFullName = `${mirrorClient?.first_name || ''} ${mirrorClient?.last_name || ''}`.trim() || null;
-      const therapistName = `${mirrorPsych?.first_name || ''} ${mirrorPsych?.last_name || ''}`.trim() || null;
-      const startIso = new Date(`${formattedDate}T${formattedTime}+05:30`);
-      const durationMin = getMeetEventDurationMinutes(clientPackage.package?.package_type);
-
-      const { error: mirrorError } = await supabaseAdmin.from('wix_bookings').insert({
-        wix_booking_id: syntheticWixBookingId,
-        wix_session_id: syntheticWixBookingId,
-        status: 'booked',
-        session_type: sessionTypeForPackage,
-        session_count: totalSessionsCount,
-        package_session_number: nextSessionNumber,
-        package_group_id: inheritedGroupId,
-        therapist_name: therapistName,
-        // `title` mirrors therapist_name — the Discovery search matches on it.
-        title: therapistName,
-        client_full_name: clientFullName,
-        client_first_name: mirrorClient?.first_name || null,
-        client_last_name: mirrorClient?.last_name || null,
-        client_email: mirrorEmail,
-        client_phone: mirrorClient?.phone_number || null,
-        start_time: Number.isNaN(startIso.getTime()) ? null : startIso.toISOString(),
-        end_time: Number.isNaN(startIso.getTime()) ? null : new Date(startIso.getTime() + durationMin * 60000).toISOString(),
-        price: '0', // follow-ups are already paid for by session 1
-        locally_modified: true,
-        payload: {
-          bookingType: sessionTypeForPackage,
-          packageType: clientPackage.package?.package_type || null,
-          planSessionNumber: nextSessionNumber,
-          creditsAvailable: totalSessionsCount,
-          isAdminManual: true,
-          manualBooking: true,
-        },
-        created_at: nowIso,
-        updated_at: nowIso,
-        synced_at: nowIso,
-      });
-      if (mirrorError) {
-        // Non-fatal: better a session with no mirror than no session at all. It will still work
-        // everywhere except the Discovery listing.
-        console.warn('[bookPackageNextSession] wix_bookings mirror insert failed (non-fatal):', mirrorError.message);
-      } else {
-        sessionData.wix_booking_id = syntheticWixBookingId;
-      }
-    } catch (mirrorErr) {
-      console.warn('[bookPackageNextSession] wix_bookings mirror skipped (non-fatal):', mirrorErr.message || mirrorErr);
-    }
 
     const { data: session, error: sessionError } = await supabaseAdmin
       .from('sessions')
@@ -5505,10 +4999,11 @@ const getPackagesWithRemainingSessions = async (req, res) => {
   try {
     // Pull sessions that are either:
     //  • Linked to a real packages-table entry (package_id IS NOT NULL), or
-    //  • Wix-synced packages (session_type='package' with session_count > 1)
+    //  • Grouped package sessions with no packages-table row (admin manual packages),
+    //    identified by session_type='package' with session_count > 1
     const { data: sessions } = await supabaseAdmin
       .from('sessions')
-      .select('id, client_id, psychologist_id, package_id, package_group_id, session_type, session_count, status, scheduled_date, scheduled_time, wix_payload, price')
+      .select('id, client_id, psychologist_id, package_id, package_group_id, session_type, session_count, status, scheduled_date, scheduled_time, price')
       .or('package_id.not.is.null,session_type.eq.package')
       .neq('session_type', 'free_assessment');
 
@@ -5526,21 +5021,19 @@ const getPackagesWithRemainingSessions = async (req, res) => {
         byKey[key].sessions.push(s);
         return;
       }
-      // Wix package (no real package_id): only count if session_count > 1
+      // Grouped package with no packages-table row: only count if session_count > 1
       if (s.session_type === 'package' && Number(s.session_count) > 1) {
-        // Group by client + psychologist + session_count + subscriptionId/group_id
-        const groupId = s.package_group_id
-          || s.wix_payload?.subscriptionId
-          || s.wix_payload?.pricingPlanInfo?.planName
-          || `wix_${s.session_count}`;
-        const key = `wix_${s.client_id}_${s.psychologist_id}_${groupId}`;
+        // Group by client + psychologist + package_group_id (falls back to session_count
+        // so pre-group_id rows still collapse into one entry rather than one per session).
+        const groupId = s.package_group_id || `count_${s.session_count}`;
+        const key = `grp_${s.client_id}_${s.psychologist_id}_${groupId}`;
         if (!byKey[key]) byKey[key] = {
-          kind: 'wix',
+          kind: 'grouped',
           client_id: s.client_id,
           psychologist_id: s.psychologist_id,
           package_id: null,
           session_count: s.session_count,
-          plan_name: s.wix_payload?.pricingPlanInfo?.planName || s.wix_payload?.planName || null,
+          plan_name: null,
           group_id: groupId,
           sessions: [],
         };
@@ -5548,7 +5041,7 @@ const getPackagesWithRemainingSessions = async (req, res) => {
       }
     });
 
-    // Only look up real packages (skip Wix synthetic entries which have package_id = null)
+    // Only look up real packages (skip grouped entries, which have package_id = null)
     const packageIds = [...new Set(Object.values(byKey).filter(p => p.kind === 'real').map(p => p.package_id))];
     let packagesMap = {};
     if (packageIds.length > 0) {
@@ -5579,7 +5072,7 @@ const getPackagesWithRemainingSessions = async (req, res) => {
 
     const result = [];
     Object.values(byKey).forEach(entry => {
-      // Resolve package metadata — real package looks it up; Wix synthesizes one
+      // Resolve package metadata — a real package looks it up; grouped entries synthesize one
       const pkg = entry.kind === 'real' ? packagesMap[entry.package_id] : null;
       const total = entry.kind === 'real'
         ? (pkg?.session_count || 0)
@@ -5637,25 +5130,25 @@ const getPackagesWithRemainingSessions = async (req, res) => {
           upcoming_sessions: upcomingSessions
         });
       } else {
-        // Wix-style package — synthesize metadata
+        // Grouped package with no packages-table row — synthesize metadata
         result.push({
           client_id: entry.client_id,
           psychologist_id: psychId,
           package_id: null,
-          wix_package_group_id: entry.group_id,
+          package_group_id: entry.group_id,
           client: client || { id: entry.client_id, first_name: '', last_name: '' },
           psychologist: psychologist || { id: psychId, first_name: '', last_name: '' },
           package: {
             id: null,
-            name: entry.plan_name || `Wix Package (${total} sessions)`,
-            package_type: 'wix_plan',
+            name: entry.plan_name || `Package (${total} sessions)`,
+            package_type: 'grouped',
             price: null,
             session_count: total,
             total_sessions: total,
             completed_sessions: completed,
             remaining_sessions: remaining,
             can_book_next: canBookNext,
-            source: 'wix'
+            source: 'grouped'
           },
           upcoming_sessions: upcomingSessions
         });

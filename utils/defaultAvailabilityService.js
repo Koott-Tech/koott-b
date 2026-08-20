@@ -140,7 +140,7 @@ const setDefaultAvailability = async (psychologistId) => {
       return { success: false, message: 'No availability records to create' };
     }
     
-    // Apply recurring blocks so blocked days have empty/reduced slots (DB reflects blocked days for Wix etc.)
+    // Apply recurring blocks so blocked days have empty/reduced slots in the DB
     const recurringBlocks = await getRecurringBlocksForPsychologist(psychologistId);
     availabilityRecords = availabilityRecords.map((r) => ({
       ...r,
