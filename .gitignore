@@ -233,3 +233,5 @@ oauth-tokens.json
 # Scratch files
 scratch/
 
+# Keep the template committed (it holds no secrets)
+!.env.example
