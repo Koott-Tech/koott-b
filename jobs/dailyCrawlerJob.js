@@ -1,7 +1,7 @@
 const cron = require('node-cron');
 const { supabaseAdmin } = require('../config/supabase');
 const EmailService = require('../utils/emailService');
-const { regenerateSessionMeet } = require('../services/wixMeetNotifyService');
+const { regenerateSessionMeet } = require('../services/sessionMeetRepairService');
 
 const startDailyCrawlerScheduler = () => {
   // Schedule to run at 12:00 AM every day in IST
@@ -16,10 +16,10 @@ const startDailyCrawlerScheduler = () => {
 
       const { data: sessions, error } = await supabaseAdmin
         .from('sessions')
-        // email_sent_at / whatsapp_sent_at (+ their *_error columns) are written by
-        // wixMeetNotifyService but nothing ever read them, so a client who never received
-        // their Meet link by email or WhatsApp was never flagged. Now checked alongside the
-        // calendar event.
+        // email_sent_at / whatsapp_sent_at (+ their *_error columns) are written by the
+        // booking notification pipeline but nothing ever read them, so a client who never
+        // received their Meet link by email or WhatsApp was never flagged. Now checked
+        // alongside the calendar event.
         .select('id, client_id, psychologist_id, scheduled_time, status, google_calendar_event_id, google_meet_link, email_sent_at, whatsapp_sent_at, email_error, whatsapp_error')
         .eq('scheduled_date', today)
         // Only ACTIVE bookings actually need a Meet link. Excludes cancelled, refunded,

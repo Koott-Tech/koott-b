@@ -17,7 +17,6 @@ const clientRoutes = require('./routes/clients');
 const psychologistRoutes = require('./routes/psychologists');
 const sessionRoutes = require('./routes/sessions');
 const adminRoutes = require('./routes/admin');
-const integrationsRoutes = require('./routes/integrations');
 const superadminRoutes = require('./routes/superadmin');
 const availabilityRoutes = require('./routes/availability');
 const availabilityControllerRoutes = require('./routes/availabilityControllerRoutes');
@@ -33,7 +32,6 @@ const sessionReminderService = require('./services/sessionReminderService');
 const dailyAvailabilityService = require('./services/dailyAvailabilityService');
 const dailyCalendarConflictAlert = require('./services/dailyCalendarConflictAlert');
 const overbookingCrawlerService = require('./services/overbookingCrawlerService');
-const wixRealtimeSyncService = require('./services/wixRealtimeSyncService');
 const monthlyFinanceSnapshotService = require('./services/monthlyFinanceSnapshotService');
 const googleCalendarRoutes = require('./routes/googleCalendar');
 const eventPagesRoutes = require('./routes/eventPages');
@@ -49,7 +47,6 @@ const blogRoutes = require('./routes/blogs');
 const counsellingRoutes = require('./routes/counselling');
 const publicRoutes = require('./routes/public');
 const financeRoutes = require('./routes/finance');
-const wixWebhookRoutes = require('./routes/wixWebhooks');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -857,7 +854,6 @@ app.use('/api/sessions', sessionRoutes);
 app.use('/api/user-sessions', sessionRoutes);
 app.use('/api/admin/event-registrations', require('./middleware/auth').authenticateToken, require('./middleware/auth').requireEventOrganizer, eventRegistrationsAdminRoutes);
 app.use('/api/admin', adminRoutes);
-app.use('/api/integrations', integrationsRoutes);
 app.use('/api/superadmin', superadminRoutes);
 app.use('/api/availability', availabilityRoutes);
 app.use('/api/availability-controller', availabilityControllerRoutes);
@@ -877,7 +873,6 @@ app.use('/api/blogs', blogRoutes);
 app.use('/api/counselling', counsellingRoutes);
 app.use('/api/public', publicRoutes);
 app.use('/api/finance', financeRoutes);
-app.use('/api/wix/webhook', wixWebhookRoutes);
 
 // 404 handler
 app.use('*', (req, res) => {
@@ -962,8 +957,6 @@ console.log(`🚀 Koott Backend running on port ${PORT}`);
   // Start Daily Overbooking Crawler (05:30 IST; emails ops only if overbookings found)
   overbookingCrawlerService.start();
 
-  // Start Wix discover mirror sync service (near real-time fallback)
-  wixRealtimeSyncService.start();
 
   // Start monthly finance snapshot service (persists previous month automatically)
   monthlyFinanceSnapshotService.start();

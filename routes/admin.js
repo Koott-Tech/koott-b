@@ -2,8 +2,6 @@ const express = require('express');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
 const sessionController = require('../controllers/sessionController');
-const wixDiscoverController = require('../controllers/wixDiscoverController');
-const wixBookingsController = require('../controllers/wixBookingsController');
 const { authenticateToken, requireAdmin, requireEventOrganizer } = require('../middleware/auth');
 const { createRateLimiters } = require('../middleware/security');
 const multer = require('multer');
@@ -224,26 +222,6 @@ router.get('/search/users', adminController.searchUsers);
 router.get('/recent-users', adminController.getRecentUsers);
 router.get('/recent-bookings', adminController.getRecentBookings);
 
-// Wix Velo `/_functions/discover` — inspect payload (admin tooling; no Supabase writes)
-router.get('/wix/discover-inspect', wixDiscoverController.discoverInspect);
-
-// Wix → Supabase mirror (`wix_bookings`)
-router.post('/wix/sync', wixBookingsController.syncWixBookings);
-router.get('/wix/bookings', wixBookingsController.listWixBookings);
-router.get('/wix/orphans', wixBookingsController.listWixOrphans);
-router.get('/wix/bookings/:id', wixBookingsController.getWixBookingDetails);
-router.patch('/wix/bookings/:id', wixBookingsController.editWixBooking);
-router.delete('/wix/bookings/:id', wixBookingsController.deleteWixBooking);
-router.patch('/wix/bookings/:id/complete', wixBookingsController.completeWixBooking);
-router.patch('/wix/bookings/:id/no-show', wixBookingsController.noShowWixBooking);
-router.patch('/wix/bookings/:id/cancel-refund', wixBookingsController.cancelRefundWixBooking);
-router.post('/wix/bookings/:id/book-next-session', wixBookingsController.bookWixNextSession);
-router.post('/wix/bookings/:id/transfer', wixBookingsController.transferWixBooking);
-router.post('/wix/bookings/:id/reschedule', wixBookingsController.rescheduleWixBooking);
-router.post('/wix/bookings/:id/cancel-only', wixBookingsController.cancelOnlyWixBooking);
-router.get('/wix/therapists', wixBookingsController.listWixTherapists);
-router.post('/wix/backfill-clients', wixBookingsController.backfillWixClients);
-
 // Workshop / marketing event registrations (Supabase table event_registrations)
 // Moved to eventRegistrationsAdmin.js to allow event_organizer access
 
@@ -262,7 +240,6 @@ router.put('/users/:userId', adminController.updateUser);
 router.delete('/users/:userId', adminController.deleteUser);
 
 // Session management
-router.get('/wix/platform-sessions', sessionController.getWixDiscoverPlatformSessions);
 router.get('/sessions/all', sessionController.getAllSessions);
 router.get('/sessions/:sessionId', sessionController.getSessionById);
 

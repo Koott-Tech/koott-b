@@ -26,12 +26,9 @@
 function computeSessionDoctorWallet(session, dc, ch, opts) {
   const s = session || {};
   const sessionTypeText = String(s.session_type || '').toLowerCase();
-  const payloadText = `${s.wix_payload?.bookingType || ''} ${s.wix_payload?.booking_type || ''} ${s.wix_payload?.session_type || ''}`.toLowerCase();
   const totalSessions = Math.max(1, parseInt(s.session_count, 10) || 1);
   const isCoupleSession = sessionTypeText.includes('couple') ||
-    sessionTypeText.includes('cpl') ||
-    payloadText.includes('couple') ||
-    payloadText.includes('cpl');
+    sessionTypeText.includes('cpl');
 
   const isPackage = !!(
     (s.package_id && s.package_id !== 'null' && s.package_id !== 'undefined') ||

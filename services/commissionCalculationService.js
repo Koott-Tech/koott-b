@@ -18,7 +18,7 @@ async function calculateAndRecordCommission(sessionId, sessionData = null) {
     if (!session) {
       const { data, error } = await supabaseAdmin
         .from('sessions')
-        .select('id, status, price, payment_id, psychologist_id, session_type, session_count, wix_payload, package_id, client_id, created_at, scheduled_date')
+        .select('id, status, price, payment_id, psychologist_id, session_type, session_count, package_id, client_id, created_at, scheduled_date')
         .eq('id', sessionId)
         .single();
 
@@ -68,12 +68,9 @@ async function calculateAndRecordCommission(sessionId, sessionData = null) {
 
     // Determine session type
     const sessionTypeText = String(session.session_type || '').toLowerCase();
-    const payloadTypeText = `${session.wix_payload?.bookingType || ''} ${session.wix_payload?.booking_type || ''} ${session.wix_payload?.session_type || ''}`.toLowerCase();
     const sessionCount = Math.max(1, parseInt(session.session_count, 10) || 1);
     const isCoupleSession = sessionTypeText.includes('couple') ||
-      sessionTypeText.includes('cpl') ||
-      payloadTypeText.includes('couple') ||
-      payloadTypeText.includes('cpl');
+      sessionTypeText.includes('cpl');
     const sessionType = session.package_id || sessionCount > 1 || session.session_type === 'Package Session' || sessionTypeText.includes('package') ? 'package' : (isCoupleSession ? 'couple' : 'individual');
     const clientId = session.client_id;
     let packageType = 'package';
