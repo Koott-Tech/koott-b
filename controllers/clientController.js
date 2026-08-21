@@ -575,7 +575,7 @@ const getSessions = async (req, res) => {
               hero_title,
               seo_title
             ),
-            psychologist:psychologists!sessions_psychologist_id_fkey(
+            psychologist:psychologists(
               id,
               first_name,
               last_name,
@@ -3246,7 +3246,7 @@ const getClientPackages = async (req, res) => {
           session_count,
           price
         ),
-        psychologist:psychologists!sessions_psychologist_id_fkey(
+        psychologist:psychologists(
           id,
           first_name,
           last_name,

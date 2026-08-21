@@ -7966,7 +7966,7 @@ const getPayouts = async (req, res) => {
       .from('payouts')
       .select(`
         *,
-        psychologist:psychologists!sessions_psychologist_id_fkey(id, first_name, last_name)
+        psychologist:psychologists(id, first_name, last_name)
       `, { count: 'exact' })
       .order('payout_date', { ascending: false });
 
@@ -8034,7 +8034,7 @@ const getPayoutDetails = async (req, res) => {
       .from('payouts')
       .select(`
         *,
-        psychologist:psychologists!sessions_psychologist_id_fkey(id, first_name, last_name, email, phone)
+        psychologist:psychologists(id, first_name, last_name, email, phone)
       `)
       .eq('id', payoutId)
       .single();

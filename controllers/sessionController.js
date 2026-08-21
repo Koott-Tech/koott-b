@@ -1132,7 +1132,7 @@ const getSessionById = async (req, res) => {
               email
             )
           ),
-          psychologist:psychologists!sessions_psychologist_id_fkey(
+          psychologist:psychologists(
             id,
             first_name,
             last_name,

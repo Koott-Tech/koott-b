@@ -45,7 +45,6 @@ const careerRoutes = require('./routes/careers');
 const betterParentingRoutes = require('./routes/betterParenting');
 const blogRoutes = require('./routes/blogs');
 const counsellingRoutes = require('./routes/counselling');
-const publicRoutes = require('./routes/public');
 const financeRoutes = require('./routes/finance');
 
 const app = express();
@@ -398,7 +397,7 @@ app.get('/api/public/psychologists', async (req, res) => {
         better_parent_pricing
       `)
       .neq('email', assessmentEmail)
-      .eq('active', true) // Only show active psychologists on client-facing pages
+      .eq('is_active', true) // Only show active psychologists on client-facing pages
       .order('created_at', { ascending: false });
 
     if (psychologistsError) {
@@ -871,7 +870,6 @@ app.use('/api/better-parenting', betterParentingRoutes);
 app.use('/api/careers', careerRoutes);
 app.use('/api/blogs', blogRoutes);
 app.use('/api/counselling', counsellingRoutes);
-app.use('/api/public', publicRoutes);
 app.use('/api/finance', financeRoutes);
 
 // 404 handler
