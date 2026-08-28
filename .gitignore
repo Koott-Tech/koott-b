@@ -235,3 +235,9 @@ scratch/
 
 # Keep the template committed (it holds no secrets)
 !.env.example
+
+# OCR debug output
+*.hocr
+
+# Claude Code personal settings
+.claude/settings.local.json
