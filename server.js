@@ -46,6 +46,7 @@ const betterParentingRoutes = require('./routes/betterParenting');
 const blogRoutes = require('./routes/blogs');
 const counsellingRoutes = require('./routes/counselling');
 const financeRoutes = require('./routes/finance');
+const couponRoutes = require('./routes/coupons');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -125,6 +126,12 @@ app.use(helmet({
   },
   crossOriginEmbedderPolicy: false
 }));
+
+// The API is never meant to appear in search results.
+app.use((req, res, next) => {
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+  next();
+});
 
 // Trust Cloudflare proxy - Express will automatically use CF-Connecting-IP
 // With 'trust proxy' set, req.ip will automatically use the correct IP
@@ -366,8 +373,15 @@ const formatPublicPsychologistCard = (psych) => {
   };
 };
 
+// Public read-only answers are cached briefly (utils/cache.js cachePublic); any successful
+// write — booking, payment, admin/CMS edit — clears that cache so changes show at once.
+const { cachePublic, clearPublicCacheOnWrite } = require('./utils/cache');
+app.use('/api', clearPublicCacheOnWrite);
+
 // ... existing /api/public/psychologists route (use helper)
-app.get('/api/public/psychologists', async (req, res) => {
+// Long TTLs are safe: any successful write clears these (clearPublicCacheOnWrite). Only
+// data that changes with the clock (next availability, free slots) keeps a short one.
+app.get('/api/public/psychologists', cachePublic(10 * 60 * 1000), async (req, res) => {
   try {
     const { supabaseAdmin } = require('./config/supabase');
 
@@ -468,6 +482,21 @@ app.get('/api/public/psychologists', async (req, res) => {
   }
 });
 
+// Card order for the public therapist lists — therapist ids and their next free
+// time only (group membership stays internal). ?list=booking applies the admin's
+// group pattern (/book-malayali-psychologists); anything else = soonest availability.
+app.get('/api/public/psychologists/order', cachePublic(60 * 1000), async (req, res) => {
+  try {
+    const list = req.query.list === 'booking' ? 'booking' : 'default';
+    const result = await require('./utils/therapistListing').listingOrder(list);
+    res.set('Cache-Control', 'public, max-age=60');
+    res.json({ success: true, data: result });
+  } catch (error) {
+    console.error('Error ordering psychologists:', error);
+    res.status(500).json({ success: false, message: 'Failed to order therapists' });
+  }
+});
+
 // Public endpoint to get cache version (for cache invalidation)
 app.get('/api/public/psychologists/cache-version', async (req, res) => {
   try {
@@ -514,7 +543,7 @@ app.get('/api/public/psychologists/cache-version', async (req, res) => {
   }
 });
 
-app.get('/api/public/psychologists/:psychologistId/details', async (req, res) => {
+app.get('/api/public/psychologists/:psychologistId/details', cachePublic(10 * 60 * 1000), async (req, res) => {
   try {
     const { supabaseAdmin } = require('./config/supabase');
     const { psychologistId } = req.params;
@@ -572,7 +601,7 @@ app.get('/api/public/psychologists/:psychologistId/details', async (req, res) =>
 });
 
 // Public psychologist packages endpoint
-app.get('/api/public/psychologists/:psychologistId/packages', async (req, res) => {
+app.get('/api/public/psychologists/:psychologistId/packages', cachePublic(10 * 60 * 1000), async (req, res) => {
   try {
     const { supabaseAdmin } = require('./config/supabase');
     const { psychologistId } = req.params;
@@ -861,9 +890,13 @@ app.use('/api/client-notifications', clientNotificationRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/payment', paymentRoutes);
 app.use('/api/email-verification', emailVerificationLimiter, emailVerificationRoutes);
+// Booking flow: WhatsApp code for the client's mobile number
+app.use('/api/phone-verification', require('./routes/phoneVerification'));
 app.use('/api', oauthRoutes);
 app.use('/api/psychologists/google-calendar', googleCalendarRoutes);
 app.use('/api/event-pages', eventPagesRoutes);
+// Site-wide chrome held in the `cms` table (footer link columns, etc.)
+app.use('/api/site-config', require('./routes/siteConfig'));
 app.use('/api/events', eventsRoutes);
 app.use('/api/assessments', assessmentsRoutes);
 app.use('/api/better-parenting', betterParentingRoutes);
@@ -871,6 +904,9 @@ app.use('/api/careers', careerRoutes);
 app.use('/api/blogs', blogRoutes);
 app.use('/api/counselling', counsellingRoutes);
 app.use('/api/finance', financeRoutes);
+// Therapist groups — read-only report for finance/admin (management is under /api/admin)
+app.use('/api/therapist-groups', require('./routes/therapistGroups'));
+app.use('/api/coupons', couponRoutes);
 
 // 404 handler
 app.use('*', (req, res) => {
@@ -902,6 +938,17 @@ app.use((err, req, res, next) => {
     error: 'Internal Server Error',
     message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
   });
+});
+
+// Last-resort guards: log and keep serving instead of crashing the whole API on one
+// stray promise (e.g. a notification send nobody awaited). A genuinely broken process
+// state (uncaught exception) still exits so the process manager restarts it cleanly.
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ Unhandled promise rejection:', reason?.stack || reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('❌ Uncaught exception — exiting:', err?.stack || err);
+  process.exit(1);
 });
 
 // Start server

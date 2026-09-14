@@ -1,5 +1,6 @@
 const nodemailer = require('nodemailer');
 const { resolveSessionDurationMinutes } = require('./sessionMeetDuration');
+const { clientSessionTime, clientSessionTimeFor } = require('./clientTimeZone');
 
 // Public site base for email assets and links (override with SITE_URL or PUBLIC_APP_URL)
 const PRODUCTION_SITE_URL = (
@@ -289,6 +290,17 @@ class EmailService {
 
       const durationMinutes = resolveSessionDurationMinutes(sessionData);
 
+      // Client copy in the client's own zone (browser zone from checkout, else the phone's
+      // country). Therapist/admin copies below stay IST.
+      const clientTime = await clientSessionTimeFor({
+        date: finalSessionDate,
+        time: finalSessionTime,
+        timeZone: sessionData.clientTimeZone,
+        phone: sessionData.clientPhone,
+        clientId: clientId || sessionData.client_id,
+      });
+      const clientAbroad = clientTime && !clientTime.isIst ? clientTime : null;
+
       // Generate calendar invites
       const { createCalendarInvites, generateGoogleCalendarLink, generateOutlookCalendarLink } = require('./calendarInviteGenerator');
       
@@ -339,8 +351,9 @@ class EmailService {
             to: clientEmail,
             clientName,
             psychologistName,
-            scheduledDate: formattedDateShort, // Use short format for email template
+            scheduledDate: clientAbroad ? clientAbroad.dateShort : formattedDateShort, // Use short format for email template
             scheduledTime: formattedTime,
+            clientTime: clientAbroad,
             googleMeetLink: finalMeetLink,
             calendarInvite: calendarInvites.client,
             googleCalendarLink,
@@ -425,7 +438,8 @@ class EmailService {
       receiptFileName,
       packageInfo,
       durationMinutes = 50,
-      tempPassword = null
+      tempPassword = null,
+      clientTime = null // set when the client is outside IST: { timeLabel, istLabel, ... }
     } = emailData;
 
     // TEMPORARY: credential block disabled during website redesign — set to true when ready to re-enable
@@ -519,7 +533,8 @@ class EmailService {
                       <div class="detail-text" style="color: #4a5568; font-size: 16px; line-height: 2; margin: 0 0 30px 0;">
                         ${packageLine}
                         • Date: ${formattedDateShort}<br>
-                        • Time: ${scheduledTime} (IST)<br>
+                        ${clientTime ? `• Time: ${clientTime.timeLabel}<br>
+                        • India time: ${clientTime.istLabel}<br>` : `• Time: ${scheduledTime} (IST)<br>`}
                         • Duration: ${durationMinutes} min<br>
                         ${formattedPrice ? `• Price: ₹${formattedPrice}` : ''}
                       </div>
@@ -1344,6 +1359,17 @@ class EmailService {
       const formattedOldTime = formatTimeForEmail(oldTime);
       const formattedNewTime = formatTimeForEmail(scheduledTime);
 
+      // Client copy in the client's own zone (therapist copy stays IST).
+      const clientNew = await clientSessionTimeFor({
+        date: scheduledDate,
+        time: scheduledTime,
+        timeZone: sessionData.clientTimeZone,
+        phone: sessionData.clientPhone,
+        clientId: sessionData.clientId || sessionData.client_id,
+      });
+      const clientZone = clientNew && !clientNew.isIst ? clientNew.timeZone : null;
+      const clientOld = clientZone ? clientSessionTime({ date: oldDate, time: oldTime, timeZone: clientZone }) : null;
+
       // Generate calendar links for the new session
       let googleCalendarLink = null;
       let outlookCalendarLink = null;
@@ -1379,10 +1405,10 @@ class EmailService {
         await this.sendRescheduleEmail({
           to: clientEmail,
           name: clientName,
-          oldDate: formattedOldDate,
-          oldTime: formattedOldTime,
-          newDate: formattedNewDate,
-          newTime: formattedNewTime,
+          oldDate: clientOld ? clientOld.dateShort : formattedOldDate,
+          oldTime: clientOld ? clientOld.combinedLabel : formattedOldTime,
+          newDate: clientZone ? clientNew.dateShort : formattedNewDate,
+          newTime: clientZone ? clientNew.combinedLabel : formattedNewTime,
           sessionId,
           meetLink,
           type: 'client',

@@ -26,34 +26,112 @@ const { generateCertificate } = require('../utils/certificateService');
 const SLOT_OCCUPYING_STATUSES = ['booked', 'scheduled', 'confirmed', 'reschedule_requested', 'rescheduled'];
 
 /**
- * Find another session already sitting in a therapist's slot.
+ * Find what a new or moved session would collide with on the therapist's day.
  *
- * `sessions.scheduled_time` is TEXT, not a `time` column, so '22:00' and '22:00:00' are two
- * different strings to Postgres and existing rows hold both shapes. Every caller must compare
- * against BOTH forms — matching only the raw request value ('22:00') silently found nothing
- * and let a session be moved on top of one already booked at '22:00:00'.
+ * Sessions differ in length — individual 50 min, couple 80 min — and each is followed by a
+ * 10-min break (utils/sessionSlots.js). So a clash is any OVERLAP, break included, not just
+ * an identical start: a couple session at 9:30 blocks an individual one at 10:00. Other
+ * sessions, assessments and live checkout holds all count. Times are compared as minutes, so
+ * the '22:00' / '22:00:00' / '10:00 PM' shapes that coexist in `scheduled_time` all match.
  *
- * Returns the conflicting rows (empty array when the slot is free). Deliberately does not use
- * .single()/.maybeSingle(): those turn "2+ rows matched" into a PostgREST error with data=null,
- * which reads as "no conflict" and disables the guard exactly when a slot is already doubled up.
+ * `minutes` is the length of the session being placed (default 50). Returns the conflicting
+ * entries ({ id, source, start, minutes }); empty when the slot is clear. Throws on lookup
+ * failure — fail closed, never treat an error as "slot is free".
  */
-async function findSlotConflicts(psychologistId, date, time, { excludeSessionId = null } = {}) {
+async function findSlotConflicts(psychologistId, date, time, { excludeSessionId = null, minutes = null } = {}) {
   if (!psychologistId || !date || !time) return [];
-  const hhmmss = formatTime(String(time));
-  const hhmm = hhmmss.slice(0, 5);
+  const { findOverlaps } = require('../utils/sessionSlots');
+  return findOverlaps({
+    psychologistId,
+    date: formatDate(date),
+    time: formatTime(String(time)),
+    minutes,
+    excludeSessionId
+  });
+}
 
-  let query = supabaseAdmin
-    .from('sessions')
-    .select('id, client_id, scheduled_date, scheduled_time, status')
-    .eq('psychologist_id', psychologistId)
-    .eq('scheduled_date', formatDate(date))
-    .in('scheduled_time', [hhmmss, hhmm])
-    .in('status', SLOT_OCCUPYING_STATUSES);
-  if (excludeSessionId) query = query.neq('id', excludeSessionId);
+/**
+ * Read an admin booking's session type — 'individual' | 'couple' | 'package_N' |
+ * 'couple_package_N' (the modal turns a custom pick into package_N) — or, when a catalog
+ * package is attached, that package's type and size. Called by both manual booking paths but
+ * never defined, so every manual booking threw a ReferenceError.
+ * @returns {{ sessionType: 'individual'|'couple'|'package', sessionCount: number, isPackage: boolean, packageType: string }}
+ */
+function normalizeManualSessionSelection(sessionType, packageData) {
+  const packageType = String(packageData?.package_type || sessionType || 'individual').trim().toLowerCase();
+  const couple = packageType.startsWith('couple');
+  const count = Number(packageType.match(/_(\d+)$/)?.[1]) || Number(packageData?.session_count) || 1;
+  const isPackage = packageType.includes('package') && count > 1;
+  return {
+    sessionType: couple ? 'couple' : (isPackage ? 'package' : 'individual'),
+    sessionCount: isPackage ? count : 1,
+    isPackage,
+    packageType
+  };
+}
 
-  const { data, error } = await query;
-  if (error) throw error; // fail closed — never treat a lookup failure as "slot is free"
-  return data || [];
+/** Days of availability the default service creates for a new therapist (today + 21). */
+const DEFAULT_AVAILABILITY_DAYS = 22;
+
+const WEEKDAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+/**
+ * Every date (IST, 'YYYY-MM-DD') in the next `windowDays` days, today included, that falls on
+ * `day` — a weekday name ('Monday', 'mon') or number (0 = Sunday). Used to apply a new
+ * therapist's custom weekly hours; it was called but never defined, so the ReferenceError
+ * (caught) silently dropped every custom hour. Dates are IST so the weekday is right on a
+ * server running in UTC.
+ */
+function getAvailabilityDatesForDay(day, windowDays = DEFAULT_AVAILABILITY_DAYS) {
+  let weekday = null;
+  if (typeof day === 'number' || /^\d$/.test(String(day ?? '').trim())) {
+    weekday = Number(day);
+  } else {
+    const name = String(day ?? '').trim().toLowerCase();
+    if (name.length >= 3) weekday = WEEKDAY_NAMES.findIndex((w) => w.startsWith(name.slice(0, 3)));
+  }
+  if (weekday == null || weekday < 0 || weekday > 6) return [];
+
+  const ist = new Date(Date.now() + 330 * 60000);
+  const [y, m, d] = [ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()];
+  const dates = [];
+  for (let i = 0; i < windowDays; i++) {
+    const date = new Date(Date.UTC(y, m, d + i));
+    if (date.getUTCDay() === weekday) dates.push(date.toISOString().slice(0, 10));
+  }
+  return dates;
+}
+
+/**
+ * "Couple Session (3-session package) · Follow-up". Called from createManualBooking's
+ * background notification task but never defined — the ReferenceError there was an
+ * unhandled rejection, which can bring the Node process down after the booking is saved.
+ */
+function getManualSessionLabel(sessionType, sessionStage, packageData, sessionCount) {
+  const base = sessionType === 'couple' ? 'Couple Session'
+    : sessionType === 'package' ? 'Package Session'
+      : 'Individual Session';
+  const size = sessionCount > 1 ? ` (${sessionCount}-session package)` : '';
+  const stage = sessionStage === 'follow_up' ? ' · Follow-up' : '';
+  return `${base}${size}${stage}`;
+}
+
+/**
+ * Default length of an admin-booked session: individual 50 min, couple 80 min
+ * (the package type wins over the chosen session type). It was called by both manual
+ * booking paths but never defined, so a booking without an explicit duration threw.
+ */
+function getManualSessionDurationMinutes(sessionType, packageData) {
+  const { sessionLengthMinutes } = require('../utils/sessionSlots');
+  return sessionLengthMinutes({ packageType: packageData?.package_type, sessionType });
+}
+
+/** Human message for a findSlotConflicts result. */
+function slotConflictMessage(conflicts) {
+  const { busyLabel } = require('../utils/sessionSlots');
+  const first = conflicts[0];
+  const what = first?.source === 'checkout_hold' ? 'a client checking out' : first?.source === 'assessment' ? 'an assessment' : 'a session';
+  return `This overlaps ${what} at ${busyLabel(first)} IST. Sessions run 50 min (couple 1 hr 20 min) with a 10-min break after each — pick another time.`;
 }
 
 async function writeSessionDeliveryMarkers(sessionId, fields) {
@@ -229,6 +307,45 @@ const createManualPackageBooking = async (req, res) => {
     if (!client) return res.status(404).json(errorResponse(`Client not found with id or user_id: ${client_id}`));
     const { data: psychologist } = await supabaseAdmin.from('psychologists').select('id, first_name, last_name, email, phone, google_calendar_credentials').eq('id', psychologist_id).single();
     if (!psychologist) return res.status(404).json(errorResponse('Psychologist not found'));
+
+    // Every date must be free for the package's session length (individual 50 min, couple
+    // 80 min, or the chosen override) plus the 10-min break — against the therapist's day AND
+    // against the package's other dates. Checked before the payment row is created.
+    {
+      const { toMinutes, BREAK_MINUTES } = require('../utils/sessionSlots');
+      const reqDurEarly = parseInt(req.body.duration_minutes, 10);
+      const lengthMin = (Number.isFinite(reqDurEarly) && reqDurEarly > 0)
+        ? reqDurEarly
+        : getManualSessionDurationMinutes(selection.sessionType, null);
+
+      const placed = schedules.map((s) => ({ date: s.date, time: s.time, start: toMinutes(s.time) }));
+      if (placed.some((p) => p.start == null)) {
+        return res.status(400).json(errorResponse('Every session needs a valid time (HH:MM)'));
+      }
+      placed.sort((a, b) => (a.date === b.date ? a.start - b.start : a.date.localeCompare(b.date)));
+      for (let i = 1; i < placed.length; i++) {
+        const prev = placed[i - 1];
+        const cur = placed[i];
+        if (cur.date === prev.date && cur.start < prev.start + lengthMin + BREAK_MINUTES) {
+          return res.status(400).json(errorResponse(
+            `Two sessions in this package overlap on ${cur.date} — starts must be at least ${lengthMin + BREAK_MINUTES} min apart (${lengthMin}-min session + ${BREAK_MINUTES}-min break).`
+          ));
+        }
+      }
+
+      for (const p of placed) {
+        let conflicts;
+        try {
+          conflicts = await findSlotConflicts(psychologist_id, p.date, p.time, { minutes: lengthMin });
+        } catch (conflictErr) {
+          console.error('[createManualPackageBooking] Slot conflict lookup failed:', conflictErr.message);
+          return res.status(500).json(errorResponse('Could not verify slot availability. Please try again.'));
+        }
+        if (conflicts.length) {
+          return res.status(409).json(errorResponse(`${p.date}: ${slotConflictMessage(conflicts)}`));
+        }
+      }
+    }
 
     // Resolve package catalog ID for this psychologist and session_type
     let resolvedPackageId = null;
@@ -679,11 +796,29 @@ const createManualBooking = async (req, res) => {
     // ============================================
     // STEP 5: MANUAL DATE/TIME ENTRY
     // ============================================
-    // Admin manual bookings are intentionally no longer restricted to generated
-    // availability slots. We still block duplicate inserts later via DB/session
-    // creation safeguards, but we do not reject the chosen date/time here just
-    // because it is not present in the availability calendar.
-    console.log('ℹ️ [MANUAL BOOKING] Skipping slot availability check; using manually selected date/time');
+    // Admins may book outside the generated availability slots (the modal still offers the
+    // free starts for this session type), but never on top of another session: the new one,
+    // at its real length (individual 50 min, couple 80 min, or the chosen override) plus the
+    // 10-min break, must not overlap anything on the therapist's day. Checked before any
+    // payment row or Meet link is created.
+    {
+      let manualConflicts;
+      try {
+        manualConflicts = await findSlotConflicts(psychologist_id, scheduled_date, scheduledTimeNormalized, {
+          minutes: resolveMeetMinutes()
+        });
+      } catch (conflictErr) {
+        console.error('[MANUAL BOOKING] Slot conflict lookup failed:', conflictErr.message);
+        return res.status(500).json(errorResponse('Could not verify slot availability. Please try again.'));
+      }
+      if (manualConflicts.length) {
+        return res.status(409).json(
+          errorResponse(slotConflictMessage(manualConflicts), {
+            conflicting_session_ids: manualConflicts.map((s) => s.id).filter(Boolean)
+          })
+        );
+      }
+    }
 
     // ============================================
     // STEP 5.5: PACKAGE CHECK (no block if exhausted – we allow new purchase via manual booking)
@@ -2562,29 +2697,39 @@ const createPsychologist = async (req, res) => {
       // Continue even if default availability fails
     }
 
-    // Handle custom availability if provided (allows doctors to remove/block slots)
+    // Handle custom availability if provided (allows doctors to remove/block slots).
+    // Each item is one weekday's working hours ({ day, slots }); they replace the default
+    // hours on every matching date inside the default 3-week window set up just above.
     if (availability && availability.length > 0) {
       try {
         const availabilityRecords = [];
         availability.forEach(item => {
-          // Only create availability for the next occurrence of the selected day (not 2 weeks)
-          const dates = getAvailabilityDatesForDay(item.day, 1); // Create availability for only 1 occurrence
-          dates.forEach(date => {
-            // Only save if there are actual time slots
-            if (item.slots && item.slots.length > 0) {
-              // Use local date formatting to avoid timezone conversion issues
-              const year = date.getFullYear();
-              const month = String(date.getMonth() + 1).padStart(2, '0');
-              const day = String(date.getDate()).padStart(2, '0');
-              const dateString = `${year}-${month}-${day}`;
-              
-              // Update existing availability or create new one
-              availabilityRecords.push({
-                psychologist_id: psychologist.id,
-                date: dateString, // Use local date formatting
-                time_slots: item.slots // Direct array of time strings as expected by validation
-              });
+          // Date-based items — { date, slots } or { date, timeSlots: { morning, noon, evening,
+          // night } }, the shape DoctorModal builds and updatePsychologist reads — set that date.
+          if (item?.date && /^\d{4}-\d{2}-\d{2}$/.test(item.date)) {
+            const dateSlots = Array.isArray(item.slots) ? item.slots : [
+              ...(item.timeSlots?.morning || []),
+              ...(item.timeSlots?.noon || []),
+              ...(item.timeSlots?.evening || []),
+              ...(item.timeSlots?.night || [])
+            ];
+            if (dateSlots.length > 0) {
+              availabilityRecords.push({ psychologist_id: psychologist.id, date: item.date, time_slots: dateSlots });
             }
+            return;
+          }
+          // Only save if there are actual time slots
+          if (!Array.isArray(item?.slots) || item.slots.length === 0) return;
+          const dates = getAvailabilityDatesForDay(item.day, DEFAULT_AVAILABILITY_DAYS);
+          if (dates.length === 0) {
+            console.warn(`⚠️ Custom availability: unrecognised day "${item.day}" — skipped`);
+          }
+          dates.forEach(dateString => {
+            availabilityRecords.push({
+              psychologist_id: psychologist.id,
+              date: dateString,
+              time_slots: item.slots // Direct array of time strings as expected by validation
+            });
           });
         });
 
@@ -3683,11 +3828,30 @@ const updateSession = async (req, res) => {
     if ((scheduleChanged || doctorChanged) && isSessionWithMeet && effectiveDate && effectiveTime) {
       let slotConflicts;
       try {
+        // Measure the moved session at its real length (individual 50 min, couple 80 min)
+        // so an overlap with a neighbouring session is caught, not only an identical start.
+        const { sessionLengthMinutes } = require('../utils/sessionSlots');
+        const placedPackageId = package_id || currentSession.package_id;
+        let placedPackageType = null;
+        if (placedPackageId) {
+          const { data: placedPkg } = await supabaseAdmin
+            .from('packages')
+            .select('package_type')
+            .eq('id', placedPackageId)
+            .maybeSingle();
+          placedPackageType = placedPkg?.package_type || null;
+        }
         slotConflicts = await findSlotConflicts(
           psychologist_id || originalPsychId,
           effectiveDate,
           effectiveTime,
-          { excludeSessionId: sessionId }
+          {
+            excludeSessionId: sessionId,
+            minutes: sessionLengthMinutes({
+              packageType: placedPackageType,
+              sessionType: session_type || currentSession.session_type
+            })
+          }
         );
       } catch (conflictErr) {
         console.error('[Admin] Slot conflict lookup failed:', conflictErr.message);
@@ -3695,8 +3859,8 @@ const updateSession = async (req, res) => {
       }
       if (slotConflicts.length) {
         return res.status(409).json(
-          errorResponse('This therapist already has a session at that date and time.', {
-            conflicting_session_ids: slotConflicts.map((s) => s.id),
+          errorResponse(slotConflictMessage(slotConflicts), {
+            conflicting_session_ids: slotConflicts.map((s) => s.id).filter(Boolean),
           })
         );
       }
@@ -4227,7 +4391,9 @@ const updateSession = async (req, res) => {
             sessionId: updatedSession.id,
             meetLink,
             isFreeAssessment: updatedSession.session_type === 'free_assessment',
-            durationMinutes: adminRescheduleMeetMinutes
+            durationMinutes: adminRescheduleMeetMinutes,
+            clientPhone: clientWithUser?.phone_number || updatedSession.client?.phone_number || null,
+            clientId: updatedSession.client_id
           }, oldDate, oldTime);
           console.log('✅ [Admin] Reschedule notification emails sent');
 
@@ -4240,6 +4406,7 @@ const updateSession = async (req, res) => {
               date: newDate,
               time: newTime,
               meetLink,
+              recipientRole: 'client',
             });
             if (waResult?.success) {
               console.log('✅ [Admin] Reschedule WhatsApp sent to client (rescheduled_link_sharing)');
@@ -4295,28 +4462,28 @@ const getPsychologistAvailabilityForReschedule = async (req, res) => {
       );
     }
 
-    console.log(`📅 [ADMIN] Getting availability for psychologist ${psychologistId} from ${startDate} to ${endDate}`);
+    // ?type=individual|couple cuts the free starts by session length (individual 50 min,
+    // couple 80 min, 10-min break after each — utils/sessionSlots.js); ?excludeSessionId frees
+    // the slot of the session being rescheduled. Times are IST.
+    const kind = req.query.type === 'couple' ? 'couple' : 'individual';
+    const excludeSessionId = req.query.excludeSessionId || null;
 
-    // Use the availability service to get availability range
+    console.log(`📅 [ADMIN] Getting ${kind} availability for psychologist ${psychologistId} from ${startDate} to ${endDate}`);
+
     const availabilityService = require('../utils/availabilityCalendarService');
-    const availability = await availabilityService.getPsychologistAvailabilityRange(
-      psychologistId,
-      startDate,
-      endDate
-    );
+    const { getBookableSlots } = require('../utils/sessionSlots');
+    const [availability, bookable] = await Promise.all([
+      availabilityService.getPsychologistAvailabilityRange(psychologistId, startDate, endDate),
+      getBookableSlots(psychologistId, startDate, endDate, kind, { excludeSessionId })
+    ]);
+    const freeStartsByDate = new Map(bookable.map((d) => [d.date, d.slots.map((s) => s.displayTime)]));
 
     // Format the response to match what the frontend expects
     // Frontend expects: { success: true, data: { availability: [...] } }
     // Each item should have: { date, available_slots (array of time strings), time_slots, booked_times, is_available }
     const formattedAvailability = availability.map(day => {
-      // The availability service returns: { date, timeSlots: [{time, available, displayTime, reason}], ... }
-      // Extract available slots from timeSlots array - these are the slots that can be booked
-      const availableSlots = (day.timeSlots || [])
-        .filter(slot => slot.available !== false && slot.reason !== 'booked' && slot.reason !== 'google_calendar_blocked')
-        .map(slot => {
-          // Return the time string in 12-hour format (e.g., "9:00 PM")
-          return slot.displayTime || slot.time || String(slot);
-        });
+      // available_slots = the bookable session starts for this session type (12-hour, e.g. "9:30 AM")
+      const availableSlots = freeStartsByDate.get(day.date) || [];
       
       // Extract all time slots (for reference)
       const allTimeSlots = (day.timeSlots || []).map(slot => slot.displayTime || slot.time || String(slot));
@@ -4781,7 +4948,15 @@ const bookPackageNextSession = async (req, res) => {
     const formattedTime = formatTime(scheduled_time);
     let existingSlotSessions;
     try {
-      existingSlotSessions = await findSlotConflicts(psychologistId, formattedDate, formattedTime);
+      // Measured at the real length: the admin's chosen duration, else the package's
+      // (individual 50 min, couple 80 min), plus the 10-min break.
+      const { sessionLengthMinutes } = require('../utils/sessionSlots');
+      existingSlotSessions = await findSlotConflicts(psychologistId, formattedDate, formattedTime, {
+        minutes: sessionLengthMinutes({
+          packageType: clientPackage.package?.package_type,
+          durationMinutes: req.body.duration_minutes
+        })
+      });
     } catch (conflictErr) {
       console.error('[bookPackageNextSession] Slot conflict lookup failed:', conflictErr.message);
       return res.status(500).json(
@@ -4791,7 +4966,7 @@ const bookPackageNextSession = async (req, res) => {
 
     if (existingSlotSessions.length) {
       return res.status(409).json(
-        errorResponse('This time slot was just booked by another user. Please select another time.')
+        errorResponse(slotConflictMessage(existingSlotSessions))
       );
     }
 
@@ -4994,7 +5169,8 @@ const bookPackageNextSession = async (req, res) => {
 
 // Get packages with remaining sessions (admin only) - for Packages tab.
 // Returns all client+package combinations that have package sessions, with upcoming booked sessions
-// and can_book_next true only when at least one session is completed and there are remaining to book.
+// and can_book_next true whenever there are sessions left to book — the earlier sessions of a
+// package don't have to be completed first (a 3-pack can have sessions 2 and 3 booked up front).
 const getPackagesWithRemainingSessions = async (req, res) => {
   try {
     // Pull sessions that are either:
@@ -5100,7 +5276,7 @@ const getPackagesWithRemainingSessions = async (req, res) => {
         return d !== 0 ? d : (a.scheduled_time || '').localeCompare(b.scheduled_time || '');
       });
       const remaining = Math.max(total - completed - booked, 0);
-      const canBookNext = completed > 0 && remaining > 0;
+      const canBookNext = remaining > 0;
 
       // Skip fully completed packages - they belong in the Completed tab only
       if (total > 0 && completed >= total) return;

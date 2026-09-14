@@ -36,14 +36,22 @@ const generateSlug = (title) => {
 // Get all blog posts
 const getAllBlogs = async (req, res) => {
   try {
-    const { page = 1, limit = 10, status = 'published', search = '' } = req.query;
-    const offset = (page - 1) * limit;
+    const { page = 1, limit = 10, status = 'published', search = '', fields = 'card' } = req.query;
+    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+    const limitNum = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 200);
+    const offset = (pageNum - 1) * limitNum;
+
+    // Lists show cards, so they get card fields only; the article body (content /
+    // structured_content, ~5 KB a post) and SEO fields come with ?fields=full. This used
+    // to select * and ignore `limit`, sending every published post (~1 MB) to show 3–6 cards.
+    const CARD_FIELDS = 'id, slug, title, excerpt, featured_image_url, author_name, status, tags, categories, read_time_minutes, created_at, updated_at, published_at';
 
     // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
     let query = supabaseAdmin
       .from('blogs')
-      .select('*')
-      .order('created_at', { ascending: false });
+      .select(fields === 'full' ? '*' : CARD_FIELDS)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limitNum - 1);
 
     // Filter by status
     if (status && status !== 'all') {
@@ -73,7 +81,7 @@ const getAllBlogs = async (req, res) => {
     // Transform blog data
     const formattedBlogs = blogs.map(blog => ({
       ...blog,
-      featured_image_url: blog.featured_image_url || '/logo.png',
+      featured_image_url: blog.featured_image_url || null, // no cover → pages show none, not the logo
       tags: blog.tags || [],
       read_time_minutes: blog.read_time_minutes || 5
     }));
@@ -81,10 +89,10 @@ const getAllBlogs = async (req, res) => {
     res.json(successResponse('Blogs retrieved successfully', {
       blogs: formattedBlogs,
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
+        page: pageNum,
+        limit: limitNum,
         total: count || formattedBlogs.length,
-        totalPages: Math.ceil((count || formattedBlogs.length) / limit)
+        totalPages: Math.ceil((count || formattedBlogs.length) / limitNum)
       }
     }));
   } catch (error) {
@@ -121,7 +129,7 @@ const getBlogBySlug = async (req, res) => {
 
     res.json(successResponse('Blog retrieved successfully', {
       ...blog,
-      featured_image_url: blog.featured_image_url || '/logo.png',
+      featured_image_url: blog.featured_image_url || null, // no cover → pages show none, not the logo
       tags: blog.tags || []
     }));
   } catch (error) {

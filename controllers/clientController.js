@@ -1171,7 +1171,8 @@ const bookSession = async (req, res) => {
         meetLink: meetData.meetLink,
         googleCalendarEventId: meetData.eventId,
         price: session.price,
-        durationMinutes: meetMinutes
+        // meetMinutes is scoped to the Meet-creation block above; recompute here
+        durationMinutes: getMeetEventDurationMinutes(packageData?.package_type)
       });
 
       console.log('✅ Email notifications sent successfully');
@@ -1891,6 +1892,33 @@ const rescheduleSession = async (req, res) => {
       );
     }
 
+    // The new start must be a free start for THIS session's length — individual
+    // 50 min, couple 80 min, 10-min break after each — the same rule as booking.
+    // Checked before the within-24h branch too, so admin is never asked to
+    // approve a move onto a taken slot. Free assessments keep their own slots.
+    if (session.session_type !== 'free_assessment') {
+      const { checkSlotBookable } = require('../utils/sessionSlots');
+      let packageType = String(session.session_type || '').toLowerCase().includes('couple') ? 'couple' : 'individual';
+      if (session.package_id) {
+        const { data: pkg } = await supabaseAdmin
+          .from('packages')
+          .select('package_type')
+          .eq('id', session.package_id)
+          .maybeSingle();
+        if (pkg?.package_type) packageType = pkg.package_type;
+      }
+      const slotCheck = await checkSlotBookable({
+        psychologistId: session.psychologist_id,
+        date: formatDate(new_date),
+        time: formatTime(new_time),
+        packageType,
+        excludeSessionId: session.id
+      });
+      if (!slotCheck.ok) {
+        return res.status(409).json(errorResponse(slotCheck.message));
+      }
+    }
+
     // Check 24-hour rule: if session is within 24 hours (IST), require admin approval
     const sessionDateTime = dayjs(
       `${session.scheduled_date} ${session.scheduled_time}`,
@@ -2098,20 +2126,23 @@ const rescheduleSession = async (req, res) => {
       );
     }
 
-    // CRITICAL FIX: Check if new time slot is available using availability service
-    console.log('🔍 Checking time slot availability using availability service...');
-    const isAvailable = await availabilityService.isTimeSlotAvailable(
-      psychologist_id, 
-      formatDate(new_date), 
-      formatTime(new_time)
-    );
-
-    if (!isAvailable) {
-      return res.status(400).json(
-        errorResponse('Selected time slot is not available in psychologist schedule')
+    // Therapy sessions were validated above against the session-length slots
+    // (checkSlotBookable). Free assessments still use the hourly schedule check.
+    if (session.session_type === 'free_assessment') {
+      console.log('🔍 Checking time slot availability using availability service...');
+      const isAvailable = await availabilityService.isTimeSlotAvailable(
+        psychologist_id,
+        formatDate(new_date),
+        formatTime(new_time)
       );
+
+      if (!isAvailable) {
+        return res.status(400).json(
+          errorResponse('Selected time slot is not available in psychologist schedule')
+        );
+      }
+      console.log('✅ Time slot is available in psychologist schedule');
     }
-    console.log('✅ Time slot is available in psychologist schedule');
 
     // Check if new time slot is already booked by another session
     const { data: conflictingSessions } = await supabaseAdmin
@@ -2577,7 +2608,9 @@ const rescheduleSession = async (req, res) => {
             sessionId: updatedSession.id,
             meetLink: meetData?.meetLink,
             isFreeAssessment: session.session_type === 'free_assessment',
-            durationMinutes: rescheduleNotifyDurationMinutes
+            durationMinutes: rescheduleNotifyDurationMinutes,
+            clientPhone: clientDetails?.phone_number || null,
+            clientId: session.client_id
           },
           session.scheduled_date,
           session.scheduled_time
@@ -2602,6 +2635,7 @@ const rescheduleSession = async (req, res) => {
           const r = await interaktService.sendRescheduleNotification(clientDetails.phone_number, {
             recipientName: clientName, otherPartyName: psychologistName,
             date: updatedSession.scheduled_date, time: updatedSession.scheduled_time, meetLink,
+            recipientRole: 'client',
           });
           if (r?.success) console.log('✅ rescheduled_link_sharing sent to client');
           else console.warn('⚠️ rescheduled_link_sharing to client failed:', r?.error || r?.reason);
@@ -2857,18 +2891,19 @@ const sendRescheduleEmails = async (originalSession, updatedSession, psychologis
       const clientName = getClientDisplayName(clientDetails, 'Client');
       const psychologistName = `${psychologistDetails.first_name} ${psychologistDetails.last_name}`.trim();
 
+      // sendRescheduleNotification(sessionData, oldDate, oldTime) reads scheduledDate/scheduledTime —
+      // this call used to pass newDate/originalDate keys, so the emails went out with blank dates.
       await emailService.sendRescheduleNotification({
         clientEmail: clientDetails.user?.email,
         psychologistEmail: psychologistDetails.email,
         clientName,
         psychologistName,
         sessionId: updatedSession.id,
-        originalDate: originalSession.scheduled_date,
-        originalTime: originalSession.scheduled_time,
-        newDate: updatedSession.scheduled_date,
-        newTime: updatedSession.scheduled_time,
-        meetLink: updatedSession.google_meet_link
-      });
+        scheduledDate: updatedSession.scheduled_date,
+        scheduledTime: updatedSession.scheduled_time,
+        meetLink: updatedSession.google_meet_link,
+        clientId: originalSession.client_id
+      }, originalSession.scheduled_date, originalSession.scheduled_time);
 
       console.log('✅ Reschedule emails sent successfully');
     }
@@ -3503,17 +3538,33 @@ const bookRemainingSession = async (req, res) => {
 
     const psychologistId = clientPackage.package.psychologist_id;
 
-    // Check if the time slot is available
-    const isAvailable = await availabilityService.isTimeSlotAvailable(
-      psychologistId, 
-      scheduled_date, 
-      scheduled_time
-    );
-
-    if (!isAvailable) {
-      return res.status(400).json(
-        errorResponse('This time slot is not available. Please select another time.')
+    // The start must be a free start for this package's session length — individual 50 min,
+    // couple 80 min, 10-min break after each (utils/sessionSlots.js). Packages outside those
+    // rules (child-specialist cs_*, psychiatrist) keep the hourly schedule check.
+    const { checkSlotBookable, isStandardTherapyType } = require('../utils/sessionSlots');
+    const remainingPackageType = clientPackage.package?.package_type;
+    if (isStandardTherapyType(remainingPackageType)) {
+      const slotCheck = await checkSlotBookable({
+        psychologistId,
+        date: formatDate(scheduled_date),
+        time: formatTime(scheduled_time),
+        packageType: remainingPackageType
+      });
+      if (!slotCheck.ok) {
+        return res.status(409).json(errorResponse(slotCheck.message));
+      }
+    } else {
+      const isAvailable = await availabilityService.isTimeSlotAvailable(
+        psychologistId,
+        scheduled_date,
+        scheduled_time
       );
+
+      if (!isAvailable) {
+        return res.status(400).json(
+          errorResponse('This time slot is not available. Please select another time.')
+        );
+      }
     }
 
     // Double-check: Verify slot isn't already booked in sessions table (race condition protection)
@@ -3563,9 +3614,10 @@ const bookRemainingSession = async (req, res) => {
     }
 
     // Use supabaseAdmin to bypass RLS (backend service, proper auth already handled)
+    // phone: the therapist's booking WhatsApp below needs it (it was never selected).
     const { data: psychologistDetails, error: psychologistDetailsError } = await supabaseAdmin
       .from('psychologists')
-      .select('first_name, last_name, email')
+      .select('first_name, last_name, email, phone')
       .eq('id', psychologistId)
       .single();
 
@@ -3591,7 +3643,10 @@ const bookRemainingSession = async (req, res) => {
       google_meet_link: fallbackMeetLink, // Fallback initially, will be updated async
       google_calendar_link: null, // Will be updated async
       price: 0, // Free since it's from a package
-      original_scheduled_date: formatDate(scheduled_date)
+      original_scheduled_date: formatDate(scheduled_date),
+      session_type: 'Package Session',
+      source: 'website',
+      booking_created_at: new Date().toISOString()
     };
 
     const { data: session, error: sessionError } = await supabaseAdmin
@@ -4039,6 +4094,21 @@ const reserveTimeSlot = async (req, res) => {
     
     console.log('💰 Final price:', price);
 
+    // The slot must still be free for THIS session's length: individual 50 min,
+    // couple 80 min, 10-min break after each — so a couple booking can clash
+    // with neighbouring starts that an exact-time check would miss.
+    const { checkSlotBookable } = require('../utils/sessionSlots');
+    const slotCheck = await checkSlotBookable({
+      psychologistId: psychologist_id,
+      date: scheduled_date,
+      time: scheduled_time,
+      packageType: package?.package_type || 'individual',
+      ignoreClientId: clientId
+    });
+    if (!slotCheck.ok) {
+      return res.status(409).json(errorResponse(slotCheck.message));
+    }
+
     res.json({
       success: true,
       data: {
@@ -4306,18 +4376,42 @@ const bookSessionWithCredit = async (req, res) => {
       );
     }
 
-    // Check time slot availability
+    // Check time slot availability — for this credit's session length (individual 50 min,
+    // couple 80 min, 10-min break after each). Non-standard packages keep the hourly check.
     console.log('🔍 Checking time slot availability for credit booking...');
-    const isAvailable = await availabilityService.isTimeSlotAvailable(
-      psychologist_id,
-      scheduled_date,
-      scheduled_time
-    );
-
-    if (!isAvailable) {
-      return res.status(400).json(
-        errorResponse('This time slot is not available. Please select another time.')
+    const { checkSlotBookable, isStandardTherapyType } = require('../utils/sessionSlots');
+    let creditPackageType = 'individual';
+    if (payment.package_id && String(payment.package_id) !== 'individual') {
+      const { data: creditPkgType } = await supabaseAdmin
+        .from('packages')
+        .select('package_type')
+        .eq('id', payment.package_id)
+        .maybeSingle();
+      creditPackageType = creditPkgType?.package_type || 'individual';
+    }
+    if (isStandardTherapyType(creditPackageType)) {
+      const slotCheck = await checkSlotBookable({
+        psychologistId: psychologist_id,
+        date: formatDate(scheduled_date),
+        time: formatTime(scheduled_time),
+        packageType: creditPackageType,
+        ignoreClientId: clientId
+      });
+      if (!slotCheck.ok) {
+        return res.status(409).json(errorResponse(slotCheck.message));
+      }
+    } else {
+      const isAvailable = await availabilityService.isTimeSlotAvailable(
+        psychologist_id,
+        scheduled_date,
+        scheduled_time
       );
+
+      if (!isAvailable) {
+        return res.status(400).json(
+          errorResponse('This time slot is not available. Please select another time.')
+        );
+      }
     }
 
     console.log('✅ Time slot is available for credit booking');

@@ -3,9 +3,15 @@
 ## 1. Create the schema
 
 Open your Supabase project → **SQL Editor** → New query → paste the entire contents
-of `migrations/0001_initial_schema.sql` → **Run**.
+of `migrations/0001_initial_schema.sql` → **Run**. Then do the same with
+`migrations/0002_missing_finance_columns.sql`.
 
-42 tables, ~593 columns. The file is safe to re-run (`if not exists` throughout).
+42 tables, ~593 columns. Both files are safe to re-run (`if not exists` throughout).
+
+**Run 0002 as well, not just 0001.** 0001 was built by scanning `.select('literal
+string')` calls, which missed the finance controllers — they build their select list
+from array constants (`FINANCE_EXPENSE_SELECT` and friends) joined with `', '`. Without
+0002, the expenses, income, expense-categories and income-sources endpoints all fail.
 
 ## 2. Create the storage buckets
 

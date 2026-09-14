@@ -233,11 +233,44 @@ class MeetLinkService {
           log('❌ No refresh token available, will need new OAuth authorization');
         }
       }
+      this.seedCompanyTokenFromEnv();
       this.tokensLoaded = true;
     } catch (error) {
       log('ℹ️ No OAuth tokens file found (this is normal on first run)');
+      this.seedCompanyTokenFromEnv();
       this.tokensLoaded = true; // Mark as loaded even if file doesn't exist
     }
+  }
+
+  /**
+   * Company Google account fallback: .env GOOGLE_REFRESH_TOKEN (care@koott.in),
+   * used when a therapist hasn't connected their own Google Calendar.
+   */
+  seedCompanyTokenFromEnv() {
+    if (this.oauthTokens || !process.env.GOOGLE_REFRESH_TOKEN) return;
+    // expiryDate 1 = already expired, so the first use refreshes it.
+    this.oauthTokens = {
+      accessToken: null,
+      refreshToken: process.env.GOOGLE_REFRESH_TOKEN,
+      expiryDate: 1,
+      storedAt: Date.now()
+    };
+    log('✅ Company Google OAuth token loaded from .env (GOOGLE_REFRESH_TOKEN)');
+  }
+
+  /**
+   * Calendar client on the company account, or null when no company token works.
+   */
+  async companyCalendar() {
+    const token = await this.getValidOAuthToken();
+    if (!token) return null;
+    const client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      GOOGLE_OAUTH_REDIRECT_URI
+    );
+    client.setCredentials({ access_token: token, refresh_token: this.oauthTokens?.refreshToken });
+    return google.calendar({ version: 'v3', auth: client });
   }
 
   /**
@@ -932,6 +965,8 @@ class MeetLinkService {
           expiry_date: userAuth.expiry_date,
         });
         calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+      } else if ((calendar = await this.companyCalendar())) {
+        log('   🔑 Updating event on the company Google account');
       } else if (this.serviceAccount) {
         const auth = new google.auth.JWT({
           email: this.serviceAccount.client_email,
@@ -1042,6 +1077,8 @@ class MeetLinkService {
           expiry_date: userAuth.expiry_date
         });
         calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+      } else if ((calendar = await this.companyCalendar())) {
+        log('   🔑 Deleting event on the company Google account');
       } else if (this.serviceAccount) {
         const auth = new google.auth.JWT({
           email: this.serviceAccount.client_email,

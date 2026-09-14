@@ -9,6 +9,44 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI;
 
+// Calendar access + the account's email (stored as oauth_email on connect).
+const CALENDAR_SCOPES = [
+  'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/calendar.events',
+  'openid',
+  'email',
+];
+
+/** Only our own callback page may receive the code: http(s)://<host>/auth/google-calendar/callback */
+const isCalendarCallback = (uri) => {
+  try {
+    const u = new URL(String(uri || ''));
+    return /^https?:$/.test(u.protocol) && u.pathname === '/auth/google-calendar/callback' && !u.search && !u.hash;
+  } catch {
+    return false;
+  }
+};
+
+// Google sign-in URL for "Connect Google Calendar". Built here with the SAME client
+// that /connect uses to exchange the code — a URL built in the browser with a
+// different client ID (or the site-login redirect) can never be exchanged.
+router.get('/auth-url', authenticateToken, requirePsychologist, (req, res) => {
+  const redirectUri = req.query.redirect_uri;
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    return res.status(503).json({ success: false, message: 'Google Calendar is not configured on the server (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET).' });
+  }
+  if (!isCalendarCallback(redirectUri)) {
+    return res.status(400).json({ success: false, message: 'redirect_uri must be <site>/auth/google-calendar/callback' });
+  }
+  const url = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, redirectUri).generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    include_granted_scopes: true,
+    scope: CALENDAR_SCOPES,
+  });
+  return res.json({ success: true, data: { url } });
+});
+
 // Connect Google Calendar
 router.post('/connect', authenticateToken, requirePsychologist, async (req, res) => {
   try {
@@ -255,7 +293,7 @@ router.get('/events', authenticateToken, requirePsychologist, async (req, res) =
           console.log(`📅 Calendar ${cal.id} (${cal.summary}): ${items.length} events`);
           
           // Debug: Log details of events from primary calendar
-          if (cal.id === 'phonixer321@gmail.com' || cal.primary) {
+          if (cal.primary) {
             console.log('🔍 Primary calendar events:', items.map(evt => ({
               id: evt.id,
               summary: evt.summary,

@@ -126,8 +126,8 @@ const bookSession = async (req, res) => {
       );
     }
 
-    // TEMPORARY: disable auto Google Meet scheduling for new bookings.
-    const DISABLE_AUTO_GOOGLE_MEET_ON_BOOKING = true;
+    // Meet + calendar event on every booking (therapist's Google, else the company account).
+    const DISABLE_AUTO_GOOGLE_MEET_ON_BOOKING = false;
 
     // Create real Google Meet link using Meet Link Service
     let meetData = null;
@@ -1485,7 +1485,9 @@ const rescheduleSession = async (req, res) => {
             scheduledTime: new_time,
             sessionId: session.id,
             isFreeAssessment: session.session_type === 'free_assessment',
-            durationMinutes: sessionRescheduleNotifyMinutes
+            durationMinutes: sessionRescheduleNotifyMinutes,
+            clientPhone: clientDetails?.phone_number || null,
+            clientId: session.client_id
           }, session.scheduled_date, session.scheduled_time);
           console.log('Reschedule notification emails sent successfully');
         } catch (emailError) {

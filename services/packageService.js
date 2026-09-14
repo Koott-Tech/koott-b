@@ -64,30 +64,52 @@ const countSessionsTowardClientPackageQuota = async (supabaseAdmin, clientId, ca
 };
 
 /**
- * Returns ok: false if the client already has session_count sessions booked/completed for this catalog package.
+ * Paid purchases of a catalog package by a client — each successful payment buys
+ * session_count sessions. excludePaymentId leaves out the purchase being booked now.
+ */
+const countPaidPurchases = async (supabaseAdmin, clientId, catalogPackageId, excludePaymentId = null) => {
+  let query = supabaseAdmin
+    .from('payments')
+    .select('id', { count: 'exact', head: true })
+    .eq('client_id', clientId)
+    .eq('package_id', catalogPackageId)
+    .in('status', ['success', 'completed']);
+  if (excludePaymentId) query = query.neq('id', excludePaymentId);
+  const { count, error } = await query;
+  return { error, count: count || 0 };
+};
+
+/**
+ * Returns ok: false if the client has used every session they paid for on this catalog
+ * package. Allowance = session_count × paid purchases (at least one), so buying the same
+ * plan again — e.g. a second single "Individual session" — adds its own sessions instead
+ * of being refused after payment.
  *
  * @param {import('@supabase/supabase-js').SupabaseClient} supabaseAdmin
  * @param {string} clientId
  * @param {object} packageRow - row from packages (must include id, session_count / package_type for deriveSessionCount)
+ * @param {{ purchasePaymentId?: string }} [options] - the payment being booked right now
+ *   (a paid booking): that purchase counts on top of the earlier ones.
  * @returns {Promise<{ ok: boolean, httpStatus?: number, message?: string, used?: number, limit?: number }>}
  */
-const assertClientPackageHasAvailableSlot = async (supabaseAdmin, clientId, packageRow) => {
+const assertClientPackageHasAvailableSlot = async (supabaseAdmin, clientId, packageRow, { purchasePaymentId = null } = {}) => {
   if (!packageRow || !packageRow.id) {
     return { ok: true };
   }
 
-  const limit = deriveSessionCount(packageRow);
-  if (!Number.isFinite(limit) || limit < 1) {
+  const perPurchase = deriveSessionCount(packageRow);
+  if (!Number.isFinite(perPurchase) || perPurchase < 1) {
     return { ok: true };
   }
 
-  const { error, used } = await countSessionsTowardClientPackageQuota(
-    supabaseAdmin,
-    clientId,
-    packageRow.id
-  );
+  const [{ error, used }, { error: purchaseError, count: paid }] = await Promise.all([
+    countSessionsTowardClientPackageQuota(supabaseAdmin, clientId, packageRow.id),
+    countPaidPurchases(supabaseAdmin, clientId, packageRow.id, purchasePaymentId)
+  ]);
+  const purchases = purchasePaymentId ? paid + 1 : Math.max(paid, 1);
+  const limit = perPurchase * purchases;
 
-  if (error) {
+  if (error || purchaseError) {
     return {
       ok: false,
       httpStatus: 500,

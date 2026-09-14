@@ -2,7 +2,7 @@
  * Interakt WhatsApp Service
  *
  * Sends WhatsApp messages via the Interakt API using pre-approved templates.
- * Replaces WASenderApi for outbound notifications.
+ * This is the only outbound WhatsApp path for notifications.
  *
  * Requires env vars:
  *   - INTERAKT_API_KEY: Your Interakt API key (from Dashboard → Settings → Developer Settings)
@@ -19,6 +19,10 @@
 
 const https = require('https');
 const { parsePhoneNumberFromString } = require('libphonenumber-js');
+const { clientSessionTime, clientTimeZoneByPhone } = require('./clientTimeZone');
+
+// Explicit zone (browser at checkout) wins; otherwise the zone saved on the client row.
+const zoneFor = async (clientTimeZone, toPhone) => clientTimeZone || (await clientTimeZoneByPhone(toPhone));
 
 const LOG_PREFIX = '[interakt]';
 
@@ -185,7 +189,24 @@ const TEMPLATES = {
   RESCHEDULED_LINK_SHARING: process.env.INTERAKT_TPL_RESCHEDULED || 'rescheduled_link_sharing',
   SESSION_FOLLOW_UP: process.env.INTERAKT_TPL_SESSION_FOLLOW_UP || 'session_follow_up_v2',
   SESSION_REMINDER: process.env.INTERAKT_TPL_SESSION_REMINDER || 'sessionreminderautomatic',
+  OTP: process.env.INTERAKT_TPL_OTP || 'booking_otp',
 };
+
+/**
+ * Send a one-time code (booking flow's mobile-number step).
+ *
+ * Template: booking_otp (INTERAKT_TPL_OTP) — Meta "Authentication" category:
+ *   {{1}} is your verification code. … + a "Copy code" button.
+ * Meta requires the same code as the button value. Not retried, so a slow
+ * send never produces two different codes.
+ */
+async function sendOtp(toPhone, code) {
+  return sendTemplateMessage(toPhone, TEMPLATES.OTP, process.env.INTERAKT_TPL_OTP_LANG || 'en', {
+    bodyValues: [code],
+    buttonValues: { 0: [code] },
+    callbackData: 'phone_otp',
+  });
+}
 
 /**
  * Send booking confirmation to client.
@@ -194,12 +215,16 @@ const TEMPLATES = {
  * Expected template body variables (in order):
  *   {{1}} = client name
  *   {{2}} = therapist name
- *   {{3}} = date (e.g. "Mon, 12 Jan 2026")
- *   {{4}} = time (e.g. "10:00 AM")
+ *   {{3}} = date in the client's zone (e.g. "Mon, 12 Jan 2026")
+ *   {{4}} = time with zone (e.g. "10:00 AM IST", or abroad
+ *           "7:00 PM Gulf Standard Time (GMT+4) · 8:30 PM IST")
  *   {{5}} = meet link
+ *
+ * details.date/time are the stored IST values; details.clientTimeZone (IANA, from the
+ * browser at checkout) wins over the zone inferred from the phone's country.
  */
 async function sendBookingConfirmation(toPhone, details) {
-  const { psychologistName, date, time, meetLink, clientName } = details || {};
+  const { psychologistName, date, time, meetLink, clientName, clientTimeZone } = details || {};
 
   // Format date
   let formattedDate = date || '';
@@ -224,6 +249,13 @@ async function sendBookingConfirmation(toPhone, details) {
       formattedTime = `${displayH}:${minutes.toString().padStart(2, '0')} ${period}`;
     }
   } catch { /* keep raw */ }
+
+  // Client's own zone, labelled (IST when in India or the zone is unknown)
+  const when = clientSessionTime({ date, time, timeZone: await zoneFor(clientTimeZone, toPhone), phone: toPhone });
+  if (when) {
+    formattedDate = when.dateShort;
+    formattedTime = when.combinedLabel;
+  }
 
   const specialist = (psychologistName || '').trim() || 'our specialist';
   const client = (clientName || '').trim();
@@ -315,9 +347,12 @@ async function sendSessionNotificationPsychologist(toPhone, details) {
  * @param {string} toPhone
  * @param {object} details
  *   - recipientName, otherPartyName, date (YYYY-MM-DD), time (HH:MM), meetLink
+ *   - recipientRole: 'client' converts date/time to the client's zone (+ label);
+ *     anything else (therapist) keeps IST
+ *   - clientTimeZone (optional IANA zone, overrides the phone-country guess)
  */
 async function sendRescheduleNotification(toPhone, details) {
-  const { recipientName, otherPartyName, date, time, meetLink } = details || {};
+  const { recipientName, otherPartyName, date, time, meetLink, recipientRole, clientTimeZone } = details || {};
 
   // Format date
   let formattedDate = date || '';
@@ -342,6 +377,14 @@ async function sendRescheduleNotification(toPhone, details) {
       formattedTime = `${displayH}:${minutes.toString().padStart(2, '0')} ${period}`;
     }
   } catch { /* keep raw */ }
+
+  if (recipientRole === 'client') {
+    const when = clientSessionTime({ date, time, timeZone: await zoneFor(clientTimeZone, toPhone), phone: toPhone });
+    if (when) {
+      formattedDate = when.dateShort;
+      formattedTime = when.combinedLabel;
+    }
+  }
 
   const link = meetLink || 'Link will be shared shortly';
 
@@ -419,14 +462,20 @@ async function sendSessionFollowUp(toPhone, details) {
  * @param {string} toPhone
  * @param {object} details
  *   - clientName, scheduledTime, psychologistName, meetLink
+ *   - date + time (raw IST, optional): when given, {{2}} becomes the time in the
+ *     client's zone with a label, e.g. "7:00 PM Gulf Standard Time (GMT+4) · 8:30 PM IST"
+ *   - clientTimeZone (optional IANA zone, overrides the phone-country guess)
  */
 async function sendSessionReminder(toPhone, details) {
-  const { clientName, scheduledTime, psychologistName, meetLink } = details || {};
+  const { clientName, scheduledTime, psychologistName, meetLink, date, time, clientTimeZone } = details || {};
   const link = meetLink || 'Link will be shared shortly';
+  const when = date && time
+    ? clientSessionTime({ date, time, timeZone: await zoneFor(clientTimeZone, toPhone), phone: toPhone })
+    : null;
   return sendTemplateWithRetry(toPhone, TEMPLATES.SESSION_REMINDER, 'en', {
     bodyValues: [
       (clientName || '').trim() || 'there',
-      (scheduledTime || '').trim() || '',
+      when ? when.combinedLabel : (scheduledTime || '').trim() || '',
       (psychologistName || '').trim() || 'our team',
       link,
     ],
@@ -435,6 +484,7 @@ async function sendSessionReminder(toPhone, details) {
 }
 
 module.exports = {
+  sendOtp,
   parsePhone,
   sendTemplateMessage,
   sendTemplateWithRetry,

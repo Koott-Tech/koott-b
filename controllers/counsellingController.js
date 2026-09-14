@@ -210,10 +210,17 @@ const createCounsellingService = async (req, res) => {
       return arr;
     };
 
-    // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
-    const { data: service, error } = await supabaseAdmin
-      .from('counselling_services')
-      .insert([{
+    const content = req.body.content ?? null;
+    if (content !== null && (typeof content !== 'object' || Array.isArray(content))) {
+      return res.status(400).json(errorResponse('content must be an object'));
+    }
+
+    // Several columns below come from migration 0004, which may not be applied yet.
+    // Instead of failing the whole create on one missing column, drop the column the
+    // database names in its error and retry — the page body lives in `content` anyway.
+    const insertRow = {
+        content,
+        cover_image_url: req.body.cover_image_url ?? null,
         slug,
         status,
         category,
@@ -247,9 +254,24 @@ const createCounsellingService = async (req, res) => {
         blog_teaser_enabled,
         blog_teaser_tag,
         updated_by: req.user?.id
-      }])
-      .select('*')
-      .single();
+    };
+    Object.keys(insertRow).forEach((k) => { if (insertRow[k] === undefined) delete insertRow[k]; });
+
+    let service = null;
+    let error = null;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
+      ({ data: service, error } = await supabaseAdmin
+        .from('counselling_services')
+        .insert([insertRow])
+        .select('*')
+        .single());
+      if (!error || String(error.code || '') !== 'PGRST204') break;
+      const missing = String(error.message || '').match(/Could not find the '([^']+)' column/)?.[1];
+      if (!missing || !(missing in insertRow) || ['slug', 'hero_title'].includes(missing)) break;
+      console.warn(`[counselling.create] column '${missing}' not in schema yet — saving without it`);
+      delete insertRow[missing];
+    }
 
     if (error) {
       console.error('Error creating counselling service:', error);
@@ -367,6 +389,14 @@ const updateCounsellingService = async (req, res) => {
     if (reviews !== undefined) updateData.reviews = reviews;
     if (blog_teaser_enabled !== undefined) updateData.blog_teaser_enabled = blog_teaser_enabled;
     if (blog_teaser_tag !== undefined) updateData.blog_teaser_tag = blog_teaser_tag;
+    // The whole page body ConditionPageTemplate renders (ConditionPageEditor writes it).
+    if (req.body.content !== undefined) {
+      if (req.body.content !== null && (typeof req.body.content !== 'object' || Array.isArray(req.body.content))) {
+        return res.status(400).json(errorResponse('content must be an object'));
+      }
+      updateData.content = req.body.content;
+    }
+    if (req.body.cover_image_url !== undefined) updateData.cover_image_url = req.body.cover_image_url;
     updateData.updated_by = req.user?.id;
 
     // Keep only keys that exist on the table (based on fetched row)

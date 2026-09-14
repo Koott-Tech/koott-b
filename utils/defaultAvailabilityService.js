@@ -1,9 +1,16 @@
 const { supabaseAdmin } = require('../config/supabase');
 const { getRecurringBlocksForPsychologist, filterSlotsByRecurringBlocks } = require('./recurringBlocksHelper');
+// Each therapist's own weekly hours (set by admin) when they have them; the
+// 8 AM–10 PM default below otherwise.
+const { slotsForDate, loadPsychologistsForAvailability } = require('./workingHours');
 
 /**
- * Generate default time slots: continuous 1-hour slots from 8:00 AM to 10:00 PM IST
- * (sessions are 1 hour each, so 8:00 AM means 8:00–9:00, 9:00 AM means 9:00–10:00, etc.)
+ * Generate default working hours: continuous 1-hour blocks from 8:00 AM to 10:00 PM IST.
+ * Each entry is an hour of WORKING TIME ("8:00 AM" = 8:00–9:00), not a session.
+ * Sessions are cut from these hours when slots are read (utils/sessionSlots.js):
+ * individual 50 min and couple 1 h 20 min, each followed by a 10-min break —
+ * so 8 AM–10 PM gives individual starts 8:00, 9:00 … 21:00 and couple starts
+ * 8:00, 9:30, 11:00 … 20:00.
  * Returns array of time strings in 12-hour format (e.g. "8:00 AM", "1:00 PM").
  *
  * Daily availability (addNextDayAvailability) uses these slots for regular psychologists.
@@ -114,11 +121,13 @@ const setDefaultAvailability = async (psychologistId) => {
     }
 
     // Fetch psychologist to determine designation (psychiatrist vs others)
-    const { data: psych, error: psychError } = await supabaseAdmin
-      .from('psychologists')
-      .select('id, designation')
-      .eq('id', psychologistId)
-      .single();
+    let psych = null;
+    let psychError = null;
+    try {
+      [psych] = await loadPsychologistsForAvailability(psychologistId);
+    } catch (err) {
+      psychError = err;
+    }
 
     if (psychError || !psych) {
       console.error('Error fetching psychologist for default availability:', psychError);
@@ -144,7 +153,7 @@ const setDefaultAvailability = async (psychologistId) => {
     const recurringBlocks = await getRecurringBlocksForPsychologist(psychologistId);
     availabilityRecords = availabilityRecords.map((r) => ({
       ...r,
-      time_slots: filterSlotsByRecurringBlocks(r.time_slots, r.date, recurringBlocks)
+      time_slots: filterSlotsByRecurringBlocks(slotsForDate(psych, r.date), r.date, recurringBlocks)
     }));
     
     // Check which dates already exist
@@ -211,10 +220,14 @@ const addNextDayAvailability = async () => {
 
     // Get all active psychologists
     // Use supabaseAdmin to bypass RLS (backend service, proper auth already handled)
-    const { data: psychologists, error: psychError } = await supabaseAdmin
-      .from('psychologists')
-      .select('id, designation');
-    
+    let psychologists = [];
+    let psychError = null;
+    try {
+      psychologists = await loadPsychologistsForAvailability();
+    } catch (err) {
+      psychError = err;
+    }
+
     if (psychError) {
       console.error('Error fetching psychologists:', psychError);
       return { success: false, message: 'Failed to fetch psychologists' };
@@ -254,7 +267,7 @@ const addNextDayAvailability = async () => {
       
       // Apply recurring blocks: full-day block -> empty slots; partial block -> filtered slots; no block -> full default
       const recurringBlocks = await getRecurringBlocksForPsychologist(psych.id);
-      const baseSlots = getDefaultSlotsForPsychologist(psych);
+      const baseSlots = slotsForDate(psych, dateString);
       const timeSlotsToInsert = filterSlotsByRecurringBlocks([...baseSlots], dateString, recurringBlocks);
       
       const { error: insertError } = await supabaseAdmin
@@ -461,18 +474,14 @@ const syncFutureAvailabilityForRecurringBlockDay = async (psychologistId, dayOfW
     const recurringBlocks = await getRecurringBlocksForPsychologist(psychologistId);
 
     // Fetch psychologist once to decide which default grid to use
-    const { data: psych, error: psychError } = await supabaseAdmin
-      .from('psychologists')
-      .select('id, designation')
-      .eq('id', psychologistId)
-      .single();
-
-    if (psychError || !psych) {
+    let psych = null;
+    try {
+      [psych] = await loadPsychologistsForAvailability(psychologistId);
+    } catch (psychError) {
       console.error('Error fetching psychologist for recurring block sync:', psychError);
-      return { updated: 0 };
     }
+    if (!psych) return { updated: 0 };
 
-    const defaultSlots = getDefaultSlotsForPsychologist(psych);
     const { data: rows, error } = await supabaseAdmin
       .from('availability')
       .select('id, date, time_slots')
@@ -486,7 +495,7 @@ const syncFutureAvailabilityForRecurringBlockDay = async (psychologistId, dayOfW
     let updated = 0;
     for (const row of rows) {
       if (getDayOfWeek(row.date) !== dayOfWeek) continue;
-      const baseSlots = useDefaultSlots ? defaultSlots : (row.time_slots || []);
+      const baseSlots = useDefaultSlots ? slotsForDate(psych, row.date) : (row.time_slots || []);
       const newSlots = filterSlotsByRecurringBlocks(baseSlots, row.date, recurringBlocks);
       if (JSON.stringify(newSlots) === JSON.stringify(row.time_slots || [])) continue;
       const { error: updateErr } = await supabaseAdmin

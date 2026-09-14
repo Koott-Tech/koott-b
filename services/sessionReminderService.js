@@ -99,7 +99,7 @@ class SessionReminderService {
             phone_number,
             email
           ),
-          psychologist:psychologists(
+          psychologist:psychologists!sessions_psychologist_id_fkey(
             id,
             first_name,
             last_name,
@@ -273,6 +273,9 @@ class SessionReminderService {
           const result = await interaktService.sendSessionReminder(client.phone_number, {
             clientName,
             scheduledTime: formattedTime,
+            // raw IST values → converted to the client's zone + labelled in the template
+            date: session.scheduled_date,
+            time: session.scheduled_time,
             psychologistName,
             meetLink,
           });
@@ -376,7 +379,7 @@ class SessionReminderService {
             phone_number,
             email
           ),
-          psychologist:psychologists(
+          psychologist:psychologists!sessions_psychologist_id_fkey(
             id,
             first_name,
             last_name,
@@ -467,7 +470,7 @@ class SessionReminderService {
             phone_number,
             email
           ),
-          psychologist:psychologists(
+          psychologist:psychologists!sessions_psychologist_id_fkey(
             id,
             first_name,
             last_name,

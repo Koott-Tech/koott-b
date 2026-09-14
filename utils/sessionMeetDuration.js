@@ -7,6 +7,13 @@ function getMeetEventDurationMinutes(packageType) {
 
   const pt = packageType.trim();
 
+  // Psychiatry consults: psychiatry_15 / psychiatry_15_package_N = 15 min, psychiatry_30 = 30 min.
+  const psychiatry = /^psychiatry_(15|30)(?:_package_\d+)?$/.exec(pt);
+  if (psychiatry) return Number(psychiatry[1]);
+
+  // Couple sessions run 1 h 20 min (individual stays at the default 50).
+  if (pt.startsWith('couple')) return 80;
+
   if (pt.startsWith('cs_init_')) {
     if (pt.endsWith('_parent')) return 60;
     if (pt.endsWith('_child')) return 90;

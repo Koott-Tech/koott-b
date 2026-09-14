@@ -354,12 +354,23 @@ const updateSlotLockStatus = async (orderId, status, paymentData = {}) => {
       updateData.signature = paymentData.signature;
     }
 
-    const { data: slotLock, error: updateError } = await supabaseAdmin
+    let { data: slotLock, error: updateError } = await supabaseAdmin
       .from('slot_locks')
       .update(updateData)
       .eq('order_id', orderId)
       .select()
       .single();
+
+    // Databases without migration 0008 lack payment_id / signature — still move the status on.
+    if (updateError?.code === 'PGRST204' && (updateData.payment_id || updateData.signature)) {
+      console.warn('⚠️ slot_locks has no payment_id/signature columns (run migration 0008); updating status only');
+      ({ data: slotLock, error: updateError } = await supabaseAdmin
+        .from('slot_locks')
+        .update({ status: updateData.status, updated_at: updateData.updated_at })
+        .eq('order_id', orderId)
+        .select()
+        .single());
+    }
 
     if (updateError) {
       console.error('❌ Error updating slot lock:', updateError);

@@ -16,6 +16,7 @@ const emailService = require('../utils/emailService');
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const timezone = require('dayjs/plugin/timezone');
+const { toMinutes, sessionMinutesForPackageType } = require('../utils/sessionSlots');
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -50,7 +51,7 @@ class OverbookingCrawlerService {
 
     const { data: sessions, error } = await supabaseAdmin
       .from('sessions')
-      .select('id, client_id, psychologist_id, scheduled_date, scheduled_time, status, source')
+      .select('id, client_id, psychologist_id, package_id, scheduled_date, scheduled_time, status, source')
       .gte('scheduled_date', today)
       .in('status', ACTIVE_STATUSES)
       .not('psychologist_id', 'is', null)
@@ -60,14 +61,40 @@ class OverbookingCrawlerService {
       throw new Error(`Overbooking query failed: ${error.message}`);
     }
 
-    const groups = new Map();
+    // Sessions differ in length (individual 50 min, couple 80 min), so a clash
+    // is any overlap on the same day — not only an identical start time.
+    const packageIds = [...new Set((sessions || []).map((s) => s.package_id).filter(Boolean))];
+    const { data: packages } = packageIds.length
+      ? await supabaseAdmin.from('packages').select('id, package_type').in('id', packageIds)
+      : { data: [] };
+    const typeOf = new Map((packages || []).map((p) => [p.id, p.package_type]));
+
+    const byDay = new Map();
     for (const s of sessions || []) {
-      const key = `${s.psychologist_id}|${s.scheduled_date}|${s.scheduled_time}`;
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(s);
+      const start = toMinutes(s.scheduled_time);
+      if (start == null) continue;
+      const key = `${s.psychologist_id}|${s.scheduled_date}`;
+      if (!byDay.has(key)) byDay.set(key, []);
+      byDay.get(key).push({ s, start, end: start + sessionMinutesForPackageType(typeOf.get(s.package_id)) });
     }
 
-    const clashes = [...groups.values()].filter((g) => g.length > 1);
+    const clashes = [];
+    for (const list of byDay.values()) {
+      list.sort((a, b) => a.start - b.start);
+      let group = [list[0]];
+      let groupEnd = list[0].end;
+      for (const item of list.slice(1)) {
+        if (item.start < groupEnd) {
+          group.push(item);
+          groupEnd = Math.max(groupEnd, item.end);
+        } else {
+          if (group.length > 1) clashes.push(group.map((g) => g.s));
+          group = [item];
+          groupEnd = item.end;
+        }
+      }
+      if (group.length > 1) clashes.push(group.map((g) => g.s));
+    }
     // Sort chronologically for a readable report
     clashes.sort((a, b) =>
       (a[0].scheduled_date + a[0].scheduled_time).localeCompare(b[0].scheduled_date + b[0].scheduled_time)
@@ -113,7 +140,7 @@ class OverbookingCrawlerService {
       const { psychologist_id, scheduled_date, scheduled_time } = g[0];
       const rows = g.map((s) => `
         <li style="margin:4px 0;">
-          <strong>${fmtClient(s)}</strong>
+          <strong>${s.scheduled_time} · ${fmtClient(s)}</strong>
           <span style="color:#6b7280;"> — status: ${s.status} · source: ${s.source || '-'} · session: ${s.id}</span>
         </li>`).join('');
       return `
@@ -133,7 +160,8 @@ class OverbookingCrawlerService {
         </p>
         ${blocks}
         <p style="color:#9ca3af;font-size:12px;margin-top:18px;">
-          A slot is flagged when 2+ active sessions share the same therapist, date and time.
+          Sessions are flagged when 2+ active sessions for the same therapist overlap on the same day
+          (individual 50 min, couple 1 h 20 min) — not only when they start at the same time.
           This is an automated message from the Koott overbooking crawler.
         </p>
       </div>`;

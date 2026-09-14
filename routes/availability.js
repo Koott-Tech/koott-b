@@ -2,6 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const availabilityService = require('../utils/availabilityCalendarService');
+const { getBookableSlots, sessionMinutes, BREAK_MINUTES } = require('../utils/sessionSlots');
 const calendarSyncService = require('../services/calendarSyncService');
 const { successResponse, errorResponse } = require('../utils/helpers');
 const { globalCache } = require('../utils/cache');
@@ -256,6 +257,49 @@ router.get('/psychologist/:id/working-hours', async (req, res, next) => {
 
   } catch (error) {
     console.error('Error getting psychologist working hours:', error);
+    next(error);
+  }
+});
+
+/**
+ * GET /api/availability/public/psychologist/:id/slots?startDate=&endDate=
+ *     &type=individual|couple|psychiatry_15|psychiatry_30
+ * Bookable session starts, cut from the therapist's working hours by session
+ * length — individual 50 min, couple 80 min, psychiatry 15 or 30 min, 10-min
+ * break after each (see utils/sessionSlots.js). Dates and times are IST; each
+ * slot also carries `startsAt`, the absolute instant, so the booking UI can show
+ * it in the visitor's own time zone. Never cached: it must reflect the latest bookings.
+ */
+const SLOT_KINDS = ['individual', 'couple', 'psychiatry_15', 'psychiatry_30'];
+// Cached 30 s (cleared by any booking/payment write); payment re-checks the slot anyway.
+router.get('/public/psychologist/:id/slots', require('../utils/cache').cachePublic(30 * 1000), async (req, res, next) => {
+  try {
+    const { id: psychologistId } = req.params;
+    const { startDate, endDate } = req.query;
+    const kind = SLOT_KINDS.includes(req.query.type) ? req.query.type : 'individual';
+    const isYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ''));
+
+    if (!isYmd(startDate) || !isYmd(endDate) || startDate > endDate) {
+      return res.status(400).json(
+        errorResponse('startDate and endDate are required (YYYY-MM-DD, startDate <= endDate)')
+      );
+    }
+    if ((Date.parse(endDate) - Date.parse(startDate)) / 864e5 > 62) {
+      return res.status(400).json(errorResponse('The date range is limited to 62 days'));
+    }
+
+    const days = await getBookableSlots(psychologistId, startDate, endDate, kind);
+
+    res.set('Cache-Control', 'no-store');
+    res.json(successResponse({
+      timeZone: 'Asia/Kolkata',
+      type: kind,
+      sessionMinutes: sessionMinutes(kind),
+      breakMinutes: BREAK_MINUTES,
+      days
+    }, 'Bookable slots retrieved successfully'));
+  } catch (error) {
+    console.error('Error getting bookable slots:', error);
     next(error);
   }
 });

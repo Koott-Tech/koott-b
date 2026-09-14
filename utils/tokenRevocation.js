@@ -10,6 +10,12 @@ const { globalCache } = require('./cache');
 const { supabaseAdmin } = require('../config/supabase');
 const crypto = require('crypto');
 
+// A "not revoked" answer is remembered this long, so the check doesn't cost a database
+// round trip on every request. Revocations on this server apply at once (in-memory map /
+// cache are checked first, and revoking clears these entries); another server instance
+// picks one up within this window.
+const CLEAR_CHECK_TTL_MS = 60 * 1000;
+
 class TokenRevocationService {
   constructor() {
     this.revokedTokens = new Map(); // In-memory map for fast lookups (Map<tokenHash, revokedAt>)
@@ -44,6 +50,7 @@ class TokenRevocationService {
 
       // Add to in-memory map for fast lookups (store hash, not raw token)
       this.revokedTokens.set(tokenHash, Date.now());
+      globalCache.delete(`token_ok:${tokenHash}`);
 
       // Store in cache as backup
       if (this.useCache) {
@@ -115,6 +122,11 @@ class TokenRevocationService {
         }
       }
 
+      // Checked (and clear) within the last minute
+      if (globalCache.get(`token_ok:${tokenHash}`)) {
+        return false;
+      }
+
       // Check database (persistent storage)
       if (this.useDatabase) {
         try {
@@ -174,6 +186,7 @@ class TokenRevocationService {
             }
             return true;
           }
+          globalCache.set(`token_ok:${tokenHash}`, true, CLEAR_CHECK_TTL_MS);
         } catch (dbError) {
           // Check if it's a timeout/connection/network error (including fetch failed = Supabase unreachable)
           const errorMessage = dbError.message || String(dbError);
@@ -225,6 +238,9 @@ class TokenRevocationService {
         const cacheKey = `revoked_user:${userId}`;
         globalCache.set(cacheKey, true, ttl);
       }
+      // Forget the remembered "clear" answer and the signed-in user (middleware/auth.js)
+      globalCache.delete(`user_ok:${userId}`);
+      globalCache.delete(`auth_user:${userId}`);
 
       // Store in database for persistence
       if (this.useDatabase) {
@@ -281,6 +297,11 @@ class TokenRevocationService {
         }
       }
 
+      // Checked (and clear) within the last minute
+      if (globalCache.get(`user_ok:${userId}`)) {
+        return false;
+      }
+
       // Check database (persistent storage)
       if (this.useDatabase) {
         try {
@@ -319,6 +340,7 @@ class TokenRevocationService {
             }
             return true;
           }
+          globalCache.set(`user_ok:${userId}`, true, CLEAR_CHECK_TTL_MS);
         } catch (dbError) {
           const errMsg = dbError.message || String(dbError);
           const isNetworkError = errMsg.includes('fetch failed') ||

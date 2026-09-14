@@ -14,6 +14,12 @@ const emailService = require('../utils/emailService');
 const userInteractionLogger = require('../utils/userInteractionLogger');
 const { generateAndStoreReceipt } = require('../services/receiptService');
 const { processPaymentCaptured } = require('./razorpayWebhookController');
+const couponService = require('../services/couponService');
+const { isValidZone, saveClientTimeZone } = require('../utils/clientTimeZone');
+const { normalizePhone, phoneFromToken } = require('../utils/phoneVerification');
+
+// Where "booking failed after payment" / risk-check alerts go (set in .env).
+const PAYMENT_ALERT_EMAIL = process.env.PAYMENT_ALERT_EMAIL || process.env.COMPANY_ADMIN_EMAIL;
 const {
   buildKoottSessionDescription,
   buildKoottSessionTitle,
@@ -706,6 +712,11 @@ const generateNextShortReceiptNumber = async (retryCount = 0) => {
 
 // Create Razorpay payment order
 const createPaymentOrder = async (req, res) => {
+  // Declared out here because the catch block releases the slot lock with them; declared
+  // inside the try they were out of scope, so any failure (e.g. missing Razorpay keys)
+  // threw a ReferenceError from the catch and the request never got a response.
+  let slotLockResult = null;
+  let razorpayOrder = null;
   try {
     console.log('🔍 Payment Request Body:', req.body);
     
@@ -722,7 +733,9 @@ const createPaymentOrder = async (req, res) => {
       scheduledDate,
       scheduledTime,
       assessmentSessionId,
-      assessmentType
+      assessmentType,
+      couponCode,
+      clientTimeZone // browser IANA zone — only used to word the client's email/WhatsApp
     } = req.body;
 
     // SECURITY FIX: Always use clientId from authenticated user, ignore from request body
@@ -785,13 +798,14 @@ const createPaymentOrder = async (req, res) => {
     // SECURITY FIX: Server-side price validation
     // Validate amount against package/psychologist pricing
     let expectedPrice = null;
-    
+    let packageType = 'individual';
+
     if (packageId && packageId !== 'individual' && packageId !== 'null' && packageId !== 'undefined') {
       // Package booking - validate against package price
       // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
       const { data: packageData, error: packageError } = await supabaseAdmin
         .from('packages')
-        .select('price, psychologist_id')
+        .select('price, psychologist_id, package_type')
         .eq('id', packageId)
         .eq('psychologist_id', psychologistId)
         .single();
@@ -805,6 +819,7 @@ const createPaymentOrder = async (req, res) => {
       }
       
       expectedPrice = packageData.price;
+      packageType = packageData.package_type;
       console.log('💰 Package price validation:', {
         packageId,
         expectedPrice,
@@ -836,6 +851,11 @@ const createPaymentOrder = async (req, res) => {
       });
     }
     
+    // NOTE ON COUPONS: the client sends `couponCode`, never a discounted amount.
+    // `amount` is still checked against the true list price below; the discount
+    // is computed here on the server and applied to `chargeableAmount`, which is
+    // what actually reaches Razorpay. See applyCouponIfPresent further down.
+
     // Validate amount matches expected price (allow 0.01 INR tolerance for rounding)
     if (expectedPrice && Math.abs(amount - expectedPrice) > 0.01) {
       console.error('❌ Price mismatch detected:', {
@@ -869,6 +889,27 @@ const createPaymentOrder = async (req, res) => {
       });
     }
 
+    // Therapy bookings: the start must still be free for this session's length
+    // (individual 50 min / couple 80 min, 10-min break after each) before any
+    // money moves. Assessments have their own slots and skip this.
+    if (!assessmentSessionId && !assessmentType) {
+      const { checkSlotBookable } = require('../utils/sessionSlots');
+      const slotCheck = await checkSlotBookable({
+        psychologistId,
+        date: scheduledDate,
+        time: scheduledTime,
+        packageType,
+        ignoreClientId: actualClientId
+      });
+      if (!slotCheck.ok) {
+        return res.status(409).json({
+          success: false,
+          message: slotCheck.message,
+          conflict: true
+        });
+      }
+    }
+
     const razorpayConfig = getRazorpayConfig();
     const razorpay = getRazorpayInstance();
     
@@ -890,8 +931,42 @@ const createPaymentOrder = async (req, res) => {
     // Generate transaction ID (receipt ID for Razorpay)
     const txnid = generateTransactionId();
     
+    // ── Coupon ────────────────────────────────────────────────────────────
+    // Validated and applied on the server. The browser only ever sends a code,
+    // so a forged discount cannot reach Razorpay. If the code is invalid we
+    // fail the request rather than silently charging full price — the client
+    // has been shown a discounted total and must not be surprised.
+    let chargeableAmount = amount;
+    let appliedCoupon = null;
+
+    if (couponCode) {
+      const couponResult = await couponService.validateCoupon({
+        code: couponCode,
+        amount,
+        clientId: actualClientId,
+      });
+
+      if (!couponResult.valid) {
+        console.warn('🎟️ Coupon rejected at order time:', couponCode, couponResult.reason);
+        return res.status(400).json({
+          success: false,
+          message: couponResult.reason,
+          code: 'COUPON_INVALID',
+        });
+      }
+
+      chargeableAmount = couponResult.finalAmount;
+      appliedCoupon = couponResult;
+      console.log('🎟️ Coupon applied:', {
+        code: couponResult.coupon.code,
+        original: couponResult.originalAmount,
+        discount: couponResult.discountAmount,
+        final: couponResult.finalAmount,
+      });
+    }
+
     // Convert amount to paise (Razorpay uses smallest currency unit)
-    const amountInPaise = Math.round(amount * 100);
+    const amountInPaise = Math.round(chargeableAmount * 100);
     
     // Create Razorpay order
     const orderOptions = {
@@ -909,12 +984,51 @@ const createPaymentOrder = async (req, res) => {
         assessmentType: assessmentType || '',
         sessionType: sessionType,
         clientName: clientName,
-        clientEmail: clientEmail
+        clientEmail: clientEmail,
+        couponCode: appliedCoupon ? appliedCoupon.coupon.code : '',
+        clientTimeZone: isValidZone(clientTimeZone) ? clientTimeZone : ''
       }
     };
 
+    // Remember the client's zone for later reminders/reschedules (no-op until migration 0005)
+    saveClientTimeZone(actualClientId, clientTimeZone).catch(() => {});
+
+    // Mobile number proven by the WhatsApp code (BookingFlow's first step). A token sent
+    // with the order must match clientPhone, and that number is saved on the client, so
+    // booking WhatsApps go to a number the client holds. REQUIRE_PHONE_OTP=true makes it
+    // mandatory for every booking — leave it off while the older booking pages
+    // (therapist-profile, online-child-psychologist) that have no code step are live.
+    const { phoneVerificationToken } = req.body;
+    if (!assessmentSessionId && (phoneVerificationToken || process.env.REQUIRE_PHONE_OTP === 'true')) {
+      const verifiedPhone = phoneFromToken(phoneVerificationToken);
+      if (!verifiedPhone || verifiedPhone !== normalizePhone(clientPhone)) {
+        return res.status(400).json({
+          success: false,
+          code: 'PHONE_NOT_VERIFIED',
+          message: 'Please verify your mobile number before paying.'
+        });
+      }
+      const { error: phoneSaveError } = await supabaseAdmin
+        .from('clients')
+        .update({ phone_number: verifiedPhone })
+        .eq('id', actualClientId);
+      if (phoneSaveError) console.warn('⚠️ Could not save verified phone on client:', phoneSaveError.message);
+    }
+
+    // Age / emergency contact from "About yourself" (clients columns from migration 0010)
+    const { clientAge, emergencyContact } = req.body;
+    const aboutFields = {};
+    const ageNum = Number(clientAge);
+    if (Number.isInteger(ageNum) && ageNum > 0 && ageNum < 130) aboutFields.age = ageNum;
+    if (typeof emergencyContact === 'string' && emergencyContact.trim()) {
+      aboutFields.emergency_contact = emergencyContact.trim().slice(0, 40);
+    }
+    if (Object.keys(aboutFields).length) {
+      supabaseAdmin.from('clients').update(aboutFields).eq('id', actualClientId)
+        .then(({ error }) => { if (error) console.warn('⚠️ Could not save age/emergency contact:', error.message); });
+    }
+
     console.log('📦 Creating Razorpay order...');
-    let razorpayOrder;
     try {
       // Add timeout for Razorpay API call (30 seconds)
       const razorpayPromise = razorpay.orders.create(orderOptions);
@@ -946,7 +1060,7 @@ const createPaymentOrder = async (req, res) => {
     // CRITICAL: Hold slot BEFORE creating payment record
     // This prevents double booking during payment process
     // If slot_locks table doesn't exist, this will fail gracefully and we'll use legacy mode
-    let slotLockResult = null;
+    slotLockResult = null;
     try {
       const { holdSlot } = require('../services/slotLockService');
       console.log('🔒 Holding slot before payment...');
@@ -1024,7 +1138,7 @@ const createPaymentOrder = async (req, res) => {
       psychologist_id: psychologistId,
       client_id: actualClientId, // Use actual clientId from JWT token
       package_id: packageId === 'individual' ? null : packageId, // Set to null for individual sessions
-      amount: amount,
+      amount: chargeableAmount,
       session_type: sessionType,
       status: 'pending',
       razorpay_params: {
@@ -1040,6 +1154,15 @@ const createPaymentOrder = async (req, res) => {
       created_at: new Date().toISOString()
     };
     
+    // Record what the coupon took off, so finance sees gross vs net without
+    // joining back through coupon_redemptions.
+    if (appliedCoupon) {
+      paymentData.coupon_id = appliedCoupon.coupon.id;
+      paymentData.coupon_code = appliedCoupon.coupon.code;
+      paymentData.discount_amount = appliedCoupon.discountAmount;
+      paymentData.original_amount = appliedCoupon.originalAmount;
+    }
+
     // Add assessment_session_id if assessment booking (only if column exists)
     if (assessmentSessionId) {
       paymentData.assessment_session_id = assessmentSessionId;
@@ -1091,6 +1214,25 @@ const createPaymentOrder = async (req, res) => {
       console.log('📤 Sending payment response to frontend...');
     }
     
+    // Record the redemption only now that the order and payment row exist, so an
+    // abandoned checkout never consumes a coupon. A failure here must not fail
+    // the payment — it is logged and reconciled from payments.coupon_id.
+    if (appliedCoupon && paymentRecord) {
+      try {
+        await couponService.recordRedemption({
+          couponId: appliedCoupon.coupon.id,
+          clientId: actualClientId,
+          orderId: razorpayOrder.id,
+          paymentId: paymentRecord.id,
+          originalAmount: appliedCoupon.originalAmount,
+          discountAmount: appliedCoupon.discountAmount,
+          finalAmount: appliedCoupon.finalAmount,
+        });
+      } catch (redemptionError) {
+        console.error('🎟️ Coupon redemption not recorded:', redemptionError);
+      }
+    }
+
     // Prepare response data
     const responseData = {
       success: true,
@@ -1098,8 +1240,13 @@ const createPaymentOrder = async (req, res) => {
         paymentId: paymentRecord.id,
         transactionId: txnid,
         orderId: razorpayOrder.id,
-        amount: amount,
+        // What is actually charged, matching amountInPaise. `originalAmount`
+        // and `discountAmount` let the checkout show the saving.
+        amount: chargeableAmount,
         amountInPaise: amountInPaise,
+        originalAmount: appliedCoupon ? appliedCoupon.originalAmount : amount,
+        discountAmount: appliedCoupon ? appliedCoupon.discountAmount : 0,
+        couponCode: appliedCoupon ? appliedCoupon.coupon.code : null,
         currency: 'INR',
         keyId: razorpayConfig.keyId,
         name: 'Koott',
@@ -1793,7 +1940,8 @@ const handlePaymentSuccess = async (req, res) => {
       const quotaCheck = await assertClientPackageHasAvailableSlot(
         supabaseAdmin,
         clientId,
-        pkgForQuota
+        pkgForQuota,
+        { purchasePaymentId: paymentRecord.id } // this booking was just paid for
       );
       if (!quotaCheck.ok) {
         console.error('❌ Package quota exceeded:', quotaCheck);
@@ -1951,7 +2099,7 @@ const handlePaymentSuccess = async (req, res) => {
       // Send error notification email to admin
       try {
         await emailService.sendEmail({
-          to: 'abhishekravi063@gmail.com',
+          to: PAYMENT_ALERT_EMAIL,
           subject: '🚨 Booking Failed After Payment - Action Required',
           html: `
             <h2>Booking Failed After Payment</h2>
@@ -2382,7 +2530,10 @@ const handlePaymentSuccess = async (req, res) => {
             clientId: session.client_id || clientId,
             receiptId: receiptResult?.receiptId || null, // Pass receipt ID for reference
             receiptNumber: receiptResult?.receiptNumber || null,
-            receiptPdfBuffer: receiptResult?.pdfBuffer || null // Pass PDF buffer to attach to email
+            receiptPdfBuffer: receiptResult?.pdfBuffer || null, // Pass PDF buffer to attach to email
+            // Client email shows the time in the client's zone (IST stays for therapist/admin)
+            clientTimeZone: paymentRecord.razorpay_params?.notes?.clientTimeZone || null,
+            clientPhone: clientDetails.phone_number || null
       });
       
           console.log('✅ Confirmation emails sent successfully with receipt (async)');
@@ -2451,6 +2602,7 @@ const handlePaymentSuccess = async (req, res) => {
           date: actualScheduledDate,
           time: actualScheduledTime,
           meetLink: meetData.meetLink,
+          clientTimeZone: paymentRecord.razorpay_params?.notes?.clientTimeZone || null,
         });
         if (clientWaResult?.success) {
               console.log('✅ WhatsApp confirmation sent to client (receipt sent via email with PDF attachment)');
@@ -2654,7 +2806,9 @@ const handlePaymentSuccess = async (req, res) => {
             status: 'failure',
             details: {
               sessionId: session.id,
-              clientPhone: clientPhone,
+              // `clientPhone` is block-scoped to the try above; referencing it here threw a
+              // ReferenceError inside this catch — an unhandled rejection with no handler.
+              clientPhone: clientDetails?.phone_number || null,
               psychologistPhone: psychologistDetails?.phone,
               failureReason: failureReason,
               errorCode: whatsappError?.code,
@@ -2807,7 +2961,7 @@ const handlePaymentSuccess = async (req, res) => {
       const razorpay_payment_id = params.razorpay_payment_id || 'Unknown';
       
       await emailService.sendEmail({
-        to: 'abhishekravi063@gmail.com',
+        to: PAYMENT_ALERT_EMAIL,
         subject: '🚨 Booking Failed After Payment - Action Required',
         html: `
           <h2>Booking Failed After Payment</h2>
@@ -2976,7 +3130,7 @@ const handlePaymentFailure = async (req, res) => {
       try {
         // emailService is already imported at the top of the file
         await emailService.sendEmail({
-          to: 'abhishekravi063@gmail.com',
+          to: PAYMENT_ALERT_EMAIL,
           subject: '⚠️ Payment Risk Check Failed - Review Required',
           html: `
             <h2>Payment Risk Check Failed</h2>

@@ -2,6 +2,12 @@ const jwt = require('jsonwebtoken');
 const supabase = require('../config/supabase');
 const supabaseAdmin = require('../config/supabase').supabaseAdmin;
 const tokenRevocationService = require('../utils/tokenRevocation');
+const { globalCache } = require('../utils/cache');
+
+// The signed-in user behind a backend JWT, remembered briefly. Resolving it was a chain
+// of sequential queries on every request (~2 s from far-off regions). revokeUserTokens
+// clears the entry; other changes (e.g. is_active) are picked up within this window.
+const AUTH_USER_TTL_MS = 60 * 1000;
 
 // Verify JWT token (handles both backend JWT and Supabase JWT)
 const authenticateToken = async (req, res, next) => {
@@ -282,13 +288,22 @@ const authenticateToken = async (req, res, next) => {
       });
     }
     
-    // Use supabaseAdmin to bypass RLS for authentication lookups
+    const cacheKey = `auth_user:${userId}`;
+    const cachedUser = globalCache.get(cacheKey);
+    if (cachedUser) {
+      req.user = { ...cachedUser };
+      return next();
+    }
+
+    // Use supabaseAdmin to bypass RLS for authentication lookups. Psychologist, user and
+    // client rows are fetched together rather than one after another.
+    const [psychologistLookup, userLookup, clientLookup] = await Promise.all([
+      supabaseAdmin.from('psychologists').select('*').eq('id', userId).maybeSingle(),
+      supabaseAdmin.from('users').select('*').eq('id', userId).maybeSingle(),
+      supabaseAdmin.from('clients').select('*').eq('user_id', userId).maybeSingle()
+    ]);
     // Check if it's a psychologist first (since login checks psychologists table first)
-    const { data: psychologist, error: psychologistError } = await supabaseAdmin
-      .from('psychologists')
-      .select('*')
-      .eq('id', userId)
-      .single();
+    const { data: psychologist, error: psychologistError } = psychologistLookup;
 
     if (psychologist && !psychologistError) {
       // Psychologist exists in psychologists table (standalone)
@@ -299,6 +314,7 @@ const authenticateToken = async (req, res, next) => {
         created_at: psychologist.created_at,
         updated_at: psychologist.updated_at
       };
+      globalCache.set(cacheKey, req.user, AUTH_USER_TTL_MS);
       return next();
     }
 
@@ -306,11 +322,7 @@ const authenticateToken = async (req, res, next) => {
     if (process.env.NODE_ENV === 'development' && process.env.DEBUG_AUTH === 'true') {
       console.log('🔍 Looking up user in users table with userId:', userId);
     }
-    const { data: user, error: userError } = await supabaseAdmin
-      .from('users')
-      .select('*')
-      .eq('id', userId)
-      .single();
+    const { data: user, error: userError } = userLookup;
 
     if (process.env.NODE_ENV === 'development' && process.env.DEBUG_AUTH === 'true') {
       console.log('🔍 User lookup result:', { 
@@ -354,11 +366,7 @@ const authenticateToken = async (req, res, next) => {
 
     // If user is a client, fetch the client profile data
     if (user.role === 'client') {
-      const { data: client, error: clientError } = await supabaseAdmin
-        .from('clients')
-        .select('*')
-        .eq('user_id', userId)
-        .single();
+      const { data: client, error: clientError } = clientLookup;
 
       if (client && !clientError) {
         // Combine user and client data
@@ -396,6 +404,7 @@ const authenticateToken = async (req, res, next) => {
       req.user = user;
     }
 
+    globalCache.set(cacheKey, req.user, AUTH_USER_TTL_MS);
     next();
   } catch (error) {
     if (error.name === 'TokenExpiredError') {

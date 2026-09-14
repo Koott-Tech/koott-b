@@ -200,9 +200,17 @@ class UserInteractionLogger {
   }
 
   /**
-   * Log user interaction to Supabase Storage
+   * Log user interaction to Supabase Storage — fire-and-forget. Each write lists,
+   * downloads and re-uploads the user's whole log file (2–4 s), and the payment
+   * paths log several times per request, so waiting on it made "Proceed to pay"
+   * and the post-payment confirmation take 10–30 s. Writes stay serialized per file.
    */
-  async logInteraction({
+  logInteraction(entry) {
+    this.writeInteraction(entry).catch(() => {});
+    return Promise.resolve();
+  }
+
+  async writeInteraction({
     userId,
     userRole = 'client',
     action,

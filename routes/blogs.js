@@ -12,7 +12,8 @@ const {
 const { upload, uploadBlogImage, uploadMultipleBlogImages } = require('../controllers/blogUploadController');
 
 // Public routes
-router.get('/', getAllBlogs);
+// Public list, cached briefly (cleared by any write — see utils/cache.js)
+router.get('/', require('../utils/cache').cachePublic(10 * 60 * 1000), getAllBlogs);
 router.get('/slug/:slug', getBlogBySlug);
 
 // Admin routes

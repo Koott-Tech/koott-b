@@ -258,6 +258,32 @@ router.post('/sessions/:sessionId/transfer', sessionController.transferSession);
 router.delete('/sessions/:sessionId', sessionController.deleteSession);
 router.get('/psychologists/:psychologistId/availability', adminController.getPsychologistAvailabilityForReschedule);
 
+// Weekly working hours per therapist (IST) — bookable slots are cut from these
+const workingHoursController = require('../controllers/workingHoursController');
+router.get('/psychologists/:psychologistId/working-hours', workingHoursController.getWorkingHours);
+router.put('/psychologists/:psychologistId/working-hours', workingHoursController.updateWorkingHours);
+
+// Psychiatrist consultation pricing: 15 / 30 min + 15-min packages (packages rows)
+const psychiatryPricingController = require('../controllers/psychiatryPricingController');
+router.get('/psychologists/:psychologistId/psychiatry-pricing', psychiatryPricingController.getPricing);
+router.put('/psychologists/:psychologistId/psychiatry-pricing', psychiatryPricingController.updatePricing);
+
+// Therapist groups (A, B, C …) — internal, for admin / finance reporting only
+const therapistGroupsController = require('../controllers/therapistGroupsController');
+router.get('/therapist-groups', therapistGroupsController.list);
+router.post('/therapist-groups', therapistGroupsController.create);
+router.put('/therapist-groups/:groupId', therapistGroupsController.update);
+router.delete('/therapist-groups/:groupId', therapistGroupsController.remove);
+router.put('/psychologists/:psychologistId/therapist-group', therapistGroupsController.assign);
+
+// Booking-page card order: a repeating pattern of groups (A, B, B, C …)
+const therapistListingController = require('../controllers/therapistListingController');
+router.get('/therapist-listing-pattern', therapistListingController.getPattern);
+router.put('/therapist-listing-pattern', therapistListingController.savePattern);
+
+// Booking-flow leads (verified mobile numbers, booked or not)
+router.get('/booking-leads', require('../controllers/bookingLeadsController').list);
+
 // Manual booking (admin only - for edge cases)
 router.post('/bookings/manual', adminController.createManualBooking);
 

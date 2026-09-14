@@ -17,6 +17,26 @@ class AvailabilityCalendarService {
    * This checks for existing sessions and blocks those time slots
    */
   async getPsychologistAvailability(psychologistId, date) {
+    // One day of the range read — the availability table plus bookings, the
+    // same source the range endpoint and the booking flow use. The Google
+    // version below never worked here: `calendar()` is async and was not
+    // awaited, so `this.calendar.events` was undefined and every call 500'd.
+    const [day] = await this.getPsychologistAvailabilityRange(psychologistId, date, date);
+    return day || {
+      date,
+      psychologistId,
+      timeSlots: [],
+      totalSlots: 0,
+      availableSlots: 0,
+      blockedSlots: 0
+    };
+  }
+
+  /**
+   * Legacy: availability straight from Google Calendar. Unused — kept for
+   * reference until the calendar client is awaited properly.
+   */
+  async getPsychologistAvailabilityFromGoogle(psychologistId, date) {
     try {
       console.log(`🔍 Getting availability for psychologist ${psychologistId} on ${date}`);
       

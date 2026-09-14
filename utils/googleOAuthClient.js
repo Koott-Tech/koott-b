@@ -167,6 +167,10 @@ function getOAuth2Client() {
     } catch (error) {
       console.log('⚠️ Error loading tokens from environment:', error.message);
     }
+  } else if (process.env.GOOGLE_REFRESH_TOKEN && !oAuth2Client.credentials?.refresh_token) {
+    // Company account token (care@koott.in) — the same one meetLinkService falls back to.
+    oAuth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+    console.log('✅ Company OAuth refresh token loaded from GOOGLE_REFRESH_TOKEN');
   } else {
     console.log('⚠️ OAuth environment variables not found or incomplete');
   }

@@ -160,7 +160,8 @@ const createSessionFromSlotLock = async (slotLock) => {
       const quotaCheck = await assertClientPackageHasAvailableSlot(
         supabaseAdmin,
         slotLock.client_id,
-        pkgForQuota
+        pkgForQuota,
+        { purchasePaymentId: paymentRecord.id } // this booking was just paid for
       );
       if (!quotaCheck.ok) {
         console.error('❌ Package quota exceeded (slot lock):', quotaCheck);
@@ -287,6 +288,9 @@ const createSessionFromSlotLock = async (slotLock) => {
 
     // Update slot lock to SESSION_CREATED
     await updateSlotLockStatus(slotLock.order_id, 'SESSION_CREATED');
+
+    // Their booking-flow lead (if any) is now a booking
+    require('../utils/bookingAccounts').markLeadBooked(slotLock.client_id).catch(() => {});
 
     // Log booking
     await userInteractionLogger.logBooking({
@@ -482,8 +486,10 @@ class MeetLinkCreationQueue {
     const { addMinutesToTime } = require('../utils/helpers');
     const endTime = addMinutesToTime(slotLock.scheduled_time, meetDurationMinutes);
 
-    // TEMPORARY: disable auto Google Meet scheduling for new bookings.
-    const DISABLE_AUTO_GOOGLE_MEET_ON_BOOKING = true;
+    // Meet + calendar event on every booking (therapist's Google, else the company account).
+    const DISABLE_AUTO_GOOGLE_MEET_ON_BOOKING = false;
+    let meetLink = null;
+    let meetEventId = null;
 
     // Create Google Meet link
     // Handle client name: prefer child_name, but skip if it's "Pending" or empty
@@ -511,8 +517,11 @@ class MeetLinkCreationQueue {
 
     // Get psychologist OAuth tokens if available
     let userAuth = null;
-    if (psychologistDetails.google_calendar_credentials) {
-      const credentials = psychologistDetails.google_calendar_credentials;
+    let credentials = psychologistDetails.google_calendar_credentials;
+    if (typeof credentials === 'string') {
+      try { credentials = JSON.parse(credentials); } catch (_) { credentials = null; }
+    }
+    if (credentials?.access_token) {
       userAuth = {
         access_token: credentials.access_token,
         refresh_token: credentials.refresh_token,
@@ -526,6 +535,8 @@ class MeetLinkCreationQueue {
       const meetResult = await meetLinkService.generateSessionMeetLink(meetSessionData, userAuth);
 
       if (meetResult.success && meetResult.meetLink) {
+        meetLink = meetResult.meetLink;
+        meetEventId = meetResult.eventId || null;
         const { error: updateError } = await supabaseAdmin
           .from('sessions')
           .update({ 
@@ -614,10 +625,81 @@ class MeetLinkCreationQueue {
       // Continue even if receipt generation fails
     }
 
-    // TEMPORARY: Auto booking notifications are disabled.
-    // Keep the existing code in git history; re-enable when needed.
-    // (Disabled: email to client/psychologist + WhatsApp to client/psychologist)
-    console.log('ℹ️ Booking notifications are temporarily disabled (sessionCreationService).');
+    // Booking notifications: email to client / therapist / admin, then WhatsApp to
+    // client and therapist. The client copies show the client's own time zone.
+    const clientTimeZone = paymentRecord.razorpay_params?.notes?.clientTimeZone || null;
+    try {
+      const emailResult = await emailService.sendSessionConfirmation({
+        clientName,
+        psychologistName,
+        sessionDate: slotLock.scheduled_date,
+        sessionTime: slotLock.scheduled_time,
+        durationMinutes: meetDurationMinutes,
+        sessionDuration: `${meetDurationMinutes} minutes`,
+        clientEmail,
+        psychologistEmail: psychologistDetails.email,
+        googleMeetLink: meetLink,
+        googleCalendarEventId: meetEventId,
+        sessionId: session.id,
+        price: paymentRecord.amount,
+        amount: paymentRecord.amount,
+        status: session.status || 'booked',
+        psychologistId: slotLock.psychologist_id,
+        clientId: slotLock.client_id,
+        packageInfo,
+        receiptId: receiptResult?.receiptId || null,
+        receiptNumber: receiptResult?.receiptNumber || null,
+        receiptPdfBuffer: receiptResult?.pdfBuffer || null,
+        clientTimeZone,
+        clientPhone: clientDetails.phone_number || null
+      });
+      console.log('📧 Booking emails:', emailResult?.success ? 'sent' : 'failed', emailResult?.clientEmailError || '');
+    } catch (emailError) {
+      console.error('❌ Booking emails failed:', emailError?.message || emailError);
+    }
+
+    // The WhatsApp templates carry the Meet link, so they need one.
+    if (!meetLink) {
+      console.warn('⚠️ No Meet link for session', session.id, '— skipping booking WhatsApp messages');
+      return;
+    }
+    const interaktService = require('../utils/interaktService');
+    const describe = (r) => (r?.success ? 'sent' : `not sent (${r?.reason || r?.error?.message || r?.error || 'unknown'})`);
+
+    if (clientDetails.phone_number) {
+      try {
+        const r = await interaktService.sendBookingConfirmation(clientDetails.phone_number, {
+          clientName,
+          psychologistName,
+          date: slotLock.scheduled_date,
+          time: slotLock.scheduled_time,
+          meetLink,
+          clientTimeZone
+        });
+        console.log('📱 Client booking WhatsApp:', describe(r));
+      } catch (waError) {
+        console.error('❌ Client booking WhatsApp failed:', waError?.message || waError);
+      }
+    } else {
+      console.log('ℹ️ Client has no phone number — skipping client WhatsApp');
+    }
+
+    if (psychologistDetails.phone) {
+      try {
+        const r = await interaktService.sendSessionNotificationPsychologist(psychologistDetails.phone, {
+          therapistName: psychologistName,
+          clientName,
+          date: slotLock.scheduled_date,
+          time: slotLock.scheduled_time,
+          meetLink
+        });
+        console.log('📱 Therapist booking WhatsApp:', describe(r));
+      } catch (waError) {
+        console.error('❌ Therapist booking WhatsApp failed:', waError?.message || waError);
+      }
+    } else {
+      console.log('ℹ️ Therapist has no phone number — skipping therapist WhatsApp');
+    }
   }
 }
 
