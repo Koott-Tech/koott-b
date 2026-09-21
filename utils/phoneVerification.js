@@ -10,6 +10,15 @@
  * PHONE_OTP_DEV_ECHO=true (never in production) returns the code in the API
  * response when WhatsApp sending fails — for local testing before the
  * template is approved.
+ *
+ * TEST NUMBERS — TEMPORARY, REMOVE BEFORE LAUNCH. Numbers listed in
+ * PHONE_OTP_TEST_NUMBERS skip WhatsApp entirely and take PHONE_OTP_TEST_CODE
+ * (default 1234) as their code, so the booking flow can be walked end to end
+ * while the Interakt template is still in review. Deliberately a short list of
+ * reserved numbers rather than "any number with 1234": a verified number signs
+ * the client straight into the account holding it, so a blanket code would let
+ * anyone type someone else's number and land inside their account. Unset the
+ * variable and the bypass does not exist.
  */
 
 const crypto = require('crypto');
@@ -37,6 +46,12 @@ function normalizePhone(raw) {
   return parsed && parsed.isValid() ? parsed.number : null;
 }
 
+/** Reserved numbers that take the fixed code instead of one sent on WhatsApp. */
+const testNumbers = () => String(process.env.PHONE_OTP_TEST_NUMBERS || '')
+  .split(',').map((n) => normalizePhone(n)).filter(Boolean);
+const testCode = () => String(process.env.PHONE_OTP_TEST_CODE || '1234').trim();
+const isTestNumber = (phone) => testNumbers().includes(phone);
+
 const hashCode = (phone, code) => crypto.createHmac('sha256', secret()).update(`${phone}:${code}`).digest('hex');
 
 const fail = (status, message, extra = {}) => ({ ok: false, status, message, ...extra });
@@ -44,6 +59,20 @@ const fail = (status, message, extra = {}) => ({ ok: false, status, message, ...
 async function sendCode(rawPhone) {
   const phone = normalizePhone(rawPhone);
   if (!phone) return fail(400, 'Please enter a valid mobile number.');
+
+  // A reserved test number: nothing is sent and nothing is stored, and the
+  // fixed code is what verifyCode will accept.
+  if (isTestNumber(phone)) {
+    console.warn(`⚠️  OTP bypass used for test number ${phone} — clear PHONE_OTP_TEST_NUMBERS before launch`);
+    return {
+      ok: true,
+      phone,
+      expiresAt: new Date(Date.now() + CODE_TTL_MINUTES * 60 * 1000).toISOString(),
+      resendAfter: 0,
+      devCode: testCode(),
+      testNumber: true,
+    };
+  }
 
   const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   const { data: recent, error } = await supabaseAdmin
@@ -100,7 +129,15 @@ async function sendCode(rawPhone) {
 async function verifyCode(rawPhone, rawCode) {
   const phone = normalizePhone(rawPhone);
   const code = String(rawCode || '').replace(/\D/g, '');
-  if (!phone || code.length !== 6) return fail(400, 'Please enter the 6-digit code.');
+  if (!phone) return fail(400, 'Please enter a valid mobile number.');
+
+  if (isTestNumber(phone)) {
+    if (code !== testCode()) return fail(400, 'That code is not right.');
+    console.warn(`⚠️  OTP bypass accepted for test number ${phone}`);
+    return { ok: true, phone, token: jwt.sign({ purpose: TOKEN_PURPOSE, phone }, secret(), { expiresIn: TOKEN_TTL }) };
+  }
+
+  if (code.length !== 6) return fail(400, 'Please enter the 6-digit code.');
 
   const { data: row, error } = await supabaseAdmin
     .from('phone_verifications')
