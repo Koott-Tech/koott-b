@@ -338,6 +338,7 @@ const formatPublicPsychologist = (psych) => {
     designation: psych.designation || '',
     languages_json: mergedLanguagesJson, // Keep for backward compatibility, but uses defaults only
     description: psych.description || 'Professional psychologist dedicated to helping clients achieve mental wellness.',
+    card_intro: psych.card_intro || '',
     profile_picture_url: null,
     cover_image_url: psych.cover_image_url,
     price: extractedPrice,
@@ -366,6 +367,7 @@ const formatPublicPsychologistCard = (psych) => {
     cover_image_url: full.cover_image_url,
     price: full.price,
     short_description: short,
+    card_intro: full.card_intro,
     description: full.description || fullDesc,
     personality_traits: [],
     area_of_expertise: full.area_of_expertise || [],
@@ -392,15 +394,14 @@ app.get('/api/public/psychologists', cachePublic(10 * 60 * 1000), async (req, re
     // Only show active psychologists on client-facing pages
     // OPTIMIZED: Removed unused fields (ug_college, pg_college, phd_college, phone, languages_json, faq fields)
     // Description kept for modal view, but could be lazy-loaded in future optimization
-    const { data: psychologists, error: psychologistsError } = await supabaseAdmin
-      .from('psychologists')
-      .select(`
+    const listColumns = `
         id,
         email,
         first_name,
         last_name,
         area_of_expertise,
         description,
+        card_intro,
         experience_years,
         cover_image_url,
         individual_session_price,
@@ -409,10 +410,21 @@ app.get('/api/public/psychologists', cachePublic(10 * 60 * 1000), async (req, re
         designation,
         specialist_category,
         better_parent_pricing
-      `)
+      `;
+    const fetchList = (columns) => supabaseAdmin
+      .from('psychologists')
+      .select(columns)
       .neq('email', assessmentEmail)
       .eq('is_active', true) // Only show active psychologists on client-facing pages
       .order('created_at', { ascending: false });
+
+    let { data: psychologists, error: psychologistsError } = await fetchList(listColumns);
+    // card_intro comes from migration 0003. Until that has been run, list without it
+    // rather than taking the whole listing down.
+    if (psychologistsError?.code === '42703' && /card_intro/.test(psychologistsError.message || '')) {
+      console.warn('psychologists.card_intro is missing — run supabase/migrations/0003_psychologist_card_intro.sql');
+      ({ data: psychologists, error: psychologistsError } = await fetchList(listColumns.replace(/\s*card_intro,/, '')));
+    }
 
     if (psychologistsError) {
       console.error('Error fetching psychologists:', psychologistsError);

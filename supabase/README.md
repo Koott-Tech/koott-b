@@ -4,7 +4,7 @@
 
 Open your Supabase project → **SQL Editor** → New query → paste the entire contents
 of `migrations/0001_initial_schema.sql` → **Run**. Then do the same with
-`migrations/0002_missing_finance_columns.sql`.
+`migrations/0002_missing_finance_columns.sql`, then `migrations/0003_psychologist_card_intro.sql`.
 
 42 tables, ~593 columns. Both files are safe to re-run (`if not exists` throughout).
 

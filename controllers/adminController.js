@@ -2496,6 +2496,7 @@ const createPsychologist = async (req, res) => {
       phd_college, 
       area_of_expertise, 
       description,
+      card_intro,
       designation,
       experience_years, 
       availability,
@@ -2584,6 +2585,7 @@ const createPsychologist = async (req, res) => {
       phone,
       area_of_expertise: area_of_expertise || null,
       description: description || null,
+      card_intro: card_intro?.trim() || null,
       designation: designation?.trim() || null,
       experience_years: experience_years || 0,
       cover_image_url: cover_image_url || null,
@@ -5745,7 +5747,7 @@ const getTherapistsSummary = async (req, res) => {
 
     const { data: psychologists, error: psychErr } = await supabaseAdmin
       .from('psychologists')
-      .select('id, email, first_name, last_name, phone, designation, profile_picture_url, cover_image_url, description, experience_years, area_of_expertise, created_at, google_calendar_credentials')
+      .select('id, email, first_name, last_name, phone, designation, profile_picture_url, cover_image_url, description, card_intro, experience_years, area_of_expertise, created_at, google_calendar_credentials')
       .limit(5000);
 
     if (psychErr) {
@@ -5815,6 +5817,7 @@ const getTherapistsSummary = async (req, res) => {
           profile_picture_url: p.profile_picture_url,
           cover_image_url: p.cover_image_url,
           description: p.description,
+          card_intro: p.card_intro,
           experience_years: p.experience_years,
           area_of_expertise: p.area_of_expertise,
           createdAt: p.created_at,
