@@ -919,6 +919,9 @@ app.use('/api/finance', financeRoutes);
 // Therapist groups — read-only report for finance/admin (management is under /api/admin)
 app.use('/api/therapist-groups', require('./routes/therapistGroups'));
 app.use('/api/coupons', couponRoutes);
+// First-party analytics (public, rate-limited) and the marketing dashboard API (marketing/admin roles)
+app.use('/api/analytics', require('./routes/analytics'));
+app.use('/api/marketing', require('./routes/marketing'));
 
 // 404 handler
 app.use('*', (req, res) => {
@@ -1032,6 +1035,9 @@ console.log(`🚀 Koott Backend running on port ${PORT}`);
 
   const { startDailyCrawlerScheduler } = require('./jobs/dailyCrawlerJob');
   startDailyCrawlerScheduler();
+
+  // Analytics outbox: turns verified payments into funnel events (never on the booking path)
+  require('./analytics/analyticsWorker').startAnalyticsWorker();
   
   // Start Slot Lock Cleanup Job (releases expired slots and cleans up abandoned payments, runs every 10 minutes)
   const { releaseExpiredSlots, cleanupAbandonedPendingPayments } = require('./services/slotLockService');

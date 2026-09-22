@@ -14,6 +14,7 @@ const emailService = require('../utils/emailService');
 const userInteractionLogger = require('../utils/userInteractionLogger');
 const { generateAndStoreReceipt } = require('../services/receiptService');
 const { processPaymentCaptured } = require('./razorpayWebhookController');
+const { recordBookingAttribution } = require('../analytics/analytics.service');
 const couponService = require('../services/couponService');
 const { isValidZone, saveClientTimeZone } = require('../utils/clientTimeZone');
 const { normalizePhone, phoneFromToken } = require('../utils/phoneVerification');
@@ -1213,6 +1214,18 @@ const createPaymentOrder = async (req, res) => {
       console.log('✅ Payment record created successfully:', paymentRecord.id);
       console.log('📤 Sending payment response to frontend...');
     }
+
+    // Freeze where this booking came from (first-party analytics). Not awaited:
+    // analytics never delays or fails an order.
+    recordBookingAttribution({
+      paymentId: paymentRecord.id,
+      clientId: actualClientId,
+      psychologistId,
+      amount: chargeableAmount,
+      itemKind: /package/i.test(sessionType || '') || packageId ? 'package' : 'session',
+      rawContext: req.body.analytics,
+      req,
+    }).catch(() => {});
     
     // Record the redemption only now that the order and payment row exist, so an
     // abandoned checkout never consumes a coupon. A failure here must not fail

@@ -21,6 +21,7 @@ const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const { sendCode, verifyCode, phoneFromToken } = require('../utils/phoneVerification');
 const { afterVerified, createAccount } = require('../utils/bookingAccounts');
+const { recordLeadAttribution } = require('../analytics/analytics.service');
 
 const router = express.Router();
 
@@ -76,6 +77,8 @@ router.post('/verify', limiter(20), async (req, res) => {
       psychologistId: uuidOrNull(req.body?.psychologistId)
     });
     if (account.ok === false) return reply(res, account);
+    // A verified number is a lead: remember which visit it came from (not awaited).
+    recordLeadAttribution({ phone: result.phone, rawContext: req.body?.analytics, req }).catch(() => {});
     reply(res, { ...result, ...account });
   } catch (error) {
     console.error('❌ phone-verification/verify:', error.message);

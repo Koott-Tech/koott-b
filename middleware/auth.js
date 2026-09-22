@@ -449,6 +449,7 @@ const requireAdmin = requireRole(['admin', 'superadmin']);
 const requireSuperAdmin = requireRole(['superadmin']);
 const requireFinance = requireRole(['finance', 'admin', 'superadmin']); // Finance can access finance routes, admins can too
 const requireEventOrganizer = requireRole(['event_organizer', 'admin', 'superadmin']); // Event organizer can access event routes
+const requireMarketing = requireRole(['marketing', 'admin', 'superadmin']); // Marketing dashboard: aggregates only
 
 module.exports = {
   authenticateToken,
@@ -458,5 +459,6 @@ module.exports = {
   requireAdmin,
   requireSuperAdmin,
   requireFinance,
+  requireMarketing,
   requireEventOrganizer
 };
