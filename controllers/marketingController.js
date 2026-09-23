@@ -21,14 +21,38 @@ const addDays = (d, n) => { const x = new Date(`${d}T00:00:00Z`); x.setUTCDate(x
 const daysBetween = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000) + 1;
 const isDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s));
 
+/** Same calendar date a year earlier; 29 Feb becomes 28 Feb. */
+const yearBefore = (d) => {
+  const [y, m, day] = d.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y - 1, m, 0)).getUTCDate();
+  return `${y - 1}-${String(m).padStart(2, '0')}-${String(Math.min(day, lastDay)).padStart(2, '0')}`;
+};
+
+const COMPARE = ['previous', 'year', 'none'];
+
+/**
+ * The reporting window, and what it is compared with.
+ *
+ *   previous  the equal-length window immediately before (the default)
+ *   year      the same calendar dates a year earlier
+ *   none      no comparison is shown; the previous window is still computed so
+ *             a report never has to special-case its absence
+ *
+ * Dates are IST calendar days: a day runs 00:00–24:00 Asia/Kolkata, which is
+ * what the reporting functions in 0011–0013 group by.
+ */
 function scopeOf(q) {
   let to = isDate(q.to) ? q.to : istToday();
   let from = isDate(q.from) ? q.from : addDays(to, -29);
   if (from > to) [from, to] = [to, from];
   if (daysBetween(from, to) > 400) from = addDays(to, -399);
   const len = daysBetween(from, to);
+  const compare = COMPARE.includes(q.compare) ? q.compare : 'previous';
+  const [prevFrom, prevTo] = compare === 'year'
+    ? [yearBefore(from), yearBefore(to)]
+    : [addDays(from, -len), addDays(from, -1)];
   return {
-    from, to, len, prevFrom: addDays(from, -len), prevTo: addDays(from, -1),
+    from, to, len, prevFrom, prevTo, compare,
     env: ENVS.includes(q.env) ? q.env : 'production',
     today: istToday(),
   };
@@ -274,6 +298,59 @@ const SOURCE_NAME = (channel, source) => {
   return CAP[base] || (base ? base.charAt(0).toUpperCase() + base.slice(1) : '—');
 };
 const DEVICES = ['mobile', 'desktop', 'tablet'];
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** The booking funnel, in order — the same list as mkt_funnel_step_order (0013). */
+const FUNNEL = [
+  ['counsellor_list_view', 'Viewed the therapist list'],
+  ['counsellor_profile_view', 'Viewed a therapist profile'],
+  ['booking_started', 'Started booking'],
+  ['phone_verified', 'Verified their number'],
+  ['slot_selected', 'Chose a date and time'],
+  ['plan_selected', 'Chose a plan'],
+  ['details_completed', 'Filled in their details'],
+  ['checkout_started', 'Reached checkout'],
+  ['payment_opened', 'Opened payment'],
+  ['booking_completed', 'Paid — booking confirmed'],
+];
+const LABEL_OF = Object.fromEntries(FUNNEL);
+const LABEL_AT = Object.fromEntries(FUNNEL.map(([step, label], i) => [i + 1, label]));
+
+/**
+ * One session's events in order. Props are the registry's own ids, enums and
+ * numbers (analytics/registry.js) — there is no free text in them to leak.
+ */
+async function timeline(s, sessionId) {
+  const { data, error } = await supabaseAdmin
+    .from('analytics_events')
+    .select('event_name, occurred_at, page_path, page_group, channel, utm_source, utm_campaign, device_class, region, value, props')
+    .eq('session_id', sessionId)
+    .eq('environment', s.env)
+    .order('occurred_at', { ascending: true })
+    .limit(500);
+  if (error) fail(error);
+  const rows = (data || []).map((e) => ({
+    event: e.event_name,
+    at: e.occurred_at,
+    path: e.page_path,
+    group: e.page_group,
+    step: LABEL_OF[e.event_name] || null,
+    value: e.event_name === 'booking_completed' ? Number(e.value) || null : null,
+    props: e.props && Object.keys(e.props).length ? e.props : null,
+  }));
+  const first = data?.[0] || {};
+  return {
+    id: sessionId,
+    startedAt: rows[0]?.at || null,
+    endedAt: rows[rows.length - 1]?.at || null,
+    channel: first.channel || null,
+    source: first.utm_source || null,
+    campaign: first.utm_campaign || null,
+    device: first.device_class || null,
+    region: first.region || null,
+    truncated: rows.length >= 500,
+    rows,
+  };
+}
 const splitOf = (q) => (q.split === 'device' ? 'device' : null);
 const MODELS = ['last_non_direct', 'last_non_direct_facebook', 'last_non_direct_google', 'first', 'last'];
 const displayCountry = (c) => (c === 'United States of America' ? 'United States' : c);
@@ -444,6 +521,150 @@ const REPORTS = {
   async 'search-queries'(s, q) {
     return searchQueries({ from: s.from, to: s.to, limit: 250, split: splitOf(q) });
   },
+
+  /**
+   * Booking Funnel: how far sessions get, and where they stop.
+   *
+   * Every step but the last is a browser event; booking_completed is written by
+   * the payments trigger from a verified Razorpay payment. Steps are counted per
+   * session and a session is not required to pass through every one, so read a
+   * step as "reached", not "reached in order" — `toPrevious` can exceed 100%
+   * when sessions skip a step, and that is the data telling you something.
+   */
+  async 'booking-funnel'(s, q) {
+    const args = (from, to) => ({
+      p_from: from, p_to: to, p_env: s.env,
+      p_channel: q.channel && CATEGORY[q.channel] ? q.channel : null,
+      p_device: DEVICES.includes(q.device) ? q.device : null,
+      p_psychologist: UUID.test(String(q.therapist || '')) ? q.therapist : null,
+    });
+    const [now, before, dropoff] = await Promise.all([
+      rpc('mkt_funnel', args(s.from, s.to)),
+      rpc('mkt_funnel', args(s.prevFrom, s.prevTo)),
+      rpc('mkt_funnel_dropoff', args(s.from, s.to)),
+    ]);
+    const at = (rows, step) => rows.find((r) => r.step === step) || {};
+    const rows = FUNNEL.map(([step, label], i) => {
+      const sessions = Number(at(now, step).sessions) || 0;
+      const first = Number(at(now, FUNNEL[0][0]).sessions) || 0;
+      const above = i ? Number(at(now, FUNNEL[i - 1][0]).sessions) || 0 : 0;
+      return {
+        step, label, order: i + 1,
+        sessions,
+        visitors: Number(at(now, step).visitors) || 0,
+        prevSessions: Number(at(before, step).sessions) || 0,
+        toPrevious: i === 0 ? null : (above ? sessions / above : 0),
+        ofEntry: first ? sessions / first : 0,
+        dropped: i === 0 ? null : Math.max(0, above - sessions),
+      };
+    });
+    const entered = Number(at(now, 'booking_started').sessions) || 0;
+    const completed = Number(at(now, 'booking_completed').sessions) || 0;
+    const stopped = dropoff
+      .filter((r) => r.step && r.step !== 'booking_completed')
+      .map((r) => ({ step: r.step, label: LABEL_OF[r.step] || r.step, order: Number(r.step_order), sessions: Number(r.sessions) }))
+      .sort((a, b) => b.sessions - a.sessions);
+    return {
+      filters: { channel: q.channel || null, device: q.device || null, therapist: q.therapist || null },
+      summary: {
+        entered,
+        completed,
+        conversion: entered ? completed / entered : 0,
+        abandoned: Math.max(0, entered - completed),
+        abandonRate: entered ? Math.max(0, entered - completed) / entered : 0,
+      },
+      rows,
+      stopped,
+    };
+  },
+
+  /**
+   * Visitor Journeys: one row per session — how it arrived, what it saw, how far
+   * it got. `session` returns that one session's timeline instead.
+   *
+   * Sessions are anonymous here and stay that way: analytics_events holds no
+   * name, email or phone, and nothing in this report joins to a client record.
+   */
+  async journeys(s, q) {
+    const page = Math.max(0, Number(q.page) || 0);
+    const limit = Math.min(200, Math.max(10, Number(q.limit) || 50));
+    if (UUID.test(String(q.session || ''))) return { session: await timeline(s, q.session) };
+    const rows = await rpc('mkt_sessions', {
+      p_from: s.from, p_to: s.to, p_env: s.env,
+      p_channel: q.channel && CATEGORY[q.channel] ? q.channel : null,
+      p_device: DEVICES.includes(q.device) ? q.device : null,
+      p_stage: Number(q.stage) > 0 ? Number(q.stage) : null,
+      p_booked: q.booked === 'yes' ? true : q.booked === 'no' ? false : null,
+      p_limit: limit, p_offset: page * limit,
+    });
+    return {
+      page, limit, total: Number(rows[0]?.total) || 0,
+      filters: { channel: q.channel || null, device: q.device || null, stage: q.stage || null, booked: q.booked || null },
+      rows: rows.map((r) => ({
+        session: r.session_id,
+        visitor: r.anonymous_id,
+        startedAt: r.started_at,
+        endedAt: r.ended_at,
+        seconds: Math.max(0, Math.round((Date.parse(r.ended_at) - Date.parse(r.started_at)) / 1000)),
+        events: Number(r.events), pageViews: Number(r.page_views),
+        landing: r.landing_path, last: r.last_path,
+        channel: r.channel, source: r.utm_source, campaign: r.utm_campaign,
+        device: r.device_class, region: r.region,
+        furthest: Number(r.furthest),
+        stage: LABEL_AT[Number(r.furthest)] || 'Browsed the site',
+        booked: !!r.booked,
+      })),
+    };
+  },
+
+  /**
+   * Therapist Performance — and the sales-by-therapist report Koott had on Wix.
+   *
+   * Views and booking starts come from events (so they only count visitors who
+   * accepted analytics); bookings and revenue come from `payments`, which counts
+   * everyone. The two columns are not measuring the same population, and the
+   * conversion between them is therefore a floor, not a rate.
+   */
+  async 'therapist-performance'(s) {
+    const [now, before, people] = await Promise.all([
+      rpc('mkt_therapist_stats', { p_from: s.from, p_to: s.to, p_env: s.env }),
+      rpc('mkt_therapist_stats', { p_from: s.prevFrom, p_to: s.prevTo, p_env: s.env }),
+      supabaseAdmin.from('psychologists').select('id, first_name, last_name, designation'),
+    ]);
+    const name = Object.fromEntries((people.data || []).map((p) => [p.id, {
+      name: [p.first_name, p.last_name].filter(Boolean).join(' ').trim() || 'Unnamed',
+      role: p.designation || '',
+    }]));
+    const prev = byKey(before.map((r) => ({ ...r, key: r.psychologist_id })), 'key');
+    const rows = now.map((r) => {
+      const views = Number(r.profile_views) || 0;
+      const started = Number(r.booking_started) || 0;
+      const bookings = Number(r.bookings) || 0;
+      return {
+        id: r.psychologist_id,
+        name: name[r.psychologist_id]?.name || '—',
+        role: name[r.psychologist_id]?.role || '',
+        profileViews: views,
+        visitors: Number(r.visitors) || 0,
+        bookingStarted: started,
+        checkoutStarted: Number(r.checkout_started) || 0,
+        bookings,
+        revenue: Number(r.revenue) || 0,
+        startRate: views ? started / views : 0,
+        prevBookings: Number(prev[r.psychologist_id]?.bookings) || 0,
+        prevRevenue: Number(prev[r.psychologist_id]?.revenue) || 0,
+      };
+    }).sort((a, b) => b.revenue - a.revenue || b.profileViews - a.profileViews);
+    return {
+      summary: {
+        profileViews: sum(rows, 'profileViews'),
+        bookingStarted: sum(rows, 'bookingStarted'),
+        bookings: sum(rows, 'bookings'),
+        revenue: sum(rows, 'revenue'),
+      },
+      rows,
+    };
+  },
 };
 
 async function report(req, res) {
@@ -455,7 +676,7 @@ async function report(req, res) {
     res.set('Cache-Control', 'private, max-age=60');
     res.json({ success: true, scope: s, data });
   } catch (e) {
-    if (e instanceof NotReady || /mkt_period_stats|mkt_path_stats|mkt_source_stats|dimension not allowed|city/.test(e?.message || '')) {
+    if (e instanceof NotReady || /mkt_period_stats|mkt_path_stats|mkt_source_stats|mkt_funnel|mkt_therapist_stats|dimension not allowed|city/.test(e?.message || '')) {
       return res.status(503).json({ success: false, code: 'NOT_MIGRATED', message: 'Run supabase/migrations/0013_marketing_detail_reports.sql to switch on the detailed reports.' });
     }
     console.error(`❌ marketing report ${req.params.name}:`, e?.message || e);
