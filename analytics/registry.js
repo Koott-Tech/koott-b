@@ -59,6 +59,10 @@ const BROWSER_EVENTS = {
   payment_dismissed:       { props: {} },
   js_error:                { props: { code: t.id } },
   api_error:               { props: { code: t.id, status: t.int(0, 599) } },
+  // Core Web Vitals, as the browser measures them (frontend src/analytics/vitals.js).
+  // `value` is milliseconds, except CLS, which is unitless and sent ×1000 so it
+  // stays an integer: 0.12 arrives as 120.
+  web_vital:               { props: { metric: t.oneOf('LCP', 'INP', 'CLS', 'FCP', 'TTFB'), value: t.int(0, 120000), rating: t.oneOf('good', 'needs-improvement', 'poor') } },
 };
 
 /** Server-only events (written by the backend; rejected if a browser sends them). */

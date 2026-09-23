@@ -487,3 +487,72 @@ grant execute on function mkt_sessions(date, date, text, text, text, int, boolea
 
 -- Rollback:
 -- drop function if exists mkt_sessions(date, date, text, text, text, int, boolean, int, int);
+
+-- ------------------------------------------------------- core web vitals
+--
+-- Percentiles for the `web_vital` events the browser sends (frontend
+-- src/analytics/vitals.js). Grouped by page group and device, because a phone
+-- on a listing page and a laptop on the home page are not the same experience.
+--
+-- p75 is the number Google grades on. CLS arrives multiplied by 1000 so it can
+-- travel as an integer; the report divides it back.
+create or replace function mkt_vitals(
+  p_from date,
+  p_to date,
+  p_env text default 'production',
+  p_group text default null
+)
+returns table (
+  metric text,
+  page_group text,
+  device_class text,
+  samples bigint,
+  p50 numeric,
+  p75 numeric,
+  p95 numeric,
+  good bigint,
+  needs_improvement bigint,
+  poor bigint
+)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  with ev as (
+    select
+      props ->> 'metric' as metric,
+      coalesce(page_group, 'other') as page_group,
+      coalesce(device_class, 'unknown') as device_class,
+      (props ->> 'value')::numeric as value,
+      props ->> 'rating' as rating
+    from analytics_events
+    where environment = p_env
+      and coalesce(is_bot, false) = false
+      and event_name = 'web_vital'
+      and props ? 'metric'
+      and (props ->> 'value') ~ '^[0-9]+$'
+      and (p_group is null or page_group = p_group)
+      and occurred_at >= (p_from::timestamp at time zone 'Asia/Kolkata')
+      and occurred_at <  ((p_to + 1)::timestamp at time zone 'Asia/Kolkata')
+  )
+  select
+    metric,
+    page_group,
+    device_class,
+    count(*)::bigint as samples,
+    percentile_cont(0.50) within group (order by value)::numeric as p50,
+    percentile_cont(0.75) within group (order by value)::numeric as p75,
+    percentile_cont(0.95) within group (order by value)::numeric as p95,
+    count(*) filter (where rating = 'good')::bigint as good,
+    count(*) filter (where rating = 'needs-improvement')::bigint as needs_improvement,
+    count(*) filter (where rating = 'poor')::bigint as poor
+  from ev
+  group by 1, 2, 3
+  order by samples desc;
+$$;
+
+grant execute on function mkt_vitals(date, date, text, text) to service_role;
+
+-- Rollback:
+-- drop function if exists mkt_vitals(date, date, text, text);

@@ -579,6 +579,121 @@ const REPORTS = {
   },
 
   /**
+   * Technical Performance: Core Web Vitals as the browser measured them, and
+   * the errors visitors actually hit.
+   *
+   * Vitals come from `web_vital` events (frontend src/analytics/vitals.js), so
+   * they are field data from real visits, not a lab score — they will not match
+   * PageSpeed's simulated run, and the p75 is the number Google grades on.
+   * INP is approximated by the slowest interaction's duration.
+   *
+   * Errors are counted from the events the site reports about itself. A page
+   * that errors and a page that converts badly are two different facts: this
+   * report puts them side by side, it does not claim one causes the other.
+   */
+  async technical(s, q) {
+    const [vitals, errors, byPage, apiErrors] = await Promise.all([
+      rpc('mkt_vitals', { p_from: s.from, p_to: s.to, p_env: s.env, p_group: q.group || null }),
+      counts(s, ['js_error', 'api_error', 'booking_step_error', 'payment_attempt_failed'], ['event_name', 'code'], { limit: 200 }),
+      counts(s, ['js_error', 'api_error'], ['page_group'], { limit: 50 }),
+      counts(s, ['api_error'], ['code'], { limit: 50 }),
+    ]);
+    const metrics = {};
+    vitals.forEach((v) => {
+      const m = v.metric;
+      metrics[m] ||= { metric: m, samples: 0, good: 0, needsImprovement: 0, poor: 0, weighted: 0 };
+      const n = Number(v.samples) || 0;
+      metrics[m].samples += n;
+      metrics[m].good += Number(v.good) || 0;
+      metrics[m].needsImprovement += Number(v.needs_improvement) || 0;
+      metrics[m].poor += Number(v.poor) || 0;
+      metrics[m].weighted += Number(v.p75) * n;
+    });
+    const unit = (m, v) => (m === 'CLS' ? Number((v / 1000).toFixed(3)) : Math.round(v));
+    return {
+      note: 'Field data from real visits, only from visitors who accepted analytics. INP is approximated by the slowest interaction.',
+      metrics: Object.values(metrics).map((m) => ({
+        ...m,
+        p75: m.samples ? unit(m.metric, m.weighted / m.samples) : null,
+        goodRate: m.samples ? m.good / m.samples : 0,
+      })),
+      rows: vitals.map((v) => ({
+        metric: v.metric,
+        pageGroup: v.page_group,
+        device: v.device_class,
+        samples: Number(v.samples),
+        p50: unit(v.metric, Number(v.p50)),
+        p75: unit(v.metric, Number(v.p75)),
+        p95: unit(v.metric, Number(v.p95)),
+        good: Number(v.good),
+        poor: Number(v.poor),
+      })),
+      errors: errors.map((e) => ({ event: e.event_name, code: e.code || 'unknown', events: e.events, sessions: e.sessions }))
+        .sort((a, b) => b.events - a.events),
+      errorPages: byPage.map((e) => ({ pageGroup: e.page_group || 'other', events: e.events, sessions: e.sessions }))
+        .sort((a, b) => b.events - a.events),
+      apiErrors: apiErrors.map((e) => ({ code: e.code || 'unknown', events: e.events })).sort((a, b) => b.events - a.events),
+    };
+  },
+
+  /**
+   * Marketing Campaigns: what each utm_campaign brought, from the first visit
+   * through to a paid booking.
+   *
+   * Sessions, starts and checkouts are browser events; bookings and their value
+   * come from booking_completed, which the payments trigger writes after
+   * Razorpay verifies the payment. Cost, CPC and ROAS are not here: no ad spend
+   * is imported, and inventing them from impressions would be a guess.
+   *
+   * utm_content and utm_term are collected but not reportable yet — the counts
+   * function (0011) does not allow them as dimensions.
+   */
+  async campaigns(s) {
+    const dims = ['utm_campaign', 'utm_source', 'channel'];
+    const [all, prev, started, checkout, booked, landing] = await Promise.all([
+      counts(s, null, dims, { limit: 500 }),
+      counts(s, null, dims, { prev: true, limit: 500 }),
+      counts(s, ['booking_started'], dims, { limit: 500 }),
+      counts(s, ['checkout_started'], dims, { limit: 500 }),
+      counts(s, ['booking_completed'], dims, { limit: 500 }),
+      counts(s, null, ['utm_campaign', 'landing_group'], { limit: 500 }),
+    ]);
+    const key = (r) => `${r.utm_campaign || ''}|${r.utm_source || ''}|${r.channel || ''}`;
+    const pick = (rows, k) => rows.find((r) => key(r) === k);
+    const named = all.filter((r) => r.utm_campaign);
+    const rows = named.map((r) => {
+      const k = key(r);
+      const sessions = r.sessions || 0;
+      const bookings = pick(booked, k)?.sessions || 0;
+      return {
+        campaign: r.utm_campaign,
+        source: SOURCE_NAME(r.channel, r.utm_source),
+        category: CATEGORY[r.channel] || r.channel || 'Unknown',
+        sessions,
+        visitors: r.visitors || 0,
+        prevSessions: pick(prev, k)?.sessions || 0,
+        bookingStarted: pick(started, k)?.sessions || 0,
+        checkoutStarted: pick(checkout, k)?.sessions || 0,
+        bookings,
+        revenue: pick(booked, k)?.value || 0,
+        conversion: sessions ? bookings / sessions : 0,
+        landing: landing.filter((l) => l.utm_campaign === r.utm_campaign)
+          .sort((a, b) => b.sessions - a.sessions)[0]?.landing_group || null,
+      };
+    }).sort((a, b) => b.sessions - a.sessions);
+    const untagged = all.filter((r) => !r.utm_campaign).reduce((t, r) => t + (r.sessions || 0), 0);
+    return {
+      summary: {
+        sessions: sum(rows, 'sessions'), visitors: sum(rows, 'visitors'),
+        bookingStarted: sum(rows, 'bookingStarted'), bookings: sum(rows, 'bookings'),
+        revenue: sum(rows, 'revenue'),
+      },
+      untagged,
+      rows,
+    };
+  },
+
+  /**
    * Visitor Journeys: one row per session — how it arrived, what it saw, how far
    * it got. `session` returns that one session's timeline instead.
    *
