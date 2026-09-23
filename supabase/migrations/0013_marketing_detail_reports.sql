@@ -10,6 +10,33 @@
 --
 -- Rollback is at the bottom.
 
+-- ------------------------------------------------------------------ re-runnable
+--
+-- Some of these already exist from an earlier attempt, with different parameter
+-- names or a different row type — which is why PostgREST could not find them
+-- (it matches on argument names) and the blog engagement numbers read zero.
+-- `create or replace` cannot change a function's return type, so every overload
+-- of the functions defined below is dropped first. Dropping them removes no
+-- data: they only read.
+do $do$
+declare r record;
+begin
+  for r in
+    select p.oid::regprocedure as sig
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public'
+      and p.proname in (
+        'mkt_source_stats', 'mkt_path_engagement', 'mkt_funnel_step_order',
+        'mkt_funnel', 'mkt_funnel_dropoff', 'mkt_therapist_stats',
+        'mkt_sessions', 'mkt_vitals'
+      )
+  loop
+    execute 'drop function if exists ' || r.sig || ' cascade';
+  end loop;
+end
+$do$;
+
 -- ---------------------------------------------------------------- source stats
 --
 -- Sessions and visitors by traffic source under one of five attribution models:
