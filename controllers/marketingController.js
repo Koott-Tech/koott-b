@@ -315,6 +315,21 @@ const FUNNEL = [
 const LABEL_OF = Object.fromEntries(FUNNEL);
 const LABEL_AT = Object.fromEntries(FUNNEL.map(([step, label], i) => [i + 1, label]));
 
+/** What a custom report may group by — the dimensions mkt_event_counts allows. */
+const DIMENSIONS = [
+  'day', 'dow', 'hour', 'channel', 'utm_source', 'utm_medium', 'utm_campaign',
+  'device_class', 'region', 'city', 'page_path', 'page_group', 'page_topic',
+  'landing_group', 'landing_topic', 'element', 'target', 'psychologist_id',
+];
+/** Events worth grouping by name in a custom report. */
+const REPORTABLE_EVENTS = [
+  'page_view', 'page_engaged', 'scroll_depth', 'ui_click', 'filter_applied', 'contact_clicked',
+  'counsellor_list_view', 'counsellor_profile_view', 'booking_started', 'phone_verified',
+  'slot_selected', 'plan_selected', 'details_completed', 'checkout_started', 'payment_opened',
+  'booking_completed', 'booking_cancelled', 'payment_failed', 'payment_attempt_failed',
+  'js_error', 'api_error', 'booking_step_error', 'registration_completed', 'login_completed', 'web_vital',
+];
+
 /**
  * One session's events in order. Props are the registry's own ids, enums and
  * numbers (analytics/registry.js) — there is no free text in them to leak.
@@ -579,6 +594,116 @@ const REPORTS = {
   },
 
   /**
+   * Custom reports: the marketing team picks the dimensions and the events, and
+   * this answers exactly that question — nothing is combined that the stored
+   * data cannot answer honestly.
+   *
+   * Only dimensions 0011's counts function allows are offered (DIMENSIONS), and
+   * only events the registry records. Sessions and visitors are distinct counts
+   * within the window, so they never sum across rows — the summary is its own
+   * count, not the column added up.
+   */
+  async custom(s, q) {
+    const dims = String(q.dims || '').split(',').map((d) => d.trim()).filter((d) => DIMENSIONS.includes(d)).slice(0, 3);
+    const events = String(q.events || '').split(',').map((e) => e.trim()).filter(Boolean).slice(0, 10);
+    const rows = await counts(s, events.length ? events : null, dims, { limit: 1000 });
+    const totals = await counts(s, events.length ? events : null, []);
+    return {
+      dims,
+      events,
+      available: { dimensions: DIMENSIONS, events: REPORTABLE_EVENTS },
+      summary: {
+        events: totals[0]?.events || 0,
+        sessions: totals[0]?.sessions || 0,
+        visitors: totals[0]?.visitors || 0,
+        value: totals[0]?.value || 0,
+      },
+      rows: rows.map((r) => {
+        const row = { events: r.events, sessions: r.sessions, visitors: r.visitors, value: r.value };
+        dims.forEach((d) => { row[d] = r[d] ?? null; });
+        return row;
+      }).sort((a, b) => b.sessions - a.sessions),
+    };
+  },
+
+  /**
+   * Real-Time Activity: who is on the site now, and what each session has done.
+   *
+   * A session's steps are the events actually recorded for it. Nothing is
+   * inferred to fill a gap — a session that jumped from the listing to checkout
+   * shows exactly that, because a step we did not observe is not a step we can
+   * claim. Sessions are anonymous and stay that way.
+   */
+  async realtime(s, q) {
+    const minutes = [5, 15, 30, 60].includes(Number(q.minutes)) ? Number(q.minutes) : 15;
+    const since = new Date(Date.now() - minutes * 60000).toISOString();
+    const { data, error } = await supabaseAdmin
+      .from('analytics_events')
+      .select('session_id, anonymous_id, occurred_at, event_name, page_path, page_group, channel, utm_campaign, device_class, region')
+      .eq('environment', s.env)
+      .eq('is_bot', false)
+      .gte('occurred_at', since)
+      .order('occurred_at', { ascending: true })
+      .limit(5000);
+    if (error) fail(error);
+
+    const bySession = new Map();
+    (data || []).forEach((e) => {
+      if (!e.session_id) return;
+      const cur = bySession.get(e.session_id) || {
+        session: e.session_id, startedAt: e.occurred_at, landing: e.page_path,
+        channel: e.channel, campaign: e.utm_campaign, device: e.device_class, region: e.region,
+        events: 0, pages: [], furthest: 0, lastEvent: null, lastAt: null,
+      };
+      cur.events += 1;
+      cur.lastEvent = e.event_name;
+      cur.lastAt = e.occurred_at;
+      if (e.page_path && cur.pages[cur.pages.length - 1] !== e.page_path) cur.pages.push(e.page_path);
+      const step = FUNNEL.findIndex(([name]) => name === e.event_name) + 1;
+      if (step > cur.furthest) cur.furthest = step;
+      bySession.set(e.session_id, cur);
+    });
+
+    const sessions = [...bySession.values()].map((c) => ({
+      session: c.session,
+      startedAt: c.startedAt,
+      lastAt: c.lastAt,
+      seconds: Math.max(0, Math.round((Date.parse(c.lastAt) - Date.parse(c.startedAt)) / 1000)),
+      landing: c.landing || null,
+      current: c.pages[c.pages.length - 1] || null,
+      previous: c.pages.length > 1 ? c.pages[c.pages.length - 2] : null,
+      pages: c.pages.length,
+      events: c.events,
+      lastEvent: c.lastEvent,
+      stage: c.furthest ? LABEL_AT[c.furthest] : 'Browsing',
+      furthest: c.furthest,
+      channel: c.channel || null,
+      campaign: c.campaign || null,
+      device: c.device || null,
+      region: c.region || null,
+    })).sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
+
+    const tally = (key) => {
+      const m = {};
+      sessions.forEach((x) => { const k = x[key] || 'unknown'; m[k] = (m[k] || 0) + 1; });
+      return Object.entries(m).map(([k, n]) => ({ key: k, sessions: n })).sort((a, b) => b.sessions - a.sessions);
+    };
+    return {
+      minutes,
+      generatedAt: new Date().toISOString(),
+      summary: {
+        sessions: sessions.length,
+        visitors: new Set((data || []).map((e) => e.anonymous_id).filter(Boolean)).size,
+        inBooking: sessions.filter((x) => x.furthest >= 3).length,
+        booked: sessions.filter((x) => x.furthest >= 10).length,
+      },
+      byPage: tally('current').slice(0, 10),
+      byChannel: tally('channel').slice(0, 8),
+      rows: sessions,
+    };
+  },
+
+  /**
    * Technical Performance: Core Web Vitals as the browser measured them, and
    * the errors visitors actually hit.
    *
@@ -799,6 +924,53 @@ async function report(req, res) {
   }
 }
 
+/* --------------------------------------------------------------- saved reports */
+
+/**
+ * A marketing user's own saved custom reports. The row holds the question (the
+ * dimensions and events they picked), never an answer, so nothing here ages or
+ * leaks. Keyed by users.id: a report follows the person, not the browser.
+ */
+async function savedReports(req, res) {
+  const userId = req.user?.id;
+  try {
+    if (req.method === 'GET') {
+      const { data, error } = await supabaseAdmin
+        .from('marketing_saved_reports')
+        .select('id, name, config, updated_at')
+        .eq('user_id', userId)
+        .order('updated_at', { ascending: false })
+        .limit(100);
+      if (error) throw error;
+      return res.json({ success: true, data: { reports: data || [] } });
+    }
+
+    if (req.method === 'DELETE') {
+      const { error } = await supabaseAdmin
+        .from('marketing_saved_reports').delete().eq('user_id', userId).eq('id', req.params.id);
+      if (error) throw error;
+      return res.json({ success: true });
+    }
+
+    const name = String(req.body?.name || '').trim().slice(0, 80);
+    if (!name) return res.status(400).json({ success: false, message: 'Give the report a name.' });
+    const config = req.body?.config && typeof req.body.config === 'object' ? req.body.config : {};
+    const { data, error } = await supabaseAdmin
+      .from('marketing_saved_reports')
+      .upsert({ user_id: userId, name, config, updated_at: new Date().toISOString() }, { onConflict: 'user_id,name' })
+      .select('id, name, config, updated_at')
+      .single();
+    if (error) throw error;
+    return res.json({ success: true, data: { report: data } });
+  } catch (e) {
+    if (isMissingTable(e)) {
+      return res.status(503).json({ success: false, code: 'NOT_MIGRATED', message: 'Run supabase/migrations/0013_marketing_detail_reports.sql to save reports.' });
+    }
+    console.error('❌ marketing/saved:', e?.message || e);
+    return res.status(500).json({ success: false, message: 'Could not save that report.' });
+  }
+}
+
 /* ------------------------------------------------------------------ live + meta */
 
 /**
@@ -877,6 +1049,7 @@ function page(build) {
 }
 
 module.exports = {
+  savedReports,
   meta: metaInfo,
   live,
   highlights: page(highlightsData),

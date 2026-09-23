@@ -556,3 +556,28 @@ grant execute on function mkt_vitals(date, date, text, text) to service_role;
 
 -- Rollback:
 -- drop function if exists mkt_vitals(date, date, text, text);
+
+-- --------------------------------------------------------- saved custom reports
+--
+-- A marketing user's own saved report configurations. The config is the
+-- dimensions, events and filters they picked — no data, just the question.
+-- Only the backend touches this table (service role); it is keyed by users.id
+-- so a report follows the person, not the browser.
+create table if not exists marketing_saved_reports (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references users(id) on delete cascade,
+  name text not null check (char_length(name) between 1 and 80),
+  config jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create unique index if not exists marketing_saved_reports_owner_name
+  on marketing_saved_reports (user_id, lower(name));
+create index if not exists marketing_saved_reports_owner
+  on marketing_saved_reports (user_id, updated_at desc);
+
+alter table marketing_saved_reports enable row level security;
+
+-- Rollback:
+-- drop table if exists marketing_saved_reports;

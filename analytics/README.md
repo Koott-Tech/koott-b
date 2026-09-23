@@ -84,11 +84,32 @@ collector accepts or drops.
 
 ## Dashboard
 
-`/marketing` shows the two reports Koott had on Wix — **Analytics Highlights**
-and **Traffic Overview** — plus a live-visitor corner feed. Sales and bookings
-come from the `payments` and `sessions` tables; visits, clicks and pages from
-first-party events. "Clicks by Google searches" needs `SEARCH_CONSOLE_SITE_URL`
-(see `searchConsole.js`).
+`/marketing` opens on **Analytics Highlights** and **Traffic Overview** (the two
+screens Koott had on Wix) with a live-visitor corner feed, and carries fifteen
+reports behind them:
+
+| Group | Reports |
+|---|---|
+| Traffic | Traffic over Time · Top Traffic Sources · Traffic by Location |
+| Behavior | Page Visits · Button Clicks |
+| Visitors | Visitor Journeys · Real-Time Activity |
+| Bookings | Booking Funnel · Therapist Performance |
+| Marketing | Top Search Queries on Google · Marketing Campaigns |
+| Blog | Top Blog Posts · Blog Activity by Time of Day |
+| Technical | Technical Performance |
+| Custom | Custom Report (saved per user) |
+
+Every report shares one date range — nine presets, a custom range, and a
+comparison against the previous period or the same period a year earlier — and
+one set of metric definitions ("View report definitions" on each report).
+
+Sales and bookings come from the `payments` and `sessions` tables; visits,
+clicks and pages from first-party events. "Clicks by Google searches" needs
+`SEARCH_CONSOLE_SITE_URL` (see `searchConsole.js`).
+
+Two things the dashboard deliberately does not do: it never infers a step it did
+not observe (a journey shows gaps as gaps), and it reports no cost, CPC or ROAS,
+because no ad spend is imported.
 
 ## Meta (built, not sending)
 

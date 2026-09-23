@@ -30,7 +30,13 @@ router.get('/live', c.live);
 router.get('/highlights', c.highlights);
 router.get('/traffic', c.traffic);
 // Detailed reports: traffic-over-time, traffic-sources, location, page-visits,
-// button-clicks, blog-posts, blog-time, search-queries
+// button-clicks, blog-posts, blog-time, search-queries, booking-funnel,
+// therapist-performance, journeys, campaigns, technical, realtime, custom
 router.get('/report/:name', c.report);
+
+// A user's own saved custom reports (the question, never the answer).
+router.get('/saved', c.savedReports);
+router.post('/saved', c.savedReports);
+router.delete('/saved/:id', c.savedReports);
 
 module.exports = router;
