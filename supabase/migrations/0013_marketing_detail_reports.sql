@@ -366,16 +366,19 @@ as $$
     from ev
     group by psychologist_id
   ),
+  -- payments carries its own psychologist_id; a package payment has no session
+  -- to join to, so the session is only a fallback.
   paid as (
-    select s.psychologist_id,
+    select coalesce(p.psychologist_id, s.psychologist_id) as psychologist_id,
            count(*)::bigint as bookings,
            coalesce(sum(p.amount), 0)::numeric as revenue
     from payments p
-    join sessions s on s.id = p.session_id
+    left join sessions s on s.id = p.session_id
     where p.status = 'success'
+      and coalesce(p.psychologist_id, s.psychologist_id) is not null
       and p.created_at >= (p_from::timestamp at time zone 'Asia/Kolkata')
       and p.created_at <  ((p_to + 1)::timestamp at time zone 'Asia/Kolkata')
-    group by s.psychologist_id
+    group by 1
   )
   select
     coalesce(a.psychologist_id, b.psychologist_id) as psychologist_id,
