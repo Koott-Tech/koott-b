@@ -183,7 +183,11 @@ const createBlog = async (req, res) => {
       tags = [],
       categories = [],
       meta_keywords = [],
-      read_time_minutes: incomingReadTime
+      read_time_minutes: incomingReadTime,
+      seo_title,
+      seo_description,
+      focus_keyword,
+      canonical_url
     } = req.body;
 
     if (!title || (!content && !structured_content)) {
@@ -265,6 +269,12 @@ const createBlog = async (req, res) => {
         categories: Array.isArray(categories) ? categories : [],
         meta_keywords: Array.isArray(meta_keywords) ? meta_keywords : [],
         read_time_minutes: computedReadTime || 5,
+        // A post with no search title of its own falls back to its headline,
+        // which is what the editor's preview shows.
+        seo_title: seo_title || title,
+        seo_description: seo_description || excerpt || null,
+        focus_keyword: focus_keyword || null,
+        canonical_url: canonical_url || null,
         view_count: 0
       }])
       .select('*')
@@ -301,7 +311,14 @@ const updateBlog = async (req, res) => {
       tags,
       categories,
       meta_keywords,
-      read_time_minutes
+      read_time_minutes,
+      // The editor has collected these all along — with character counters and
+      // a search preview — and the API dropped them, so a search title typed in
+      // the admin was quietly lost on save.
+      seo_title,
+      seo_description,
+      focus_keyword,
+      canonical_url
     } = req.body;
 
     // Check if blog exists
@@ -408,6 +425,10 @@ const updateBlog = async (req, res) => {
     if (categories !== undefined) updateData.categories = Array.isArray(categories) ? categories : [];
     if (meta_keywords !== undefined) updateData.meta_keywords = Array.isArray(meta_keywords) ? meta_keywords : [];
     if (read_time_minutes !== undefined) updateData.read_time_minutes = read_time_minutes;
+    if (seo_title !== undefined) updateData.seo_title = seo_title || null;
+    if (seo_description !== undefined) updateData.seo_description = seo_description || null;
+    if (focus_keyword !== undefined) updateData.focus_keyword = focus_keyword || null;
+    if (canonical_url !== undefined) updateData.canonical_url = canonical_url || null;
     
     updateData.published_at = published_at;
 
