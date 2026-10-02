@@ -155,6 +155,7 @@ temp_key.txt
 # All SQL stays out of the repo, migrations included — they are run by hand in the
 # Supabase SQL editor (see supabase/README.md) and kept locally.
 *.sql
+!supabase/migrations/*.sql
 
 # Scraped Wix content used once by scripts/importWixContent.js (~2.3 MB) — local only
 scripts/wix-import-data/*.json
