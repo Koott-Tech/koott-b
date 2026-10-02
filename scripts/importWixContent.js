@@ -120,6 +120,23 @@ async function importConditions() {
 
 async function importBlogs() {
   const posts = loadJson('blogs.json');
+  /**
+   * Categories and tags are different things on the live site, and used to be
+   * imported as the same array — which is why the listing's category filter
+   * offered thirty-odd tags instead of the handful of real categories.
+   *
+   * Tags come with the post. Categories come from the category pages
+   * (blogCategories.json: each category lists the posts in it), inverted here
+   * into post → categories.
+   */
+  const catsOf = {};
+  try {
+    loadJson('blogCategories.json').forEach((c) => {
+      (c.posts || []).forEach((slug) => { (catsOf[slug] ||= []).push(c.label || c.slug); });
+    });
+  } catch (_) {
+    console.log('  (no blogCategories.json — categories will be left empty)');
+  }
   const optional = await presentColumns('blogs', ['published_at', 'canonical_url', 'meta_keywords']);
   console.log(`blogs optional columns present: ${[...optional].join(', ') || '(none)'}\n`);
 
@@ -135,8 +152,8 @@ async function importBlogs() {
       content: post.content,
       featured_image_url: post.featured_image_url || null,
       author_name: post.author_name || 'Koott',
-      categories: post.categories || [],
-      tags: post.categories || [],
+      categories: catsOf[post.slug] || post.categories || [],
+      tags: post.tags || [],
       read_time_minutes: post.read_time_minutes || 5,
       seo_title: post.seo_title || post.title,
       seo_description: post.excerpt || '',

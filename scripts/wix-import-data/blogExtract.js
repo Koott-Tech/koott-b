@@ -3,6 +3,31 @@ const { bareMedia } = require('./extract');
 
 const NL2 = '\n\n';
 
+/** Set per post so body images can be told apart from the cover. */
+let coverUrl = '';
+
+/**
+ * The src of a real body image, or '' for anything that is page furniture.
+ *
+ * Dropped: the cover (it is rendered separately), the author avatar, Wix's
+ * blurred low-resolution placeholder twin of every image, and anything small
+ * enough to be an icon.
+ */
+function keepImage(img) {
+  const raw = img.getAttribute('src') || img.getAttribute('data-src') || '';
+  if (!raw || !/^https?:/i.test(raw)) return '';
+  if (/blur_|_tiny|placeholder/i.test(raw)) return '';
+  const w = Number(img.getAttribute('width')) || 0;
+  const h = Number(img.getAttribute('height')) || 0;
+  if ((w && w <= 80) || (h && h <= 80)) return '';
+  const src = bareMedia(raw);
+  if (!src) return '';
+  if (coverUrl && src === coverUrl) return '';
+  // avatars live under .../media/<id>.jpg with a tiny fill in the transform
+  if (/\/fill\/w_(\d{1,2}),/.test(raw)) return '';
+  return src;
+}
+
 /**
  * Walk the <article> in document order and emit the markdown-ish shape that
  * BlogArticle renders: "## " heading, "### " sub-heading, "- " list item,
@@ -17,6 +42,14 @@ function toMarkdown(article) {
   const walk = (el) => {
     for (const n of el.children) {
       const tag = n.tagName;
+      // Body images, as markdown. Wix wraps each in <wow-image>, repeats a
+      // blurred placeholder, and uses the same tag for the author avatar and
+      // the "Recent Posts" thumbnails — hence the filtering in keepImage().
+      if (tag === 'IMG') {
+        const src = keepImage(n);
+        if (src && !seen.has('i' + src)) { seen.add('i' + src); out.push(`![](${src})`); }
+        continue;
+      }
       if (/^H[1-6]$/.test(tag)) {
         const t = clean(n.textContent);
         if (t && !seen.has('h' + t)) { seen.add('h' + t); out.push((tag === 'H2' ? '## ' : '### ') + t); }
@@ -63,11 +96,17 @@ function splitChrome(blocks, title) {
     const bare = b.replace(/^(#{2,3}|-|>)\s*/, '');
     const isTitle = /^#{2,3} /.test(b) && norm(bare) === norm(title);
     const isRead = /^-\s*\d+\s*min read$/i.test(b);
-    const isDate = /^-\s*[A-Z][a-z]{2}\s+\d{1,2}(,\s*\d{4})?$/.test(b);
+    // Wix prints either a date ("Sep 14", "Jan 23, 2026") or, for anything
+    // recent, a relative one ("5 days ago", "an hour ago") — which is why those
+    // two lines used to end up at the top of the body and then go stale.
+    const isDate = /^-\s*[A-Z][a-z]{2}\s+\d{1,2}(,\s*\d{4})?$/.test(b)
+      || /^-\s*(a|an|\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$/i.test(b)
+      || /^-\s*(updated:|edited:)/i.test(b);
     const isByline = /^-\s/.test(b) && bare.split(/\s+/).length <= 4
       && /^[A-Z]/.test(bare) && !/[.?!]$/.test(bare);
     if (isRead) { readMinutes = Number(b.match(/(\d+)/)[1]); start = i + 1; continue; }
     if (isTitle || isDate || isByline) { start = i + 1; continue; }
+    if (/^!\[\]\(/.test(b)) continue;   // the cover's twin, already dropped
     break;
   }
 
@@ -108,14 +147,19 @@ async function extractPost(url) {
   };
   const title = hook('post-title') || clean(doc.querySelector('h1')?.textContent) || ld.headline || '';
 
+  coverUrl = bareMedia(doc.querySelector('meta[property="og:image"]')?.content || '');
   const article = doc.querySelector('article') || doc.body;
   const { body, readMinutes, tags } = splitChrome(toMarkdown(article), title);
   const content = body.join(NL2);
 
-  const cats = tags.length
-    ? tags
-    : [...doc.querySelectorAll('[data-hook="post-page-category-label"], [data-hook="category-label"]')]
-        .map((e) => clean(e.textContent)).filter(Boolean);
+  /**
+   * Categories and tags are two different things on the live site: categories
+   * are the handful in the bar across the top ("Health Psychology"), tags are
+   * the long list at the foot of a post. They used to be imported as the same
+   * array, which made the category filter on the listing unusable.
+   */
+  const cats = [...doc.querySelectorAll('[data-hook="post-page-category-label"], [data-hook="category-label"]')]
+    .map((e) => clean(e.textContent)).filter(Boolean);
 
   return {
     slug,
@@ -128,6 +172,7 @@ async function extractPost(url) {
     author_name: (ld.author && (ld.author.name || ld.author)) || hook('user-name') || 'Koott',
     created_at: ld.datePublished || '',
     categories: [...new Set(cats)],
+    tags: [...new Set(tags)],
     read_time_minutes: readMinutes || Math.max(1, Math.round(content.split(/\s+/).length / 200)),
     content,
   };
