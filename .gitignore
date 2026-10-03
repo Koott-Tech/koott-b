@@ -152,8 +152,10 @@ temp_key.txt
 # Database
 *.sqlite
 *.db
-# All SQL stays out of the repo, migrations included — they are run by hand in the
-# Supabase SQL editor (see supabase/README.md) and kept locally.
+# Ad-hoc SQL stays out of the repo. Migrations do not: they are the schema, and
+# with them ignored there was no way to rebuild a database, review a change, or
+# tell which of them an environment had. They are still run by hand in the
+# Supabase SQL editor (see supabase/README.md).
 *.sql
 !supabase/migrations/*.sql
 

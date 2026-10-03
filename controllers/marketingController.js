@@ -21,14 +21,38 @@ const addDays = (d, n) => { const x = new Date(`${d}T00:00:00Z`); x.setUTCDate(x
 const daysBetween = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000) + 1;
 const isDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s));
 
+/** Same calendar date a year earlier; 29 Feb becomes 28 Feb. */
+const yearBefore = (d) => {
+  const [y, m, day] = d.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y - 1, m, 0)).getUTCDate();
+  return `${y - 1}-${String(m).padStart(2, '0')}-${String(Math.min(day, lastDay)).padStart(2, '0')}`;
+};
+
+const COMPARE = ['previous', 'year', 'none'];
+
+/**
+ * The reporting window, and what it is compared with.
+ *
+ *   previous  the equal-length window immediately before (the default)
+ *   year      the same calendar dates a year earlier
+ *   none      no comparison is shown; the previous window is still computed so
+ *             a report never has to special-case its absence
+ *
+ * Dates are IST calendar days: a day runs 00:00–24:00 Asia/Kolkata, which is
+ * what the reporting functions in 0011–0013 group by.
+ */
 function scopeOf(q) {
   let to = isDate(q.to) ? q.to : istToday();
   let from = isDate(q.from) ? q.from : addDays(to, -29);
   if (from > to) [from, to] = [to, from];
   if (daysBetween(from, to) > 400) from = addDays(to, -399);
   const len = daysBetween(from, to);
+  const compare = COMPARE.includes(q.compare) ? q.compare : 'previous';
+  const [prevFrom, prevTo] = compare === 'year'
+    ? [yearBefore(from), yearBefore(to)]
+    : [addDays(from, -len), addDays(from, -1)];
   return {
-    from, to, len, prevFrom: addDays(from, -len), prevTo: addDays(from, -1),
+    from, to, len, prevFrom, prevTo, compare,
     env: ENVS.includes(q.env) ? q.env : 'production',
     today: istToday(),
   };
@@ -274,6 +298,74 @@ const SOURCE_NAME = (channel, source) => {
   return CAP[base] || (base ? base.charAt(0).toUpperCase() + base.slice(1) : '—');
 };
 const DEVICES = ['mobile', 'desktop', 'tablet'];
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** The booking funnel, in order — the same list as mkt_funnel_step_order (0013). */
+const FUNNEL = [
+  ['counsellor_list_view', 'Viewed the therapist list'],
+  ['counsellor_profile_view', 'Viewed a therapist profile'],
+  ['booking_started', 'Started booking'],
+  ['phone_verified', 'Verified their number'],
+  ['slot_selected', 'Chose a date and time'],
+  ['plan_selected', 'Chose a plan'],
+  ['details_completed', 'Filled in their details'],
+  ['checkout_started', 'Reached checkout'],
+  ['payment_opened', 'Opened payment'],
+  ['booking_completed', 'Paid — booking confirmed'],
+];
+const LABEL_OF = Object.fromEntries(FUNNEL);
+const LABEL_AT = Object.fromEntries(FUNNEL.map(([step, label], i) => [i + 1, label]));
+
+/** What a custom report may group by — the dimensions mkt_event_counts allows. */
+const DIMENSIONS = [
+  'day', 'dow', 'hour', 'channel', 'utm_source', 'utm_medium', 'utm_campaign',
+  'device_class', 'region', 'city', 'page_path', 'page_group', 'page_topic',
+  'landing_group', 'landing_topic', 'element', 'target', 'psychologist_id',
+];
+/** Events worth grouping by name in a custom report. */
+const REPORTABLE_EVENTS = [
+  'page_view', 'page_engaged', 'scroll_depth', 'ui_click', 'filter_applied', 'contact_clicked',
+  'counsellor_list_view', 'counsellor_profile_view', 'booking_started', 'phone_verified',
+  'slot_selected', 'plan_selected', 'details_completed', 'checkout_started', 'payment_opened',
+  'booking_completed', 'booking_cancelled', 'payment_failed', 'payment_attempt_failed',
+  'js_error', 'api_error', 'booking_step_error', 'registration_completed', 'login_completed', 'web_vital',
+];
+
+/**
+ * One session's events in order. Props are the registry's own ids, enums and
+ * numbers (analytics/registry.js) — there is no free text in them to leak.
+ */
+async function timeline(s, sessionId) {
+  const { data, error } = await supabaseAdmin
+    .from('analytics_events')
+    .select('event_name, occurred_at, page_path, page_group, channel, utm_source, utm_campaign, device_class, region, value, props')
+    .eq('session_id', sessionId)
+    .eq('environment', s.env)
+    .order('occurred_at', { ascending: true })
+    .limit(500);
+  if (error) fail(error);
+  const rows = (data || []).map((e) => ({
+    event: e.event_name,
+    at: e.occurred_at,
+    path: e.page_path,
+    group: e.page_group,
+    step: LABEL_OF[e.event_name] || null,
+    value: e.event_name === 'booking_completed' ? Number(e.value) || null : null,
+    props: e.props && Object.keys(e.props).length ? e.props : null,
+  }));
+  const first = data?.[0] || {};
+  return {
+    id: sessionId,
+    startedAt: rows[0]?.at || null,
+    endedAt: rows[rows.length - 1]?.at || null,
+    channel: first.channel || null,
+    source: first.utm_source || null,
+    campaign: first.utm_campaign || null,
+    device: first.device_class || null,
+    region: first.region || null,
+    truncated: rows.length >= 500,
+    rows,
+  };
+}
 const splitOf = (q) => (q.split === 'device' ? 'device' : null);
 const MODELS = ['last_non_direct', 'last_non_direct_facebook', 'last_non_direct_google', 'first', 'last'];
 const displayCountry = (c) => (c === 'United States of America' ? 'United States' : c);
@@ -444,6 +536,375 @@ const REPORTS = {
   async 'search-queries'(s, q) {
     return searchQueries({ from: s.from, to: s.to, limit: 250, split: splitOf(q) });
   },
+
+  /**
+   * Booking Funnel: how far sessions get, and where they stop.
+   *
+   * Every step but the last is a browser event; booking_completed is written by
+   * the payments trigger from a verified Razorpay payment. Steps are counted per
+   * session and a session is not required to pass through every one, so read a
+   * step as "reached", not "reached in order" — `toPrevious` can exceed 100%
+   * when sessions skip a step, and that is the data telling you something.
+   */
+  async 'booking-funnel'(s, q) {
+    const args = (from, to) => ({
+      p_from: from, p_to: to, p_env: s.env,
+      p_channel: q.channel && CATEGORY[q.channel] ? q.channel : null,
+      p_device: DEVICES.includes(q.device) ? q.device : null,
+      p_psychologist: UUID.test(String(q.therapist || '')) ? q.therapist : null,
+    });
+    const [now, before, dropoff] = await Promise.all([
+      rpc('mkt_funnel', args(s.from, s.to)),
+      rpc('mkt_funnel', args(s.prevFrom, s.prevTo)),
+      rpc('mkt_funnel_dropoff', args(s.from, s.to)),
+    ]);
+    const at = (rows, step) => rows.find((r) => r.step === step) || {};
+    const rows = FUNNEL.map(([step, label], i) => {
+      const sessions = Number(at(now, step).sessions) || 0;
+      const first = Number(at(now, FUNNEL[0][0]).sessions) || 0;
+      const above = i ? Number(at(now, FUNNEL[i - 1][0]).sessions) || 0 : 0;
+      return {
+        step, label, order: i + 1,
+        sessions,
+        visitors: Number(at(now, step).visitors) || 0,
+        prevSessions: Number(at(before, step).sessions) || 0,
+        toPrevious: i === 0 ? null : (above ? sessions / above : 0),
+        ofEntry: first ? sessions / first : 0,
+        dropped: i === 0 ? null : Math.max(0, above - sessions),
+      };
+    });
+    const entered = Number(at(now, 'booking_started').sessions) || 0;
+    const completed = Number(at(now, 'booking_completed').sessions) || 0;
+    const stopped = dropoff
+      .filter((r) => r.step && r.step !== 'booking_completed')
+      .map((r) => ({ step: r.step, label: LABEL_OF[r.step] || r.step, order: Number(r.step_order), sessions: Number(r.sessions) }))
+      .sort((a, b) => b.sessions - a.sessions);
+    return {
+      filters: { channel: q.channel || null, device: q.device || null, therapist: q.therapist || null },
+      summary: {
+        entered,
+        completed,
+        conversion: entered ? completed / entered : 0,
+        abandoned: Math.max(0, entered - completed),
+        abandonRate: entered ? Math.max(0, entered - completed) / entered : 0,
+      },
+      rows,
+      stopped,
+    };
+  },
+
+  /**
+   * Custom reports: the marketing team picks the dimensions and the events, and
+   * this answers exactly that question — nothing is combined that the stored
+   * data cannot answer honestly.
+   *
+   * Only dimensions 0011's counts function allows are offered (DIMENSIONS), and
+   * only events the registry records. Sessions and visitors are distinct counts
+   * within the window, so they never sum across rows — the summary is its own
+   * count, not the column added up.
+   */
+  async custom(s, q) {
+    const dims = String(q.dims || '').split(',').map((d) => d.trim()).filter((d) => DIMENSIONS.includes(d)).slice(0, 3);
+    const events = String(q.events || '').split(',').map((e) => e.trim()).filter(Boolean).slice(0, 10);
+    const rows = await counts(s, events.length ? events : null, dims, { limit: 1000 });
+    const totals = await counts(s, events.length ? events : null, []);
+    return {
+      dims,
+      events,
+      available: { dimensions: DIMENSIONS, events: REPORTABLE_EVENTS },
+      summary: {
+        events: totals[0]?.events || 0,
+        sessions: totals[0]?.sessions || 0,
+        visitors: totals[0]?.visitors || 0,
+        value: totals[0]?.value || 0,
+      },
+      rows: rows.map((r) => {
+        const row = { events: r.events, sessions: r.sessions, visitors: r.visitors, value: r.value };
+        dims.forEach((d) => { row[d] = r[d] ?? null; });
+        return row;
+      }).sort((a, b) => b.sessions - a.sessions),
+    };
+  },
+
+  /**
+   * Real-Time Activity: who is on the site now, and what each session has done.
+   *
+   * A session's steps are the events actually recorded for it. Nothing is
+   * inferred to fill a gap — a session that jumped from the listing to checkout
+   * shows exactly that, because a step we did not observe is not a step we can
+   * claim. Sessions are anonymous and stay that way.
+   */
+  async realtime(s, q) {
+    const minutes = [5, 15, 30, 60].includes(Number(q.minutes)) ? Number(q.minutes) : 15;
+    const since = new Date(Date.now() - minutes * 60000).toISOString();
+    const { data, error } = await supabaseAdmin
+      .from('analytics_events')
+      .select('session_id, anonymous_id, occurred_at, event_name, page_path, page_group, channel, utm_campaign, device_class, region')
+      .eq('environment', s.env)
+      .eq('is_bot', false)
+      .gte('occurred_at', since)
+      .order('occurred_at', { ascending: true })
+      .limit(5000);
+    if (error) fail(error);
+
+    const bySession = new Map();
+    (data || []).forEach((e) => {
+      if (!e.session_id) return;
+      const cur = bySession.get(e.session_id) || {
+        session: e.session_id, startedAt: e.occurred_at, landing: e.page_path,
+        channel: e.channel, campaign: e.utm_campaign, device: e.device_class, region: e.region,
+        events: 0, pages: [], furthest: 0, lastEvent: null, lastAt: null,
+      };
+      cur.events += 1;
+      cur.lastEvent = e.event_name;
+      cur.lastAt = e.occurred_at;
+      if (e.page_path && cur.pages[cur.pages.length - 1] !== e.page_path) cur.pages.push(e.page_path);
+      const step = FUNNEL.findIndex(([name]) => name === e.event_name) + 1;
+      if (step > cur.furthest) cur.furthest = step;
+      bySession.set(e.session_id, cur);
+    });
+
+    const sessions = [...bySession.values()].map((c) => ({
+      session: c.session,
+      startedAt: c.startedAt,
+      lastAt: c.lastAt,
+      seconds: Math.max(0, Math.round((Date.parse(c.lastAt) - Date.parse(c.startedAt)) / 1000)),
+      landing: c.landing || null,
+      current: c.pages[c.pages.length - 1] || null,
+      previous: c.pages.length > 1 ? c.pages[c.pages.length - 2] : null,
+      pages: c.pages.length,
+      events: c.events,
+      lastEvent: c.lastEvent,
+      stage: c.furthest ? LABEL_AT[c.furthest] : 'Browsing',
+      furthest: c.furthest,
+      channel: c.channel || null,
+      campaign: c.campaign || null,
+      device: c.device || null,
+      region: c.region || null,
+    })).sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
+
+    const tally = (key) => {
+      const m = {};
+      sessions.forEach((x) => { const k = x[key] || 'unknown'; m[k] = (m[k] || 0) + 1; });
+      return Object.entries(m).map(([k, n]) => ({ key: k, sessions: n })).sort((a, b) => b.sessions - a.sessions);
+    };
+    return {
+      minutes,
+      generatedAt: new Date().toISOString(),
+      summary: {
+        sessions: sessions.length,
+        visitors: new Set((data || []).map((e) => e.anonymous_id).filter(Boolean)).size,
+        inBooking: sessions.filter((x) => x.furthest >= 3).length,
+        booked: sessions.filter((x) => x.furthest >= 10).length,
+      },
+      byPage: tally('current').slice(0, 10),
+      byChannel: tally('channel').slice(0, 8),
+      rows: sessions,
+    };
+  },
+
+  /**
+   * Technical Performance: Core Web Vitals as the browser measured them, and
+   * the errors visitors actually hit.
+   *
+   * Vitals come from `web_vital` events (frontend src/analytics/vitals.js), so
+   * they are field data from real visits, not a lab score — they will not match
+   * PageSpeed's simulated run, and the p75 is the number Google grades on.
+   * INP is approximated by the slowest interaction's duration.
+   *
+   * Errors are counted from the events the site reports about itself. A page
+   * that errors and a page that converts badly are two different facts: this
+   * report puts them side by side, it does not claim one causes the other.
+   */
+  async technical(s, q) {
+    const [vitals, errors, byPage, apiErrors] = await Promise.all([
+      rpc('mkt_vitals', { p_from: s.from, p_to: s.to, p_env: s.env, p_group: q.group || null }),
+      counts(s, ['js_error', 'api_error', 'booking_step_error', 'payment_attempt_failed'], ['event_name', 'code'], { limit: 200 }),
+      counts(s, ['js_error', 'api_error'], ['page_group'], { limit: 50 }),
+      counts(s, ['api_error'], ['code'], { limit: 50 }),
+    ]);
+    const metrics = {};
+    vitals.forEach((v) => {
+      const m = v.metric;
+      metrics[m] ||= { metric: m, samples: 0, good: 0, needsImprovement: 0, poor: 0, weighted: 0 };
+      const n = Number(v.samples) || 0;
+      metrics[m].samples += n;
+      metrics[m].good += Number(v.good) || 0;
+      metrics[m].needsImprovement += Number(v.needs_improvement) || 0;
+      metrics[m].poor += Number(v.poor) || 0;
+      metrics[m].weighted += Number(v.p75) * n;
+    });
+    const unit = (m, v) => (m === 'CLS' ? Number((v / 1000).toFixed(3)) : Math.round(v));
+    return {
+      note: 'Field data from real visits, only from visitors who accepted analytics. INP is approximated by the slowest interaction.',
+      metrics: Object.values(metrics).map((m) => ({
+        ...m,
+        p75: m.samples ? unit(m.metric, m.weighted / m.samples) : null,
+        goodRate: m.samples ? m.good / m.samples : 0,
+      })),
+      rows: vitals.map((v) => ({
+        metric: v.metric,
+        pageGroup: v.page_group,
+        device: v.device_class,
+        samples: Number(v.samples),
+        p50: unit(v.metric, Number(v.p50)),
+        p75: unit(v.metric, Number(v.p75)),
+        p95: unit(v.metric, Number(v.p95)),
+        good: Number(v.good),
+        poor: Number(v.poor),
+      })),
+      errors: errors.map((e) => ({ event: e.event_name, code: e.code || 'unknown', events: e.events, sessions: e.sessions }))
+        .sort((a, b) => b.events - a.events),
+      errorPages: byPage.map((e) => ({ pageGroup: e.page_group || 'other', events: e.events, sessions: e.sessions }))
+        .sort((a, b) => b.events - a.events),
+      apiErrors: apiErrors.map((e) => ({ code: e.code || 'unknown', events: e.events })).sort((a, b) => b.events - a.events),
+    };
+  },
+
+  /**
+   * Marketing Campaigns: what each utm_campaign brought, from the first visit
+   * through to a paid booking.
+   *
+   * Sessions, starts and checkouts are browser events; bookings and their value
+   * come from booking_completed, which the payments trigger writes after
+   * Razorpay verifies the payment. Cost, CPC and ROAS are not here: no ad spend
+   * is imported, and inventing them from impressions would be a guess.
+   *
+   * utm_content and utm_term are collected but not reportable yet — the counts
+   * function (0011) does not allow them as dimensions.
+   */
+  async campaigns(s) {
+    const dims = ['utm_campaign', 'utm_source', 'channel'];
+    const [all, prev, started, checkout, booked, landing] = await Promise.all([
+      counts(s, null, dims, { limit: 500 }),
+      counts(s, null, dims, { prev: true, limit: 500 }),
+      counts(s, ['booking_started'], dims, { limit: 500 }),
+      counts(s, ['checkout_started'], dims, { limit: 500 }),
+      counts(s, ['booking_completed'], dims, { limit: 500 }),
+      counts(s, null, ['utm_campaign', 'landing_group'], { limit: 500 }),
+    ]);
+    const key = (r) => `${r.utm_campaign || ''}|${r.utm_source || ''}|${r.channel || ''}`;
+    const pick = (rows, k) => rows.find((r) => key(r) === k);
+    const named = all.filter((r) => r.utm_campaign);
+    const rows = named.map((r) => {
+      const k = key(r);
+      const sessions = r.sessions || 0;
+      const bookings = pick(booked, k)?.sessions || 0;
+      return {
+        campaign: r.utm_campaign,
+        source: SOURCE_NAME(r.channel, r.utm_source),
+        category: CATEGORY[r.channel] || r.channel || 'Unknown',
+        sessions,
+        visitors: r.visitors || 0,
+        prevSessions: pick(prev, k)?.sessions || 0,
+        bookingStarted: pick(started, k)?.sessions || 0,
+        checkoutStarted: pick(checkout, k)?.sessions || 0,
+        bookings,
+        revenue: pick(booked, k)?.value || 0,
+        conversion: sessions ? bookings / sessions : 0,
+        landing: landing.filter((l) => l.utm_campaign === r.utm_campaign)
+          .sort((a, b) => b.sessions - a.sessions)[0]?.landing_group || null,
+      };
+    }).sort((a, b) => b.sessions - a.sessions);
+    const untagged = all.filter((r) => !r.utm_campaign).reduce((t, r) => t + (r.sessions || 0), 0);
+    return {
+      summary: {
+        sessions: sum(rows, 'sessions'), visitors: sum(rows, 'visitors'),
+        bookingStarted: sum(rows, 'bookingStarted'), bookings: sum(rows, 'bookings'),
+        revenue: sum(rows, 'revenue'),
+      },
+      untagged,
+      rows,
+    };
+  },
+
+  /**
+   * Visitor Journeys: one row per session — how it arrived, what it saw, how far
+   * it got. `session` returns that one session's timeline instead.
+   *
+   * Sessions are anonymous here and stay that way: analytics_events holds no
+   * name, email or phone, and nothing in this report joins to a client record.
+   */
+  async journeys(s, q) {
+    const page = Math.max(0, Number(q.page) || 0);
+    const limit = Math.min(200, Math.max(10, Number(q.limit) || 50));
+    if (UUID.test(String(q.session || ''))) return { session: await timeline(s, q.session) };
+    const rows = await rpc('mkt_sessions', {
+      p_from: s.from, p_to: s.to, p_env: s.env,
+      p_channel: q.channel && CATEGORY[q.channel] ? q.channel : null,
+      p_device: DEVICES.includes(q.device) ? q.device : null,
+      p_stage: Number(q.stage) > 0 ? Number(q.stage) : null,
+      p_booked: q.booked === 'yes' ? true : q.booked === 'no' ? false : null,
+      p_limit: limit, p_offset: page * limit,
+    });
+    return {
+      page, limit, total: Number(rows[0]?.total) || 0,
+      filters: { channel: q.channel || null, device: q.device || null, stage: q.stage || null, booked: q.booked || null },
+      rows: rows.map((r) => ({
+        session: r.session_id,
+        visitor: r.anonymous_id,
+        startedAt: r.started_at,
+        endedAt: r.ended_at,
+        seconds: Math.max(0, Math.round((Date.parse(r.ended_at) - Date.parse(r.started_at)) / 1000)),
+        events: Number(r.events), pageViews: Number(r.page_views),
+        landing: r.landing_path, last: r.last_path,
+        channel: r.channel, source: r.utm_source, campaign: r.utm_campaign,
+        device: r.device_class, region: r.region,
+        furthest: Number(r.furthest),
+        stage: LABEL_AT[Number(r.furthest)] || 'Browsed the site',
+        booked: !!r.booked,
+      })),
+    };
+  },
+
+  /**
+   * Therapist Performance — and the sales-by-therapist report Koott had on Wix.
+   *
+   * Views and booking starts come from events (so they only count visitors who
+   * accepted analytics); bookings and revenue come from `payments`, which counts
+   * everyone. The two columns are not measuring the same population, and the
+   * conversion between them is therefore a floor, not a rate.
+   */
+  async 'therapist-performance'(s) {
+    const [now, before, people] = await Promise.all([
+      rpc('mkt_therapist_stats', { p_from: s.from, p_to: s.to, p_env: s.env }),
+      rpc('mkt_therapist_stats', { p_from: s.prevFrom, p_to: s.prevTo, p_env: s.env }),
+      supabaseAdmin.from('psychologists').select('id, first_name, last_name, designation'),
+    ]);
+    const name = Object.fromEntries((people.data || []).map((p) => [p.id, {
+      name: [p.first_name, p.last_name].filter(Boolean).join(' ').trim() || 'Unnamed',
+      role: p.designation || '',
+    }]));
+    const prev = byKey(before.map((r) => ({ ...r, key: r.psychologist_id })), 'key');
+    const rows = now.map((r) => {
+      const views = Number(r.profile_views) || 0;
+      const started = Number(r.booking_started) || 0;
+      const bookings = Number(r.bookings) || 0;
+      return {
+        id: r.psychologist_id,
+        name: name[r.psychologist_id]?.name || '—',
+        role: name[r.psychologist_id]?.role || '',
+        profileViews: views,
+        visitors: Number(r.visitors) || 0,
+        bookingStarted: started,
+        checkoutStarted: Number(r.checkout_started) || 0,
+        bookings,
+        revenue: Number(r.revenue) || 0,
+        startRate: views ? started / views : 0,
+        prevBookings: Number(prev[r.psychologist_id]?.bookings) || 0,
+        prevRevenue: Number(prev[r.psychologist_id]?.revenue) || 0,
+      };
+    }).sort((a, b) => b.revenue - a.revenue || b.profileViews - a.profileViews);
+    return {
+      summary: {
+        profileViews: sum(rows, 'profileViews'),
+        bookingStarted: sum(rows, 'bookingStarted'),
+        bookings: sum(rows, 'bookings'),
+        revenue: sum(rows, 'revenue'),
+      },
+      rows,
+    };
+  },
 };
 
 async function report(req, res) {
@@ -455,11 +916,58 @@ async function report(req, res) {
     res.set('Cache-Control', 'private, max-age=60');
     res.json({ success: true, scope: s, data });
   } catch (e) {
-    if (e instanceof NotReady || /mkt_period_stats|mkt_path_stats|mkt_source_stats|dimension not allowed|city/.test(e?.message || '')) {
+    if (e instanceof NotReady || /mkt_period_stats|mkt_path_stats|mkt_source_stats|mkt_funnel|mkt_therapist_stats|dimension not allowed|city/.test(e?.message || '')) {
       return res.status(503).json({ success: false, code: 'NOT_MIGRATED', message: 'Run supabase/migrations/0013_marketing_detail_reports.sql to switch on the detailed reports.' });
     }
     console.error(`❌ marketing report ${req.params.name}:`, e?.message || e);
     res.status(500).json({ success: false, message: 'Could not load this report.' });
+  }
+}
+
+/* --------------------------------------------------------------- saved reports */
+
+/**
+ * A marketing user's own saved custom reports. The row holds the question (the
+ * dimensions and events they picked), never an answer, so nothing here ages or
+ * leaks. Keyed by users.id: a report follows the person, not the browser.
+ */
+async function savedReports(req, res) {
+  const userId = req.user?.id;
+  try {
+    if (req.method === 'GET') {
+      const { data, error } = await supabaseAdmin
+        .from('marketing_saved_reports')
+        .select('id, name, config, updated_at')
+        .eq('user_id', userId)
+        .order('updated_at', { ascending: false })
+        .limit(100);
+      if (error) throw error;
+      return res.json({ success: true, data: { reports: data || [] } });
+    }
+
+    if (req.method === 'DELETE') {
+      const { error } = await supabaseAdmin
+        .from('marketing_saved_reports').delete().eq('user_id', userId).eq('id', req.params.id);
+      if (error) throw error;
+      return res.json({ success: true });
+    }
+
+    const name = String(req.body?.name || '').trim().slice(0, 80);
+    if (!name) return res.status(400).json({ success: false, message: 'Give the report a name.' });
+    const config = req.body?.config && typeof req.body.config === 'object' ? req.body.config : {};
+    const { data, error } = await supabaseAdmin
+      .from('marketing_saved_reports')
+      .upsert({ user_id: userId, name, config, updated_at: new Date().toISOString() }, { onConflict: 'user_id,name' })
+      .select('id, name, config, updated_at')
+      .single();
+    if (error) throw error;
+    return res.json({ success: true, data: { report: data } });
+  } catch (e) {
+    if (isMissingTable(e)) {
+      return res.status(503).json({ success: false, code: 'NOT_MIGRATED', message: 'Run supabase/migrations/0013_marketing_detail_reports.sql to save reports.' });
+    }
+    console.error('❌ marketing/saved:', e?.message || e);
+    return res.status(500).json({ success: false, message: 'Could not save that report.' });
   }
 }
 
@@ -541,6 +1049,7 @@ function page(build) {
 }
 
 module.exports = {
+  savedReports,
   meta: metaInfo,
   live,
   highlights: page(highlightsData),
