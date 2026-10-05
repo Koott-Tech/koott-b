@@ -249,3 +249,6 @@ scratch/
 
 # Claude Code personal settings
 .claude/settings.local.json
+
+# Not published: the env template is shared outside the repo.
+.env.example
