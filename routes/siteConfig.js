@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { authenticateToken, requireAdmin } = require('../middleware/auth');
+const { authenticateToken, requireMarketing } = require('../middleware/auth');
 const { getConfig, putConfig } = require('../controllers/siteConfigController');
 
 // Public read — the footer needs this on every page.
@@ -8,6 +8,9 @@ const { getConfig, putConfig } = require('../controllers/siteConfigController');
 router.get('/:key', require('../utils/cache').cachePublic(10 * 60 * 1000), getConfig);
 
 // Admin write.
-router.put('/:key', authenticateToken, requireAdmin, putConfig);
+// Page content is the marketing team's to edit (requireMarketing covers
+// marketing, admin and superadmin). What they may change is still bounded by
+// the field schema in SitePageEditor, so the design cannot be altered here.
+router.put('/:key', authenticateToken, requireMarketing, putConfig);
 
 module.exports = router;

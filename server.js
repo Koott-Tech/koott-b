@@ -909,6 +909,7 @@ app.use('/api/psychologists/google-calendar', googleCalendarRoutes);
 app.use('/api/event-pages', eventPagesRoutes);
 // Site-wide chrome held in the `cms` table (footer link columns, etc.)
 app.use('/api/site-config', require('./routes/siteConfig'));
+app.use('/api/pages', require('./routes/pages'));
 app.use('/api/events', eventsRoutes);
 app.use('/api/assessments', assessmentsRoutes);
 app.use('/api/better-parenting', betterParentingRoutes);
