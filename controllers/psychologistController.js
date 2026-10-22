@@ -1244,10 +1244,17 @@ const deleteAvailability = async (req, res) => {
   }
 };
 
-// Recurring blocks (e.g. block every Sunday as leave) - only affects this psychologist
+/**
+ * Whose time is being blocked. A therapist blocking their own carries no id and
+ * falls back to the signed-in user; an admin blocking on someone's behalf names
+ * them in the path, on routes that sit behind requireAdmin.
+ */
+const blockTargetId = (req) => req.params.psychologistId || req.user.id;
+
+// Weekly blocks (e.g. block every Sunday) - only affects this psychologist
 const getRecurringBlocks = async (req, res) => {
   try {
-    const psychologistId = req.user.id;
+    const psychologistId = blockTargetId(req);
     const { data: blocks, error } = await supabaseAdmin
       .from('psychologist_recurring_blocks')
       .select('*')
@@ -1267,7 +1274,7 @@ const getRecurringBlocks = async (req, res) => {
 
 const addRecurringBlock = async (req, res) => {
   try {
-    const psychologistId = req.user.id;
+    const psychologistId = blockTargetId(req);
     const { day_of_week, block_entire_day = true, time_slots } = req.body;
 
     if (day_of_week == null || day_of_week < 0 || day_of_week > 6) {
@@ -1349,7 +1356,7 @@ const addRecurringBlock = async (req, res) => {
 
 const deleteRecurringBlock = async (req, res) => {
   try {
-    const psychologistId = req.user.id;
+    const psychologistId = blockTargetId(req);
     const blockId = req.params.blockId;
 
     const { data: block } = await supabaseAdmin

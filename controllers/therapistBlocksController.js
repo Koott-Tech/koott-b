@@ -6,6 +6,11 @@
  *   POST   /api/psychologists/date-blocks        block a date, whole or in part
  *   DELETE /api/psychologists/date-blocks/:id    unblock it
  *
+ * The same handlers serve the admin dashboard at
+ * /api/admin/psychologists/:psychologistId/..., where the therapist is named in
+ * the path instead of being the signed-in user. Working hours stay admin-only;
+ * blocking is available to both.
+ *
  * Weekly blocks ("every Tuesday", repeating six months) are the other half of
  * this and live in psychologistController.js, next to the rest of availability.
  *
@@ -22,6 +27,16 @@ const timeBlockingService = require('../utils/timeBlockingService');
 const { normalizeTimeSlotsForStorage, getDateBlocksForPsychologist } = require('../utils/dateBlocksHelper');
 const { normalizeSlotTime, DAYS } = require('../utils/recurringBlocksHelper');
 const { DAY_KEYS, DEFAULT_WORKING_HOURS, slotsForRanges, getWorkingHours } = require('../utils/workingHours');
+
+/**
+ * Whose time is being blocked.
+ *
+ * A therapist blocking their own is the common case and carries no id, so it
+ * falls back to the signed-in user. An admin blocking on someone's behalf names
+ * them in the path, and those routes sit behind requireAdmin, so a therapist
+ * cannot reach another therapist's calendar by passing an id.
+ */
+const targetPsychologistId = (req) => req.params.psychologistId || req.user.id;
 
 /** YYYY-MM-DD for today in IST, the timezone sessions are scheduled in. */
 const istToday = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
@@ -50,7 +65,7 @@ async function removeCalendarEvents(psychologistId, row) {
  */
 const getBlockingOptions = async (req, res) => {
   try {
-    const psychologistId = req.user.id;
+    const psychologistId = targetPsychologistId(req);
     const result = await getWorkingHours(psychologistId);
     if (!result.found) return res.status(404).json(errorResponse('Psychologist not found'));
 
@@ -83,7 +98,7 @@ const getBlockingOptions = async (req, res) => {
 /** Blocks on specific dates, today onward. */
 const getDateBlocks = async (req, res) => {
   try {
-    const blocks = await getDateBlocksForPsychologist(req.user.id);
+    const blocks = await getDateBlocksForPsychologist(targetPsychologistId(req));
     return res.json(successResponse(blocks, 'Date blocks fetched'));
   } catch (error) {
     console.error('Get date blocks error:', error);
@@ -100,7 +115,7 @@ const getDateBlocks = async (req, res) => {
  */
 const addDateBlock = async (req, res) => {
   try {
-    const psychologistId = req.user.id;
+    const psychologistId = targetPsychologistId(req);
     const { date, block_entire_day = true, time_slots, reason } = req.body || {};
 
     if (!isYmd(date)) {
@@ -167,7 +182,7 @@ const addDateBlock = async (req, res) => {
 /** Unblock a date, and remove the calendar events that mirrored it. */
 const deleteDateBlock = async (req, res) => {
   try {
-    const psychologistId = req.user.id;
+    const psychologistId = targetPsychologistId(req);
 
     const { data: block } = await supabaseAdmin
       .from('psychologist_date_blocks')

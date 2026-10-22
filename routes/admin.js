@@ -263,6 +263,19 @@ const workingHoursController = require('../controllers/workingHoursController');
 router.get('/psychologists/:psychologistId/working-hours', workingHoursController.getWorkingHours);
 router.put('/psychologists/:psychologistId/working-hours', workingHoursController.updateWorkingHours);
 
+// Blocking a therapist's time on their behalf. Same handlers the therapist
+// dashboard uses; the therapist is named in the path rather than being the
+// signed-in user. Unlike working hours above, which only an admin sets, these
+// are available from both dashboards.
+const therapistBlocksController = require('../controllers/therapistBlocksController');
+router.get('/psychologists/:psychologistId/blocking-options', therapistBlocksController.getBlockingOptions);
+router.get('/psychologists/:psychologistId/date-blocks', therapistBlocksController.getDateBlocks);
+router.post('/psychologists/:psychologistId/date-blocks', therapistBlocksController.addDateBlock);
+router.delete('/psychologists/:psychologistId/date-blocks/:blockId', therapistBlocksController.deleteDateBlock);
+router.get('/psychologists/:psychologistId/recurring-blocks', psychologistController.getRecurringBlocks);
+router.post('/psychologists/:psychologistId/recurring-blocks', psychologistController.addRecurringBlock);
+router.delete('/psychologists/:psychologistId/recurring-blocks/:blockId', psychologistController.deleteRecurringBlock);
+
 // Psychiatrist consultation pricing: 15 / 30 min + 15-min packages (packages rows)
 const psychiatryPricingController = require('../controllers/psychiatryPricingController');
 router.get('/psychologists/:psychologistId/psychiatry-pricing', psychiatryPricingController.getPricing);
