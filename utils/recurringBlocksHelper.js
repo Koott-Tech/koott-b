@@ -1,6 +1,13 @@
 /**
- * Helper for psychologist recurring availability blocks (e.g. block every Sunday).
- * Used when returning availability so blocked slots are excluded per psychologist.
+ * The blocks a therapist puts on their own time, and how availability honours
+ * them. Two shapes, both handled here so every caller gets both:
+ *
+ *   weekly  - "every Sunday", repeating for six months (day_of_week set)
+ *   by date - "the 3rd of November", one date only (date set)
+ *
+ * getRecurringBlocksForPsychologist returns them together, and a slot is
+ * unavailable if either kind covers it. Callers that already pass a date get
+ * date blocks for free; the two that work from a weekday pass the date too.
  */
 
 const { supabaseAdmin } = require('../config/supabase');
@@ -50,49 +57,74 @@ function normalizeTimeSlotsForStorage(slots) {
   return out.length ? out : null;
 }
 
-/**
- * Check if a time slot is blocked by recurring blocks for a given day of week.
- * @param {Array} recurringBlocks - From getRecurringBlocksForPsychologist
- * @param {number} dayOfWeek - 0-6 (Sunday-Saturday)
- * @param {string} timeSlot - e.g. "09:00" or "09:00:00"
- * @returns {boolean}
- */
-function isSlotBlockedByRecurring(recurringBlocks, dayOfWeek, timeSlot) {
-  if (!recurringBlocks || recurringBlocks.length === 0) return false;
-  const block = recurringBlocks.find(b => b.day_of_week === dayOfWeek);
+/** Does this one block cover this slot? */
+function blockCoversSlot(block, timeSlot) {
   if (!block) return false;
   if (block.block_entire_day) return true;
-  const slots = block.time_slots || [];
   const normalized = normalizeSlotTime(timeSlot);
   if (!normalized) return false;
-  return slots.some(s => normalizeSlotTime(s) === normalized);
+  return (block.time_slots || []).some(s => normalizeSlotTime(s) === normalized);
 }
 
 /**
- * Fetch recurring blocks for a psychologist.
- * @param {string} psychologistId
- * @returns {Promise<Array>}
+ * Is this slot blocked, by either kind of block?
+ * @param {Array} blocks - From getRecurringBlocksForPsychologist
+ * @param {number} dayOfWeek - 0-6 (Sunday-Saturday)
+ * @param {string} timeSlot - e.g. "09:00" or "9:00 AM"
+ * @param {string} [dateStr] - YYYY-MM-DD; without it only weekly blocks apply
+ * @returns {boolean}
  */
-async function getRecurringBlocksForPsychologist(psychologistId) {
+function isSlotBlockedByRecurring(blocks, dayOfWeek, timeSlot, dateStr = null) {
+  if (!blocks || blocks.length === 0) return false;
+
+  // A date block is the more specific statement, so it is checked first.
+  if (dateStr) {
+    const onDate = blocks.find(b => b.date && String(b.date).slice(0, 10) === dateStr);
+    if (blockCoversSlot(onDate, timeSlot)) return true;
+  }
+  const weekly = blocks.find(b => !b.date && b.day_of_week === dayOfWeek);
+  return blockCoversSlot(weekly, timeSlot);
+}
+
+/** A table or column that the migration has not created yet. */
+const notMigrated = (error) => error?.code === '42P01'
+  || error?.code === '42703'
+  || /does not exist/i.test(error?.message || '');
+
+async function readBlocks(table, psychologistId) {
   try {
     const { data, error } = await supabaseAdmin
-      .from('psychologist_recurring_blocks')
+      .from(table)
       .select('*')
       .eq('psychologist_id', psychologistId);
 
     if (error) {
-      // Table may not exist yet (migration not run)
-      if (error.code === '42P01' || error.message?.includes('does not exist')) {
-        return [];
-      }
-      console.error('Error fetching recurring blocks:', error);
+      if (notMigrated(error)) return [];
+      console.error(`Error fetching ${table}:`, error);
       return [];
     }
     return data || [];
   } catch (err) {
-    console.error('Error fetching recurring blocks:', err);
+    console.error(`Error fetching ${table}:`, err);
     return [];
   }
+}
+
+/**
+ * Every block for a psychologist: weekly ones and dated ones together.
+ *
+ * The name is kept because seven call sites read availability through it; what
+ * changed is that the list now carries date blocks as well, each with a `date`
+ * where a weekly block has a `day_of_week`.
+ * @param {string} psychologistId
+ * @returns {Promise<Array>}
+ */
+async function getRecurringBlocksForPsychologist(psychologistId) {
+  const [weekly, dated] = await Promise.all([
+    readBlocks('psychologist_recurring_blocks', psychologistId),
+    readBlocks('psychologist_date_blocks', psychologistId),
+  ]);
+  return [...weekly, ...dated];
 }
 
 /**
@@ -109,7 +141,7 @@ function filterSlotsByRecurringBlocks(timeSlots, dateStr, recurringBlocks) {
   const dayOfWeek = getDayOfWeekFromDate(dateStr);
   if (dayOfWeek == null) return timeSlots;
 
-  return timeSlots.filter(slot => !isSlotBlockedByRecurring(recurringBlocks, dayOfWeek, slot));
+  return timeSlots.filter(slot => !isSlotBlockedByRecurring(recurringBlocks, dayOfWeek, slot, dateStr));
 }
 
 /**

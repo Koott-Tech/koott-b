@@ -1276,6 +1276,7 @@ const addRecurringBlock = async (req, res) => {
 
     const { normalizeTimeSlotsForStorage } = require('../utils/recurringBlocksHelper');
     const dayNum = Number(day_of_week);
+    let calendarError = null;
     const normalizedSlots = normalizeTimeSlotsForStorage(time_slots);
     const payload = {
       psychologist_id: psychologistId,
@@ -1313,6 +1314,12 @@ const addRecurringBlock = async (req, res) => {
           payload.google_calendar_event_id = gcalResult.eventId;
         }
       }
+      // The repeat stops six months out. Storing the same date the calendar
+      // event's RRULE UNTIL carries keeps the row and the calendar in step, and
+      // lets the dashboard tell the therapist when the block lapses.
+      payload.blocked_until = gcalResult.until
+        || timeBlockingService.constructor.sixMonthHorizon().date;
+      calendarError = gcalResult.success ? null : gcalResult.error;
     }
 
     const { data: block, error } = await supabaseAdmin
@@ -1330,7 +1337,10 @@ const addRecurringBlock = async (req, res) => {
     }
     // Sync future availability so a blocked day has empty/reduced slots in the DB
     await syncFutureAvailabilityForRecurringBlockDay(psychologistId, dayNum, { useDefaultSlots: false });
-    res.json(successResponse(block, 'Recurring block saved. It will apply to all future weeks.'));
+    res.json(successResponse(
+      { ...block, calendar_synced: !calendarError, calendar_error: calendarError },
+      'Weekly block saved. It repeats for the next six months.'
+    ));
   } catch (err) {
     console.error('Add recurring block error:', err);
     res.status(500).json(errorResponse('Internal server error while adding recurring block'));

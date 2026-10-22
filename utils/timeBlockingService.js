@@ -33,141 +33,204 @@ class TimeBlockingService {
   }
 
   /**
+   * How far a weekly block repeats: six months from today, in IST.
+   * Returned both as a date (stored on the row) and as the UTC basic-format
+   * stamp an RRULE UNTIL takes, so the row and the calendar event agree.
+   */
+  static sixMonthHorizon(from = new Date()) {
+    const end = new Date(from);
+    end.setMonth(end.getMonth() + 6);
+    const date = end.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    return { date, until: `${date.replace(/-/g, '')}T235959Z` };
+  }
+
+  /**
+   * The therapist's calendar client, or why it cannot be used.
+   */
+  async getCalendarClient(psychologistId, { needsWrite = true } = {}) {
+    const { data: psychologist, error } = await supabaseAdmin
+      .from('psychologists')
+      .select('id, google_calendar_credentials')
+      .eq('id', psychologistId)
+      .single();
+
+    if (error || !psychologist || !psychologist.google_calendar_credentials) {
+      return { ok: false, error: 'Google Calendar not connected' };
+    }
+
+    const credentials = typeof psychologist.google_calendar_credentials === 'string'
+      ? JSON.parse(psychologist.google_calendar_credentials)
+      : psychologist.google_calendar_credentials;
+
+    if (needsWrite && credentials.scope && credentials.scope.includes('calendar.readonly')) {
+      return { ok: false, error: 'Google Calendar is read-only. Reconnect with full access.' };
+    }
+    return { ok: true, auth: this.createOAuthClient(credentials) };
+  }
+
+  /**
+   * Group "HH:MM" slot starts into contiguous hour-long runs.
+   * ["09:00","10:00","14:00"] -> [{ start: "09:00", end: "11:00" },
+   *                               { start: "14:00", end: "15:00" }]
+   * A run becomes one calendar event rather than one per hour, so blocking a
+   * morning reads as a single band instead of four stacked entries.
+   */
+  static groupSlotsIntoRuns(timeSlots) {
+    const toMin = (slot) => {
+      const [h, m] = String(slot).trim().substring(0, 5).split(':').map(Number);
+      return (h || 0) * 60 + (m || 0);
+    };
+    const toHHMM = (min) => `${String(Math.floor(min / 60) % 24).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
+
+    const mins = [...new Set((timeSlots || []).map(toMin))].sort((a, b) => a - b);
+    const runs = [];
+    for (const m of mins) {
+      const last = runs[runs.length - 1];
+      if (last && m === last.endMin) last.endMin = m + 60;
+      else runs.push({ startMin: m, endMin: m + 60 });
+    }
+    return runs.map((r) => ({ start: toHHMM(r.startMin), end: toHHMM(r.endMin) }));
+  }
+
+  /**
+   * Block one calendar date - the whole day, or only the given hours.
+   * The date-block counterpart to createRecurringBlockCalendarEvent: no RRULE,
+   * so it marks that one date.
+   * @param {string} psychologistId
+   * @param {Object} block - { date: 'YYYY-MM-DD', block_entire_day: boolean, time_slots?: string[] }
+   * @param {string} reason
+   * @returns {Promise<{ success: boolean, eventIds?: string[], error?: string }>}
+   */
+  async createDateBlockCalendarEvent(psychologistId, block, reason = 'Blocked') {
+    try {
+      const client = await this.getCalendarClient(psychologistId);
+      if (!client.ok) return { success: false, error: client.error };
+
+      const date = String(block.date).trim();
+      const timeSlots = Array.isArray(block.time_slots) ? block.time_slots.filter(Boolean) : [];
+      const base = {
+        summary: `🚫 BLOCKED - ${reason}`,
+        description: `Blocked by psychologist - ${reason}. Synced from Koott.`,
+        colorId: '11',
+        transparency: 'opaque',
+        visibility: 'private'
+      };
+
+      const events = [];
+      if (block.block_entire_day || timeSlots.length === 0) {
+        const next = new Date(`${date}T00:00:00Z`);
+        next.setUTCDate(next.getUTCDate() + 1);
+        events.push({ ...base, start: { date }, end: { date: next.toISOString().split('T')[0] } });
+      } else {
+        for (const run of TimeBlockingService.groupSlotsIntoRuns(timeSlots)) {
+          events.push({
+            ...base,
+            start: { dateTime: `${date}T${run.start}:00`, timeZone: 'Asia/Kolkata' },
+            end: { dateTime: `${date}T${run.end}:00`, timeZone: 'Asia/Kolkata' }
+          });
+        }
+      }
+
+      const eventIds = [];
+      for (const resource of events) {
+        const response = await this.calendar.events.insert({
+          auth: client.auth,
+          calendarId: 'primary',
+          resource
+        });
+        eventIds.push(response.data.id);
+      }
+      console.log(`✅ Date block GCal: ${eventIds.length} event(s) for psychologist ${psychologistId} on ${date}`);
+      return { success: true, eventIds };
+    } catch (error) {
+      console.error('Error creating date block calendar event:', error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Delete a block event. Works for date blocks and recurring blocks alike -
+   * deleting a recurring event removes the whole series.
+   */
+  async deleteBlockCalendarEvent(psychologistId, eventId) {
+    return this.deleteRecurringBlockCalendarEvent(psychologistId, eventId);
+  }
+
+  /**
    * Create a recurring block event on Google Calendar (full-day or time range, e.g. every Sunday 11 AM–3 PM).
    * Used when psychologist adds a recurring block (e.g. "block every Sunday" or "block 11 AM–3 PM every Sunday").
    * @param {string} psychologistId - Psychologist ID
    * @param {Object} block - { day_of_week: 0-6, block_entire_day: boolean, time_slots?: string[] }
    * @param {string} reason - Display reason (e.g. "Recurring block")
-   * @returns {Promise<{ success: boolean, eventId?: string, error?: string }>}
+   * @returns {Promise<{ success: boolean, eventIds?: string[], until?: string, error?: string }>}
    */
   async createRecurringBlockCalendarEvent(psychologistId, block, reason = 'Recurring block') {
     try {
-      const { data: psychologist, error: psychError } = await supabaseAdmin
-        .from('psychologists')
-        .select('id, google_calendar_credentials')
-        .eq('id', psychologistId)
-        .single();
+      const client = await this.getCalendarClient(psychologistId);
+      if (!client.ok) return { success: false, error: client.error };
 
-      if (psychError || !psychologist || !psychologist.google_calendar_credentials) {
-        return { success: false, error: 'Google Calendar not connected' };
-      }
-
-      const credentials = typeof psychologist.google_calendar_credentials === 'string'
-        ? JSON.parse(psychologist.google_calendar_credentials)
-        : psychologist.google_calendar_credentials;
-
-      if (credentials.scope && credentials.scope.includes('calendar.readonly')) {
-        return { success: false, error: 'Google Calendar is read-only. Reconnect with full access.' };
-      }
-
-      const oauth2Client = this.createOAuthClient(credentials);
       const dayOfWeek = Number(block.day_of_week);
       const byDay = TimeBlockingService.getRRULEByDay(dayOfWeek);
       const blockEntireDay = !!block.block_entire_day;
       const timeSlots = Array.isArray(block.time_slots) ? block.time_slots.filter(Boolean) : [];
 
-      // First occurrence date must fall on the chosen day (e.g. a Sunday). Reference: 2020-01-05 = Sunday.
+      if (!blockEntireDay && timeSlots.length === 0) {
+        return { success: false, error: 'No time range specified for partial-day block' };
+      }
+
+      // The repeat stops after six months rather than running forever, so a
+      // therapist is not blocked into next year by a block they set once.
+      const horizon = block.until || TimeBlockingService.sixMonthHorizon();
+      const rrule = `RRULE:FREQ=WEEKLY;BYDAY=${byDay};UNTIL=${horizon.until}`;
+
+      // The first occurrence has to land on the chosen weekday; 2020-01-05 was a Sunday.
       const refSunday = new Date('2020-01-05T00:00:00Z');
       const startDate = new Date(refSunday);
       startDate.setUTCDate(refSunday.getUTCDate() + dayOfWeek);
       const startDateStr = startDate.toISOString().split('T')[0];
 
-      let event;
+      const base = {
+        summary: `🚫 BLOCKED - ${reason}`,
+        description: `Recurring block by psychologist - ${reason}. Synced from Koott.`,
+        recurrence: [rrule],
+        colorId: '11',
+        transparency: 'opaque',
+        visibility: 'private'
+      };
 
+      const events = [];
       if (blockEntireDay) {
-        const endDate = new Date(startDate);
-        endDate.setUTCDate(endDate.getUTCDate() + 1);
-        const endDateStr = endDate.toISOString().split('T')[0];
-        event = {
-          summary: `🚫 BLOCKED - ${reason}`,
-          description: `Recurring block by psychologist (e.g. leave) - ${reason}. Synced from Koott.`,
+        const next = new Date(startDate);
+        next.setUTCDate(next.getUTCDate() + 1);
+        events.push({
+          ...base,
           start: { date: startDateStr },
-          end: { date: endDateStr },
-          recurrence: [`RRULE:FREQ=WEEKLY;BYDAY=${byDay}`],
-          colorId: '11',
-          transparency: 'opaque',
-          visibility: 'private'
-        };
-      } else if (timeSlots.length > 0) {
-        // Check if slots form a continuous range (each slot is 1 hour after the previous)
-        const parseMinutes = (s) => {
-          const t = String(s).trim().substring(0, 5);
-          const [h, m] = t.split(':').map(Number);
-          return (h || 0) * 60 + (m || 0);
-        };
-        const sorted = [...timeSlots].map(parseMinutes).sort((a, b) => a - b);
-        const isContinuous = sorted.every((m, i) => i === 0 || m - sorted[i - 1] === 60);
-
-        if (isContinuous) {
-          // Single event for continuous range: e.g. 11:00–15:00 (slots 11, 12, 13, 14)
-          const firstSlot = String(timeSlots[0]).trim().substring(0, 5);
-          const lastSlot = String(timeSlots[timeSlots.length - 1]).trim().substring(0, 5);
-          const [lastH, lastM] = lastSlot.split(':').map(Number);
-          const endH = lastH + 1;
-          const endSlot = `${String(endH).padStart(2, '0')}:${String(lastM || 0).padStart(2, '0')}`;
-          const startDateTime = `${startDateStr}T${firstSlot}:00`;
-          const endDateTime = `${startDateStr}T${endSlot}:00`;
-          event = {
-            summary: `🚫 BLOCKED - ${reason}`,
-            description: `Recurring block by psychologist - ${reason}. Synced from Koott.`,
-            start: { dateTime: startDateTime, timeZone: 'Asia/Kolkata' },
-            end: { dateTime: endDateTime, timeZone: 'Asia/Kolkata' },
-            recurrence: [`RRULE:FREQ=WEEKLY;BYDAY=${byDay}`],
-            colorId: '11',
-            transparency: 'opaque',
-            visibility: 'private'
-          };
-          const response = await this.calendar.events.insert({
-            auth: oauth2Client,
-            calendarId: 'primary',
-            resource: event
-          });
-          const eventId = response.data.id;
-          console.log(`✅ Recurring block GCal event created for psychologist ${psychologistId}, day ${dayOfWeek}, eventId=${eventId}`);
-          return { success: true, eventId };
-        }
-
-        // Non-contiguous slots (e.g. 8, 9, 13): create one recurring event per slot so only those hours are blocked
-        const eventIds = [];
-        for (const slot of timeSlots) {
-          const startSlot = String(slot).trim().substring(0, 5);
-          const [h, m] = startSlot.split(':').map(Number);
-          const endH = (h || 0) + 1;
-          const endSlot = `${String(endH).padStart(2, '0')}:${String(m || 0).padStart(2, '0')}`;
-          const slotEvent = {
-            summary: `🚫 BLOCKED - ${reason}`,
-            description: `Recurring block by psychologist - ${reason}. Synced from Koott.`,
-            start: { dateTime: `${startDateStr}T${startSlot}:00`, timeZone: 'Asia/Kolkata' },
-            end: { dateTime: `${startDateStr}T${endSlot}:00`, timeZone: 'Asia/Kolkata' },
-            recurrence: [`RRULE:FREQ=WEEKLY;BYDAY=${byDay}`],
-            colorId: '11',
-            transparency: 'opaque',
-            visibility: 'private'
-          };
-          const response = await this.calendar.events.insert({
-            auth: oauth2Client,
-            calendarId: 'primary',
-            resource: slotEvent
-          });
-          eventIds.push(response.data.id);
-        }
-        console.log(`✅ Recurring block GCal: ${eventIds.length} events for psychologist ${psychologistId}, day ${dayOfWeek}`);
-        return { success: true, eventIds };
-      } else {
-        return { success: false, error: 'No time range specified for partial-day block' };
-      }
-
-      // Single event path (blockEntireDay or continuous range) already returned above
-      if (event) {
-        const response = await this.calendar.events.insert({
-          auth: oauth2Client,
-          calendarId: 'primary',
-          resource: event
+          end: { date: next.toISOString().split('T')[0] }
         });
-        const eventId = response.data.id;
-        console.log(`✅ Recurring block GCal event created for psychologist ${psychologistId}, day ${dayOfWeek}, eventId=${eventId}`);
-        return { success: true, eventId };
+      } else {
+        // Contiguous hours collapse into one band; a gap starts a new event, so
+        // blocking 9-11 and 2-3 marks those two bands and nothing between them.
+        for (const run of TimeBlockingService.groupSlotsIntoRuns(timeSlots)) {
+          events.push({
+            ...base,
+            start: { dateTime: `${startDateStr}T${run.start}:00`, timeZone: 'Asia/Kolkata' },
+            end: { dateTime: `${startDateStr}T${run.end}:00`, timeZone: 'Asia/Kolkata' }
+          });
+        }
       }
+
+      const eventIds = [];
+      for (const resource of events) {
+        const response = await this.calendar.events.insert({
+          auth: client.auth,
+          calendarId: 'primary',
+          resource
+        });
+        eventIds.push(response.data.id);
+      }
+
+      console.log(`✅ Recurring block GCal: ${eventIds.length} event(s) for psychologist ${psychologistId}, day ${dayOfWeek}, until ${horizon.date}`);
+      return { success: true, eventIds, eventId: eventIds[0], until: horizon.date };
     } catch (error) {
       console.error('Error creating recurring block calendar event:', error);
       return { success: false, error: error.message };

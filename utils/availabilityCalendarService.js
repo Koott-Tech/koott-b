@@ -280,7 +280,7 @@ class AvailabilityCalendarService {
       // Recurring blocks (e.g. block every Sunday) - only this psychologist
       const recurringBlocks = await getRecurringBlocksForPsychologist(psychologistId);
       const dayOfWeek = getDayOfWeekFromDate(date);
-      if (dayOfWeek != null && isSlotBlockedByRecurring(recurringBlocks, dayOfWeek, time)) {
+      if (dayOfWeek != null && isSlotBlockedByRecurring(recurringBlocks, dayOfWeek, time, date)) {
         console.log(`🔍 isTimeSlotAvailable result: ❌ Not available (recurring block)`);
         return false;
       }
@@ -533,7 +533,7 @@ class AvailabilityCalendarService {
             
             const isGoogleCalendarBlocked = googleCalendarSlots.has(timeStr);
             const dayOfWeek = getDayOfWeekFromDate(dateStr);
-            const isRecurringBlocked = dayOfWeek != null && isSlotBlockedByRecurring(recurringBlocks, dayOfWeek, timeString);
+            const isRecurringBlocked = dayOfWeek != null && isSlotBlockedByRecurring(recurringBlocks, dayOfWeek, timeString, dateStr);
             const isBlocked = isBooked || isGoogleCalendarBlocked || isRecurringBlocked;
             
             let reason = 'available';

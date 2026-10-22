@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const psychologistController = require('../controllers/psychologistController');
+const therapistBlocksController = require('../controllers/therapistBlocksController');
 const sessionController = require('../controllers/sessionController');
 const { authenticateToken, requirePsychologist } = require('../middleware/auth');
 const { 
@@ -130,10 +131,17 @@ router.post('/availability', validateAvailability, psychologistController.addAva
 router.put('/availability', validateAvailability, psychologistController.updateAvailability);
 router.delete('/availability/:availabilityId', psychologistController.deleteAvailability);
 
-// Recurring blocks (e.g. block every Sunday - applies to all future weeks, only this psychologist)
+// Time blocking, the two shapes a therapist can choose between.
+// Weekly: "every Sunday", repeating for the next six months.
 router.get('/recurring-blocks', psychologistController.getRecurringBlocks);
 router.post('/recurring-blocks', psychologistController.addRecurringBlock);
 router.delete('/recurring-blocks/:blockId', psychologistController.deleteRecurringBlock);
+// By date: one calendar date, whole or in part.
+router.get('/date-blocks', therapistBlocksController.getDateBlocks);
+router.post('/date-blocks', therapistBlocksController.addDateBlock);
+router.delete('/date-blocks/:blockId', therapistBlocksController.deleteDateBlock);
+// The hours this therapist can block, cut from their own working hours.
+router.get('/blocking-options', therapistBlocksController.getBlockingOptions);
 
 // Private note password — per-therapist password that gates summary_notes access
 router.get('/private-notes/status', psychologistController.getPrivateNotePasswordStatus);
