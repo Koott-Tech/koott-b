@@ -161,31 +161,32 @@ async function sessionsInWindow({ from, to, scope, on = 'booking' }) {
 const bookedAt = (s) => s.booking_created_at || s.created_at || null;
 
 /**
- * Which sessions came from a client's first-ever booking.
+ * Which of these clients had already booked before the window opened.
  *
  * sessions.is_first_session is not used: it is null on every live row, written
- * only by the finance reports. The first booking per client is found by
- * ordering that client's whole history, so a client who booked before the
- * window counts as returning inside it.
+ * only by the finance reports.
+ *
+ * This asks one narrow question — "which of these clients have any session
+ * earlier than this?" — rather than reading their histories. An earlier version
+ * pulled every session for every client in batches of two hundred, which is
+ * unbounded by the date filter: a one-day report on a busy month would have
+ * read the whole sessions table. This reads client ids only, for sessions
+ * strictly before the window, and the set is at most the number of clients.
  */
-async function firstBookingByClient(clientIds) {
-  if (!clientIds.length) return new Map();
-  const first = new Map();
+async function clientsSeenBefore(clientIds, beforeUtc) {
+  if (!clientIds.length) return new Set();
+  const seen = new Set();
   for (let i = 0; i < clientIds.length; i += 200) {
     const batch = clientIds.slice(i, i + 200);
     const rows = await readAll(() => supabaseAdmin
       .from('sessions')
-      .select('client_id, booking_created_at, created_at')
+      .select('client_id')
       .in('client_id', batch)
+      .lt('booking_created_at', beforeUtc)
       .order('client_id'));
-    rows.forEach((r) => {
-      const at = r.booking_created_at || r.created_at;
-      if (!at) return;
-      const seen = first.get(r.client_id);
-      if (!seen || at < seen) first.set(r.client_id, at);
-    });
+    rows.forEach((r) => seen.add(r.client_id));
   }
-  return first;
+  return seen;
 }
 
 /** An empty 24-hour histogram, so quiet hours appear as zero rather than vanish. */
@@ -242,19 +243,31 @@ async function sessionTime({ from, to, scope }) {
 async function clientMix({ from, to, scope }) {
   const rows = await sessionsInWindow({ from, to, scope, on: 'booking' });
   const clientIds = [...new Set(rows.map((s) => s.client_id).filter(Boolean))];
-  const first = await firstBookingByClient(clientIds);
+  const windowStartUtc = new Date(Date.parse(`${from}T00:00:00Z`) - IST_OFFSET_MS).toISOString();
+  const seenBefore = await clientsSeenBefore(clientIds, windowStartUtc);
 
   let newSessions = 0;
   let returningSessions = 0;
   const newClients = new Set();
   const returningClients = new Set();
 
-  rows.forEach((s) => {
+  // A client is new on the first booking they make, and only if they had none
+  // before the window. Their second booking inside the same window is already a
+  // repeat, which is what stops one person inflating the new-client count.
+  const countedFirst = new Set();
+  const ordered = [...rows].sort((a, b) => String(bookedAt(a) || '').localeCompare(String(bookedAt(b) || '')));
+
+  ordered.forEach((s) => {
     if (!s.client_id) return;
-    const at = bookedAt(s);
-    const isFirst = at && first.get(s.client_id) === at;
-    if (isFirst) { newSessions += 1; newClients.add(s.client_id); }
-    else { returningSessions += 1; returningClients.add(s.client_id); }
+    const isFirstEver = !seenBefore.has(s.client_id) && !countedFirst.has(s.client_id);
+    if (isFirstEver) {
+      countedFirst.add(s.client_id);
+      newSessions += 1;
+      newClients.add(s.client_id);
+    } else {
+      returningSessions += 1;
+      returningClients.add(s.client_id);
+    }
   });
 
   const byStatus = {};
@@ -263,7 +276,8 @@ async function clientMix({ from, to, scope }) {
   return {
     sessions: { total: rows.length, new: newSessions, returning: returningSessions },
     // A client whose first booking and a repeat both fall in the window counts
-    // in both sets, so these need not sum to the unique total.
+    // in both sets, so these need not sum to the unique total. `total` is the
+    // honest count of distinct people.
     clients: { total: clientIds.length, new: newClients.size, returning: returningClients.size },
     byStatus: Object.entries(byStatus).map(([status, sessions]) => ({ status, sessions })).sort((a, b) => b.sessions - a.sessions),
     activeStatuses: ACTIVE_SESSION_STATUSES,
