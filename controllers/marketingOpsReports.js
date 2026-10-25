@@ -451,9 +451,110 @@ async function slotsAvailable({ from, to, scope }) {
 }
 
 /** Everything the overview needs, in one round trip. */
+/**
+ * The same figures as the overview, but one row per team — or, inside a team,
+ * one row per therapist.
+ *
+ * The level follows the scope, so the table always answers "how do the parts of
+ * what I am looking at compare". Everything is grouped from a single pass over
+ * the window rather than one request per row: asking the API eight times to
+ * fill an eight-row table would be eight times the work for an answer that
+ * reads the same rows each time.
+ *
+ * Rows are the parts of the current scope and so add up to its total, which is
+ * only true because a therapist belongs to at most one team and those with
+ * none fall into Ungrouped.
+ */
+async function comparison({ from, to, scope }) {
+  const [kind] = String(scope || 'all').split(':');
+  // Inside a team the parts are its therapists; at the top they are the teams.
+  const groupBy = kind === 'team' ? 'therapist' : 'team';
+  if (kind === 'therapist') return { groupBy: 'therapist', rows: [] };
+
+  const ids = await therapistIdsForScope(scope);
+  if (ids && ids.length === 0) return { groupBy, rows: [] };
+
+  let pq = supabaseAdmin.from('psychologists').select('id, first_name, last_name, therapist_group_id');
+  if (ids) pq = pq.in('id', ids);
+  const [{ data: psychs, error: pErr }, groups] = await Promise.all([pq, teams()]);
+  if (pErr) throw pErr;
+
+  const teamName = new Map(groups.map((g) => [g.id, g.name]));
+  const keyOf = (psychId) => {
+    if (groupBy === 'therapist') return psychId;
+    const p = (psychs || []).find((x) => x.id === psychId);
+    return p?.therapist_group_id || UNGROUPED.id;
+  };
+  const labelOf = (key) => {
+    if (groupBy === 'team') return teamName.get(key) || UNGROUPED.name;
+    const p = (psychs || []).find((x) => x.id === key);
+    return `${p?.first_name || ''} ${p?.last_name || ''}`.trim() || 'Therapist';
+  };
+
+  // Every therapist in scope gets a row, so a team with no activity shows as a
+  // zero rather than disappearing — which would read as "no such team".
+  const rows = new Map();
+  const blank = (key) => ({
+    id: key, name: labelOf(key),
+    sessions: 0, newClients: 0, returningClients: 0,
+    slotsScheduled: 0, slotsBookable: 0, slotsOpened: 0, slotsOpenedByPeople: 0,
+  });
+  (psychs || []).forEach((p) => {
+    const key = keyOf(p.id);
+    if (!rows.has(key)) rows.set(key, blank(key));
+  });
+  const row = (psychId) => {
+    const key = keyOf(psychId);
+    if (!rows.has(key)) rows.set(key, blank(key));
+    return rows.get(key);
+  };
+
+  const [sessions, slots, openings] = await Promise.all([
+    sessionsInWindow({ from, to, scope, on: 'booking' }),
+    slotsAvailable({ from, to, scope }),
+    slotOpenings({ from, to, scope }),
+  ]);
+
+  // New vs returning is decided the same way as everywhere else, then
+  // attributed to whichever part the session's therapist belongs to.
+  const clientIds = [...new Set(sessions.map((x) => x.client_id).filter(Boolean))];
+  const windowStartUtc = new Date(Date.parse(`${from}T00:00:00Z`) - IST_OFFSET_MS).toISOString();
+  const seenBefore = await clientsSeenBefore(clientIds, windowStartUtc);
+  const countedFirst = new Set();
+
+  [...sessions]
+    .sort((a, b) => String(bookedAt(a) || '').localeCompare(String(bookedAt(b) || '')))
+    .forEach((x) => {
+      if (!x.psychologist_id) return;
+      const r = row(x.psychologist_id);
+      r.sessions += 1;
+      if (!x.client_id) return;
+      if (!seenBefore.has(x.client_id) && !countedFirst.has(x.client_id)) {
+        countedFirst.add(x.client_id);
+        r.newClients += 1;
+      } else {
+        r.returningClients += 1;
+      }
+    });
+
+  slots.perTherapist.forEach((t) => {
+    const r = row(t.psychologistId);
+    r.slotsScheduled += t.slots;
+    r.slotsBookable += t.bookable;
+  });
+  openings.perTherapist.forEach((t) => { row(t.psychologistId).slotsOpened += t.slots; });
+  openings.openings.forEach((o) => {
+    if (o.actor === 'therapist' || o.actor === 'admin') row(o.psychologistId).slotsOpenedByPeople += 1;
+  });
+
+  const out = [...rows.values()].sort((a, b) => b.sessions - a.sessions || a.name.localeCompare(b.name));
+  // Ungrouped reads as a remainder, so it sits last whatever its numbers.
+  return { groupBy, rows: out.sort((a, b) => (a.id === UNGROUPED.id ? 1 : b.id === UNGROUPED.id ? -1 : 0)) };
+}
+
 async function overview(args) {
-  const [booking, session, mix, openings, slots] = await Promise.all([
-    bookingTime(args), sessionTime(args), clientMix(args), slotOpenings(args), slotsAvailable(args),
+  const [booking, session, mix, openings, slots, compare] = await Promise.all([
+    bookingTime(args), sessionTime(args), clientMix(args), slotOpenings(args), slotsAvailable(args), comparison(args),
   ]);
   return {
     kpis: {
@@ -472,11 +573,13 @@ async function overview(args) {
     clients: mix,
     slotOpenings: openings,
     slots,
+    comparison: compare,
   };
 }
 
 module.exports = {
   teams,
+  comparison,
   therapists,
   overview,
   bookingTime,
