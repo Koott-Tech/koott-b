@@ -1,4 +1,5 @@
 const { supabaseAdmin } = require('../config/supabase');
+const { recordSlotBooking } = require('../utils/slotEvents');
 const { 
   successResponse, 
   errorResponse,
@@ -3074,7 +3075,7 @@ async function cancelOnlySession(req, res) {
     const { data: session, error: fetchErr } = await supabaseAdmin
       .from('sessions')
       .select(`
-        id, status, psychologist_id, google_calendar_event_id,
+        id, status, psychologist_id, scheduled_date, scheduled_time, google_calendar_event_id,
         psychologist:psychologists!sessions_psychologist_id_fkey(id, google_calendar_credentials)
       `)
       .eq('id', sessionId)
@@ -3125,6 +3126,18 @@ async function cancelOnlySession(req, res) {
       })
       .eq('id', sessionId);
     if (updateErr) return res.status(500).json(errorResponse(updateErr.message));
+
+    // The slot is bookable again, which the dashboard counts against the
+    // 'booked' event recorded when it was taken.
+    await recordSlotBooking({
+      psychologistId: session.psychologist_id,
+      date: session.scheduled_date,
+      time: session.scheduled_time,
+      event: 'cancelled',
+      actor: req.user?.role === 'psychologist' ? 'therapist' : 'admin',
+      actorId: req.user?.id || null,
+      source: 'sessionController.cancelOnlySession',
+    });
 
     console.log(`⏸️  [cancelOnlySession] ${sessionId} → on_hold (no refund); slot freed.`);
     return res.json({

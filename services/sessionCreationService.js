@@ -11,6 +11,7 @@
  */
 
 const { supabaseAdmin } = require('../config/supabase');
+const { recordSlotBooking } = require('../utils/slotEvents');
 const { assertClientPackageHasAvailableSlot } = require('./packageService');
 const { updateSlotLockStatus } = require('./slotLockService');
 const meetLinkService = require('../utils/meetLinkService');
@@ -184,6 +185,21 @@ const createSessionFromSlotLock = async (slotLock) => {
       .insert([sessionData])
       .select('*')
       .single();
+
+    if (!sessionError && session) {
+      // A booking does not change the availability array — a taken slot is
+      // filtered out when availability is read — so it is recorded here rather
+      // than by diffing slots.
+      await recordSlotBooking({
+        psychologistId: slotLock.psychologist_id,
+        date: slotLock.scheduled_date,
+        time: slotLock.scheduled_time,
+        event: 'booked',
+        actor: 'client',
+        actorId: session.client_id || null,
+        source: 'sessionCreationService.createSessionFromSlotLock',
+      });
+    }
 
     if (sessionError) {
       // Check if it's a unique constraint violation (double booking)

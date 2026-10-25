@@ -12,6 +12,7 @@ const { authenticateToken, requireMarketing } = require('../middleware/auth');
 const auditLogger = require('../utils/auditLogger');
 const c = require('../controllers/marketingController');
 
+const ops = require('../controllers/marketingOpsController');
 const router = express.Router();
 router.use(authenticateToken, requireMarketing);
 
@@ -33,6 +34,15 @@ router.get('/traffic', c.traffic);
 // button-clicks, blog-posts, blog-time, search-queries, booking-funnel,
 // therapist-performance, journeys, campaigns, technical, realtime, custom
 router.get('/report/:name', c.report);
+
+/**
+ * Operations reports: bookings, sessions, slots and clients, at three levels.
+ * ?scope=all | team:<id> | therapist:<id>, with the same from/to the other
+ * reports take. Same role guard as the rest of the dashboard.
+ */
+router.get('/ops/teams', ops.teams);
+router.get('/ops/therapists', ops.therapists);
+router.get('/ops/:name', ops.report);
 
 // A user's own saved custom reports (the question, never the answer).
 router.get('/saved', c.savedReports);

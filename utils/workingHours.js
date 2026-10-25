@@ -16,6 +16,7 @@ const { supabaseAdmin } = require('../config/supabase');
 const { getRecurringBlocksForPsychologist, filterSlotsByRecurringBlocks } = require('./recurringBlocksHelper');
 const sessionSlots = require('./sessionSlots');
 
+const { recordSlotChange } = require('./slotEvents');
 const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 const DEFAULT_WORKING_HOURS = {
   days: Object.fromEntries(DAY_KEYS.map((k) => [k, [{ start: '08:00', end: '22:00' }]])),
@@ -195,13 +196,15 @@ async function saveWorkingHours(psychologistId, input) {
   const blocks = await getRecurringBlocksForPsychologist(psychologistId);
   const { data: rows, error: rowsErr } = await supabaseAdmin
     .from('availability')
-    .select('id, date')
+    .select('id, date, time_slots')
     .eq('psychologist_id', psychologistId)
     .gte('date', dates[0])
     .lte('date', dates[dates.length - 1]);
   if (rowsErr) throw rowsErr;
 
   const idByDate = new Map((rows || []).map((r) => [r.date, r.id]));
+  const slotsByDate = new Map((rows || []).map((r) => [r.date, Array.isArray(r.time_slots) ? r.time_slots : []]));
+  const newDays = [];
   const stamp = new Date().toISOString();
   const fresh = [];
   let updatedDays = 0;
@@ -215,16 +218,42 @@ async function saveWorkingHours(psychologistId, input) {
         .update({ time_slots, is_available, updated_at: stamp })
         .eq('id', id);
       if (error) console.error(`working hours: could not update ${date}:`, error.message);
-      else updatedDays += 1;
+      else {
+        updatedDays += 1;
+        // Changing working hours rewrites three weeks of days at once. Only the
+        // hours that actually moved are recorded, so a day that was already
+        // correct does not register as having been opened again.
+        await recordSlotChange({
+          psychologistId, date,
+          before: slotsByDate.get(date) || [],
+          after: time_slots,
+          actor: 'admin',
+          source: 'workingHours.saveWorkingHours',
+        });
+      }
     } else {
       fresh.push({ psychologist_id: psychologistId, date, time_slots, is_available, created_at: stamp, updated_at: stamp });
+      newDays.push({ date, time_slots });
     }
   }
   let createdDays = 0;
   if (fresh.length) {
     const { error } = await supabaseAdmin.from('availability').insert(fresh);
     if (error) console.error('working hours: could not add days:', error.message);
-    else createdDays = fresh.length;
+    else {
+      createdDays = fresh.length;
+      for (const day of newDays) {
+        await recordSlotChange({
+          psychologistId,
+          date: day.date,
+          before: [],
+          after: day.time_slots,
+          actor: 'admin',
+          source: 'workingHours.saveWorkingHours',
+          isNewDay: true,
+        });
+      }
+    }
   }
 
   const conflicts = await bookingsOutsideHours(psych, dates[0], dates[dates.length - 1]);

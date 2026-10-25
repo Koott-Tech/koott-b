@@ -1,4 +1,16 @@
 const { supabaseAdmin } = require('../config/supabase');
+const { recordSlotChange } = require('../utils/slotEvents');
+
+/**
+ * Who opened the slot. Most come from the nightly job, so counting therapist
+ * and admin changes separately is what makes "slots opened" mean a person.
+ */
+const actorOf = (req) => {
+  const role = req?.user?.role;
+  if (role === 'psychologist') return 'therapist';
+  if (role === 'admin' || role === 'superadmin') return 'admin';
+  return 'system';
+};
 const { successResponse, errorResponse } = require('../utils/helpers');
 const googleCalendarService = require('../utils/googleCalendarService');
 const dayjs = require('dayjs');
@@ -149,10 +161,16 @@ const setAvailability = async (req, res) => {
     // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
     const { data: existingAvailability } = await supabaseAdmin
       .from('availability')
-      .select('id')
+      .select('id, time_slots')
       .eq('psychologist_id', psychologist_id)
       .eq('date', date)
       .single();
+
+    // What the day held before this write, so the change can be recorded as a
+    // difference rather than as the whole day opening again.
+    const slotsBefore = Array.isArray(existingAvailability?.time_slots)
+      ? existingAvailability.time_slots
+      : [];
 
     let availability;
     if (existingAvailability) {
@@ -176,6 +194,15 @@ const setAvailability = async (req, res) => {
         );
       }
       availability = updatedAvailability;
+      await recordSlotChange({
+        psychologistId: psychologist_id,
+        date,
+        before: slotsBefore,
+        after: is_available ? time_slots : [],
+        actor: actorOf(req),
+        actorId: req.user?.id || null,
+        source: 'availabilityController.setAvailability',
+      });
     } else {
       // Create new availability
       // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
@@ -199,6 +226,16 @@ const setAvailability = async (req, res) => {
         );
       }
       availability = newAvailability;
+      await recordSlotChange({
+        psychologistId: psychologist_id,
+        date,
+        before: [],
+        after: is_available ? time_slots : [],
+        actor: actorOf(req),
+        actorId: req.user?.id || null,
+        source: 'availabilityController.setAvailability',
+        isNewDay: true,
+      });
     }
 
     // COMMENTED OUT: Google Calendar sync (optional - for blocking time)

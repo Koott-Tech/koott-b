@@ -1,5 +1,6 @@
 const { supabaseAdmin } = require('../config/supabase');
 const { getRecurringBlocksForPsychologist, filterSlotsByRecurringBlocks } = require('./recurringBlocksHelper');
+const { recordSlotChange } = require('./slotEvents');
 // Each therapist's own weekly hours (set by admin) when they have them; the
 // 8 AM–10 PM default below otherwise.
 const { slotsForDate, loadPsychologistsForAvailability } = require('./workingHours');
@@ -269,6 +270,18 @@ const addNextDayAvailability = async () => {
       const recurringBlocks = await getRecurringBlocksForPsychologist(psych.id);
       const baseSlots = slotsForDate(psych, dateString);
       const timeSlotsToInsert = filterSlotsByRecurringBlocks([...baseSlots], dateString, recurringBlocks);
+      // The nightly job is the biggest single source of open slots, so it is
+      // recorded as 'system'. Reports separate it from therapist action, or
+      // "slots opened" would mostly be measuring the cron.
+      await recordSlotChange({
+        psychologistId: psych.id,
+        date: dateString,
+        before: [],
+        after: timeSlotsToInsert,
+        actor: 'system',
+        source: 'defaultAvailabilityService.addNextDayAvailability',
+        isNewDay: true,
+      });
       
       const { error: insertError } = await supabaseAdmin
         .from('availability')
@@ -308,108 +321,27 @@ const addNextDayAvailability = async () => {
  * This should be run daily to prevent database bloat
  * @returns {Promise<Object>} Result object with deletion count
  */
-const cleanupPastAvailability = async () => {
-  try {
-    // Get today's date in YYYY-MM-DD format
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const todayStr = today.toISOString().split('T')[0];
-    
-    console.log(`🧹 Starting cleanup of past availability records (before ${todayStr})...`);
-    
-    // Count records before deletion (for logging)
-    // Use supabaseAdmin to bypass RLS (backend service, proper auth already handled)
-    const { count: totalCount, error: countError } = await supabaseAdmin
-      .from('availability')
-      .select('id', { count: 'exact', head: true })
-      .lt('date', todayStr);
-    
-    if (countError) {
-      console.error('Error counting past availability records:', countError);
-      // Continue with deletion even if count fails
-      console.log('⚠️  Could not count records, proceeding with deletion...');
-    }
-    
-    if (totalCount === 0) {
-      console.log('✅ No past availability records to clean up');
-      return { 
-        success: true, 
-        message: 'No past availability records found',
-        deleted: 0 
-      };
-    }
-    
-    console.log(`   Found ${totalCount} past availability records to delete`);
-    
-    // Delete records in batches to avoid timeout with large datasets
-    const batchSize = 500;
-    let deletedCount = 0;
-    let hasMore = true;
-    let offset = 0;
-    
-    while (hasMore) {
-      // Get batch of IDs to delete
-      // Use supabaseAdmin to bypass RLS (backend service, proper auth already handled)
-      const { data: batch, error: fetchError } = await supabaseAdmin
-        .from('availability')
-        .select('id')
-        .lt('date', todayStr)
-        .range(offset, offset + batchSize - 1);
-      
-      if (fetchError) {
-        console.error('Error fetching batch for deletion:', fetchError);
-        return { success: false, message: 'Failed to fetch records for deletion', error: fetchError };
-      }
-      
-      if (!batch || batch.length === 0) {
-        hasMore = false;
-        break;
-      }
-      
-      // Delete this batch
-      const idsToDelete = batch.map(record => record.id);
-      // Use supabaseAdmin to bypass RLS (backend service, proper auth already handled)
-      const { error: deleteError } = await supabaseAdmin
-        .from('availability')
-        .delete()
-        .in('id', idsToDelete);
-      
-      if (deleteError) {
-        console.error('Error deleting batch:', deleteError);
-        return { success: false, message: 'Failed to delete batch', error: deleteError };
-      }
-      
-      deletedCount += batch.length;
-      offset += batchSize;
-      
-      // Log progress every 500 records
-      if (deletedCount % 500 === 0) {
-        console.log(`   🧹 Deleted ${deletedCount} records...`);
-      }
-      
-      // If batch is smaller than batchSize, we're done
-      if (batch.length < batchSize) {
-        hasMore = false;
-      }
-    }
-    
-    console.log(`✅ Cleanup completed: Deleted ${deletedCount} past availability records`);
-    return {
-      success: true,
-      message: `Successfully deleted ${deletedCount} past availability records`,
-      deleted: deletedCount
-    };
-    
-  } catch (error) {
-    console.error('Error in cleanupPastAvailability:', error);
-    return { 
-      success: false, 
-      message: 'Error cleaning up past availability', 
-      error: error.message 
-    };
-  }
-};
-
+/**
+ * Past availability used to be deleted here every midnight.
+ *
+ * It is kept now. The marketing dashboard reports on how many slots existed on
+ * a given day and how far ahead therapists opened them, and deleting the rows
+ * made every past day unanswerable — a live check found zero rows dated before
+ * today, so the history was being lost nightly rather than accumulating.
+ *
+ * The table grows by roughly one row per therapist per day, which is a few
+ * thousand rows a year: small, and indexed on (psychologist_id, date). If it
+ * ever needs trimming, archive beyond a retention window rather than deleting
+ * outright, or the same reports go blank again.
+ *
+ * Kept as a no-op so the nightly job and the admin endpoint that call it
+ * continue to work unchanged.
+ */
+const cleanupPastAvailability = async () => ({
+  success: true,
+  message: 'Past availability is kept — the marketing dashboard reports on it',
+  deleted: 0,
+});
 /**
  * Update all existing psychologists with default availability
  * @returns {Promise<Object>} Result object
