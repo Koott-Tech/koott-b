@@ -276,6 +276,11 @@ router.get('/psychologists/:psychologistId/recurring-blocks', psychologistContro
 router.post('/psychologists/:psychologistId/recurring-blocks', psychologistController.addRecurringBlock);
 router.delete('/psychologists/:psychologistId/recurring-blocks/:blockId', psychologistController.deleteRecurringBlock);
 
+// The tag vocabulary: read every kind including the internal ones, and edit.
+const tagOptionsController = require('../controllers/tagOptionsController');
+router.get('/tags', tagOptionsController.adminTags);
+router.post('/tags', tagOptionsController.upsertTag);
+
 // Psychiatrist consultation pricing: 15 / 30 min + 15-min packages (packages rows)
 const psychiatryPricingController = require('../controllers/psychiatryPricingController');
 router.get('/psychologists/:psychologistId/psychiatry-pricing', psychiatryPricingController.getPricing);

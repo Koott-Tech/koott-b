@@ -895,6 +895,9 @@ app.use('/api/user-sessions', sessionRoutes);
 app.use('/api/admin/event-registrations', require('./middleware/auth').authenticateToken, require('./middleware/auth').requireEventOrganizer, eventRegistrationsAdminRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/superadmin', superadminRoutes);
+// The tag vocabulary the booking filters are built from. Public: topics and
+// languages, with nobody's data in it, needed before anyone signs in.
+app.use('/api/tags', require('./routes/tags'));
 app.use('/api/availability', availabilityRoutes);
 app.use('/api/availability-controller', availabilityControllerRoutes);
 app.use('/api/notifications', notificationRoutes);

@@ -1722,9 +1722,25 @@ const requestReschedule = async (req, res) => {
 };
 
 // Get available psychologists
+/**
+ * Filters the booking page offers, and the column each one narrows.
+ *
+ * The multi-valued ones use .contains(), which asks "does this therapist's
+ * array include the value" and is answered by the GIN indexes from migration
+ * 0020. Team and employment are deliberately absent: they are internal, and
+ * accepting them here would let anyone filter the public listing by them.
+ */
+const ARRAY_FILTERS = {
+  expertise: 'area_of_expertise',
+  condition: 'area_of_expertise',
+  language: 'languages',
+  method: 'therapy_methods',
+  mode: 'session_modes',
+};
+
 const getAvailablePsychologists = async (req, res) => {
   try {
-    const { expertise, date } = req.query;
+    const { date, type, minExperience, maxPrice } = req.query;
 
     // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
     let query = supabaseAdmin
@@ -1733,16 +1749,38 @@ const getAvailablePsychologists = async (req, res) => {
         id,
         first_name,
         last_name,
+        designation,
+        specialist_category,
         area_of_expertise,
+        languages,
+        therapy_methods,
+        session_modes,
         description,
+        card_intro,
         experience_years,
+        individual_session_price,
         cover_image_url,
+        profile_picture_url,
         packages(id, package_type, price, description)
       `);
 
-    // Filter by expertise if provided
-    if (expertise) {
-      query = query.contains('area_of_expertise', [expertise]);
+    // Several of a kind narrow together: ?language=malayalam&language=hindi
+    // asks for someone who speaks both, which is what picking two in the UI
+    // means.
+    for (const [param, column] of Object.entries(ARRAY_FILTERS)) {
+      const raw = req.query[param];
+      if (!raw) continue;
+      const values = (Array.isArray(raw) ? raw : String(raw).split(','))
+        .map((v) => String(v).trim())
+        .filter(Boolean);
+      if (values.length) query = query.contains(column, values);
+    }
+    if (type) query = query.eq('specialist_category', String(type).trim());
+    if (minExperience && Number.isFinite(Number(minExperience))) {
+      query = query.gte('experience_years', Number(minExperience));
+    }
+    if (maxPrice && Number.isFinite(Number(maxPrice))) {
+      query = query.lte('individual_session_price', Number(maxPrice));
     }
 
     const { data: psychologists, error } = await query;
