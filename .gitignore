@@ -252,3 +252,9 @@ scratch/
 
 # Not published: the env template is shared outside the repo.
 .env.example
+
+# Python helper scripts and their caches never belong in this repo
+*.py
+*.pyc
+*.pkl
+__pycache__/
