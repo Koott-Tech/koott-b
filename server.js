@@ -343,7 +343,8 @@ const formatPublicPsychologist = (psych) => {
     cover_image_url: psych.cover_image_url,
     price: extractedPrice,
     specialist_category: psych.specialist_category ?? null,
-    better_parent_pricing: psych.better_parent_pricing ?? null
+    better_parent_pricing: psych.better_parent_pricing ?? null,
+    session_modes: psych.session_modes?.length ? psych.session_modes : ['online']
     // OPTIMIZED: Removed unused fields (phone, ug_college, pg_college, phd_college, faq fields)
   };
 };
@@ -372,6 +373,7 @@ const formatPublicPsychologistCard = (psych) => {
     personality_traits: [],
     area_of_expertise: full.area_of_expertise || [],
     specialist_category: full.specialist_category ?? null,
+    session_modes: full.session_modes,
   };
 };
 
@@ -409,7 +411,8 @@ app.get('/api/public/psychologists', cachePublic(10 * 60 * 1000), async (req, re
         created_at,
         designation,
         specialist_category,
-        better_parent_pricing
+        better_parent_pricing,
+        session_modes
       `;
     const fetchList = (columns) => supabaseAdmin
       .from('psychologists')

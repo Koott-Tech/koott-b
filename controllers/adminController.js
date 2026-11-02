@@ -2290,6 +2290,14 @@ const getRecentBookings = async (req, res) => {
   }
 };
 
+/** How a therapist sees clients (tag_options kind 'mode'). Online is the default. */
+const SESSION_MODES = ['online', 'offline'];
+const cleanSessionModes = (input) => {
+  const given = Array.isArray(input) ? input : [];
+  const modes = SESSION_MODES.filter((m) => given.includes(m));
+  return modes.length ? modes : ['online'];
+};
+
 const getAllPsychologists = async (req, res) => {
   try {
     let data = null;
@@ -2515,7 +2523,8 @@ const createPsychologist = async (req, res) => {
       psychiatrist_30min_price,
       specialist_category,
       child_specialist_pricing,
-      better_parent_pricing
+      better_parent_pricing,
+      session_modes
     } = req.body;
 
     // Keep email as-is (don't normalize dots away)
@@ -2589,6 +2598,7 @@ const createPsychologist = async (req, res) => {
       designation: designation?.trim() || null,
       experience_years: experience_years || 0,
       cover_image_url: cover_image_url || null,
+      session_modes: cleanSessionModes(session_modes),
     };
     // child_specialist_pricing exists on the table — include it only when provided.
     if (child_specialist_pricing != null) {
@@ -2827,6 +2837,10 @@ const updatePsychologist = async (req, res) => {
     // Convert display_order to integer if provided
     if (psychologistUpdateData.display_order !== undefined) {
       psychologistUpdateData.display_order = psychologistUpdateData.display_order ? parseInt(psychologistUpdateData.display_order) : null;
+    }
+
+    if (psychologistUpdateData.session_modes !== undefined) {
+      psychologistUpdateData.session_modes = cleanSessionModes(psychologistUpdateData.session_modes);
     }
 
     // Remove only undefined values from update data (preserve null for intentional field clearing)
