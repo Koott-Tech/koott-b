@@ -271,8 +271,32 @@ router.get('/psychologist/:id/working-hours', async (req, res, next) => {
  * it in the visitor's own time zone. Never cached: it must reflect the latest bookings.
  */
 const SLOT_KINDS = ['individual', 'couple', 'psychiatry_15', 'psychiatry_30'];
-// Cached 30 s (cleared by any booking/payment write); payment re-checks the slot anyway.
-router.get('/public/psychologist/:id/slots', require('../utils/cache').cachePublic(30 * 1000), async (req, res, next) => {
+// A signed-in client's own checkout hold (a payment window they closed, or a page they
+// reloaded mid-payment) must not hide that time from them, or the booking page says
+// "someone else booked it". Their client id comes from the bearer token; a missing or
+// bad token just gets the public answer.
+const jwt = require('jsonwebtoken');
+async function clientIdFromBearer(req) {
+  const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (!token) return null;
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+    const userId = decoded.userId || decoded.id;
+    if (!userId) return null;
+    const { supabaseAdmin } = require('../config/supabase');
+    const { data } = await supabaseAdmin.from('clients').select('id').eq('user_id', userId).maybeSingle();
+    return data?.id || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Public answers are cached 30 s (cleared by any booking/payment write); signed-in
+// requests skip the cache because they differ per client. Payment re-checks the slot anyway.
+const slotsCache = require('../utils/cache').cachePublic(30 * 1000);
+router.get('/public/psychologist/:id/slots', (req, res, next) => (
+  req.headers.authorization ? next() : slotsCache(req, res, next)
+), async (req, res, next) => {
   try {
     const { id: psychologistId } = req.params;
     const { startDate, endDate } = req.query;
@@ -288,7 +312,8 @@ router.get('/public/psychologist/:id/slots', require('../utils/cache').cachePubl
       return res.status(400).json(errorResponse('The date range is limited to 62 days'));
     }
 
-    const days = await getBookableSlots(psychologistId, startDate, endDate, kind);
+    const ignoreClientId = await clientIdFromBearer(req);
+    const days = await getBookableSlots(psychologistId, startDate, endDate, kind, { ignoreClientId });
 
     res.set('Cache-Control', 'no-store');
     res.json(successResponse({

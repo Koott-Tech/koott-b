@@ -13,7 +13,10 @@
 const { supabaseAdmin } = require('../config/supabase');
 const { errorResponse } = require('../utils/helpers');
 
-const SLOT_HOLD_DURATION_MINUTES = 5; // 5 minutes to complete payment
+// Time to finish paying. 5 minutes was too short for UPI apps and card OTP pages: the
+// hold lapsed mid-payment, another client could take the time, and the first payment
+// then landed on a booked slot. extendSlotLock was meant to stretch it but is never called.
+const SLOT_HOLD_DURATION_MINUTES = 15;
 const SLOT_EXTENDED_DURATION_MINUTES = 15; // Extended duration after payment initiation (total 15 min)
 const MAX_RETRIES = 3; // Maximum retries to prevent infinite loops
 
@@ -80,6 +83,29 @@ const holdSlot = async ({ psychologistId, clientId, scheduledDate, scheduledTime
       const expiresAt = new Date(lock.slot_expires_at);
       return expiresAt > now;
     });
+
+    // The same client trying again (closed the payment window, reloaded, or a retry after
+    // a failed payment) gets a new order: their earlier, unpaid hold on this time is
+    // replaced instead of refusing them as "booked by another user". Holds whose payment
+    // already went through are kept.
+    const ownStaleLocks = activeLocks.filter(
+      (lock) => lock.client_id === clientId && lock.order_id !== orderId
+        && ['SLOT_HELD', 'PAYMENT_PENDING'].includes(lock.status)
+    );
+    if (ownStaleLocks.length > 0) {
+      const { error: replaceError } = await supabaseAdmin
+        .from('slot_locks')
+        .update({ status: 'EXPIRED', updated_at: new Date().toISOString() })
+        .in('id', ownStaleLocks.map((lock) => lock.id));
+      if (replaceError) {
+        console.warn('⚠️ Could not replace the client\'s earlier hold:', replaceError.message);
+      } else {
+        const replaced = new Set(ownStaleLocks.map((lock) => lock.id));
+        for (let i = activeLocks.length - 1; i >= 0; i -= 1) {
+          if (replaced.has(activeLocks[i].id)) activeLocks.splice(i, 1);
+        }
+      }
+    }
 
     if (activeLocks.length > 0) {
       const activeLock = activeLocks[0];
