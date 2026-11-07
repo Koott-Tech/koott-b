@@ -16,6 +16,8 @@ const { getSlotLockByOrderId } = require('../services/slotLockService');
 const { getRazorpayInstance, getRazorpayConfig, verifyPaymentSignature: verifyRazorpaySignature } = require('../config/razorpay');
 const { processPaymentCaptured } = require('./razorpayWebhookController');
 
+const SLOT_TAKEN_REFUNDED = 'The time you picked was booked by someone else before your payment came through. We have refunded the full amount; it usually reaches your account in 5–7 working days. Our team will contact you to find another time.';
+
 /**
  * Get booking status by order ID
  * 
@@ -114,6 +116,9 @@ const getBookingStatusByOrderId = async (req, res) => {
       } else if (paymentRecord.status === 'failed') {
         overallStatus = 'FAILED';
         message = 'Payment failed. Please try again.';
+      } else if (paymentRecord.status === 'refunded' && !session?.id) {
+        overallStatus = 'SLOT_TAKEN';
+        message = SLOT_TAKEN_REFUNDED;
       } else {
         message = 'Processing...';
       }
@@ -318,7 +323,15 @@ const getBookingStatusByOrderId = async (req, res) => {
     }
 
     // `payments` row is authoritative for whether the charge succeeded or was declined
-    if (paymentRecord.status === 'failed') {
+    if (!session?.id && paymentRecord.status === 'refunded') {
+      // Paid after the time was taken meanwhile: refunded (razorpayWebhookController refundTakenSlot)
+      overallStatus = 'SLOT_TAKEN';
+      message = SLOT_TAKEN_REFUNDED;
+    } else if (!session?.id && paymentRecord.status === 'success' && slotLock.status === 'FAILED') {
+      // Same, but Razorpay refused the automatic refund: ops were alerted to refund by hand
+      overallStatus = 'SLOT_TAKEN';
+      message = 'The time you picked was booked by someone else before your payment came through. Our team has been told and will refund you.';
+    } else if (paymentRecord.status === 'failed') {
       overallStatus = 'FAILED';
       message = 'Payment failed. Please try again.';
     } else if (paymentRecord.status === 'success' && session?.id) {

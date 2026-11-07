@@ -1629,6 +1629,16 @@ const handlePaymentSuccess = async (req, res) => {
             }
           });
         }
+        // Paid after the time was taken: refunded, no session. Falling through to the
+        // legacy insert below would book it anyway, on top of the other client.
+        if (captureResult.error === 'SLOT_ALREADY_BOOKED') {
+          return res.status(409).json({
+            success: false,
+            code: 'SLOT_ALREADY_BOOKED',
+            refunded: Boolean(captureResult.refunded),
+            message: captureResult.message
+          });
+        }
         if (!captureResult.success) {
           console.warn(
             '⚠️ processPaymentCaptured did not complete; continuing with legacy session insert:',

@@ -38,7 +38,7 @@ const handleRazorpayWebhook = async (req, res) => {
     });
 
     // Get webhook body as string for signature verification
-    const webhookBody = JSON.stringify(req.body);
+    const webhookBody = req.rawBody || JSON.stringify(req.body);
     const signature = req.headers['x-razorpay-signature'];
     const eventId = req.headers['x-razorpay-event-id'];
 
@@ -51,8 +51,15 @@ const handleRazorpayWebhook = async (req, res) => {
     }
 
     // Verify webhook signature
+    // Webhooks are signed with the secret typed in Razorpay Dashboard → Webhooks, not the
+    // API key secret (using that one rejected every real webhook). Test and live
+    // dashboards have their own webhook secret.
     const razorpayConfig = getRazorpayConfig();
-    const secret = razorpayConfig.keySecret; // Use the appropriate secret (test or prod)
+    const secret = razorpayConfig.webhookSecret;
+    if (!secret) {
+      console.error('❌ RAZORPAY_WEBHOOK_SECRET is not set — cannot verify webhooks');
+      return res.status(500).json({ success: false, message: 'Webhook secret not configured' });
+    }
 
     const isValidSignature = verifyWebhookSignature(webhookBody, signature, secret);
 
@@ -126,6 +133,92 @@ const handleRazorpayWebhook = async (req, res) => {
       message: 'Internal server error processing webhook'
     });
   }
+};
+
+/**
+ * The client paid, but only after their hold lapsed, and the time (or one overlapping
+ * it) was booked by someone else meanwhile. No session is created: the money goes back
+ * through Razorpay, the client is told by email and on the success page, and ops get
+ * an alert — with "refund it by hand" when Razorpay refused the refund.
+ */
+const refundTakenSlot = async ({ paymentRecord, slotLock, paymentId, amount, clashes }) => {
+  const orderId = paymentRecord.razorpay_order_id;
+  const notes = paymentRecord.razorpay_params?.notes || {};
+  const whenIst = `${slotLock.scheduled_date} ${String(slotLock.scheduled_time || '').slice(0, 5)} IST`;
+
+  if (paymentRecord.status === 'refunded') {
+    return { success: false, error: 'SLOT_ALREADY_BOOKED', refunded: true, message: 'This payment was already refunded.' };
+  }
+
+  let refund = null;
+  let refundError = null;
+  try {
+    const { getRazorpayInstance } = require('../config/razorpay');
+    refund = await getRazorpayInstance().payments.refund(paymentId, {
+      amount,
+      speed: 'normal',
+      notes: { reason: 'slot_taken_during_payment', order_id: orderId },
+    });
+  } catch (e) {
+    refundError = e?.error?.description || e?.message || String(e);
+    console.error('❌ Automatic refund failed:', refundError);
+  }
+
+  await supabaseAdmin
+    .from('payments')
+    .update(refund
+      ? { status: 'refunded', razorpay_payment_id: paymentId, completed_at: new Date().toISOString() }
+      : { status: 'success', razorpay_payment_id: paymentId, completed_at: new Date().toISOString() })
+    .eq('id', paymentRecord.id);
+  await updateSlotLockStatus(orderId, 'FAILED', { paymentId }).catch(() => {});
+
+  const emailService = require('../utils/emailService');
+  const alertTo = process.env.PAYMENT_ALERT_EMAIL || process.env.COMPANY_ADMIN_EMAIL;
+  const amountInr = (Number(amount) || 0) / 100;
+  if (alertTo) {
+    emailService.sendEmail({
+      to: alertTo,
+      subject: refund
+        ? '⚠️ Paid after the slot was taken — refunded automatically'
+        : '🚨 Paid after the slot was taken — REFUND FAILED, refund by hand',
+      html: `
+        <h2>${refund ? 'Refunded automatically' : 'Automatic refund failed — please refund in Razorpay'}</h2>
+        <p>The client paid after their 15-minute hold ran out, and the time had been booked meanwhile, so no session was created.</p>
+        <ul>
+          <li>Client: ${notes.clientName || '-'} (${notes.clientEmail || '-'})</li>
+          <li>Therapist id: ${slotLock.psychologist_id}</li>
+          <li>Time: ${whenIst}</li>
+          <li>Amount: ₹${amountInr}</li>
+          <li>Razorpay order: ${orderId} · payment: ${paymentId}</li>
+          <li>${refund ? `Refund id: ${refund.id}` : `Refund error: ${refundError}`}</li>
+          <li>Clashes with: ${clashes.map((c) => `${c.source} ${c.id}`).join(', ')}</li>
+        </ul>
+        <p>Please contact the client to offer another time.</p>`,
+    }).catch((e) => console.error('❌ Could not send the refund alert email:', e?.message));
+  }
+  if (notes.clientEmail) {
+    emailService.sendEmail({
+      to: notes.clientEmail,
+      subject: 'Your Koott booking could not be completed',
+      html: `
+        <p>Hi ${notes.clientName || 'there'},</p>
+        <p>Your payment of ₹${amountInr} came through after the time you picked (${whenIst}) had been booked by someone else, so we could not book it for you.</p>
+        <p>${refund
+          ? 'We have refunded the full amount. Refunds usually reach your account in 5–7 working days.'
+          : 'We will refund the full amount. Our team has been told and will be in touch.'}</p>
+        <p>Our team will contact you to find another time. You can also book a new time on koott.in.</p>
+        <p>Team Koott</p>`,
+    }).catch((e) => console.error('❌ Could not email the client about the refund:', e?.message));
+  }
+
+  return {
+    success: false,
+    error: 'SLOT_ALREADY_BOOKED',
+    refunded: Boolean(refund),
+    message: refund
+      ? 'The time you picked was booked by someone else before your payment came through. Your payment has been refunded.'
+      : 'The time you picked was booked by someone else before your payment came through. Our team will refund you.',
+  };
 };
 
 /**
@@ -268,25 +361,34 @@ const processPaymentCaptured = async (payload, eventId, skipSignatureCheck = fal
     // EDGE CASE HANDLING: Payment succeeds after slot lock expired/failed
     // If slot lock is FAILED or EXPIRED, check if slot is still available
     let slotLockUpdated = false;
-    if (slotLock.status === 'FAILED' || slotLock.status === 'EXPIRED') {
-      console.log('⚠️ Slot lock is FAILED/EXPIRED but payment succeeded - checking slot availability');
-      
-      // Check if slot is still available (no conflicting sessions)
-      const { data: conflictingSessions } = await supabaseAdmin
-        .from('sessions')
-        .select('id')
-        .eq('psychologist_id', slotLock.psychologist_id)
-        .eq('scheduled_date', slotLock.scheduled_date)
-        .eq('scheduled_time', slotLock.scheduled_time)
-        .in('status', ['booked', 'upcoming', 'rescheduled']);
-      
-      if (conflictingSessions && conflictingSessions.length > 0) {
-        console.error('❌ Slot already booked by another user - cannot create session');
-        return {
-          success: false,
-          message: 'This time slot was just booked by another user. Your payment will be refunded.',
-          error: 'SLOT_ALREADY_BOOKED'
-        };
+    // The hold ran out before the money arrived (status changed by the cleanup job, or
+    // its time simply passed): someone else may have booked this time, or one that
+    // overlaps it, meanwhile.
+    const holdLapsed = slotLock.status === 'FAILED' || slotLock.status === 'EXPIRED'
+      || (slotLock.slot_expires_at && new Date(slotLock.slot_expires_at) < new Date()
+        && ['SLOT_HELD', 'PAYMENT_PENDING'].includes(slotLock.status));
+    if (holdLapsed) {
+      console.log('⚠️ Payment arrived after the slot hold lapsed - checking the time is still free');
+
+      // Any overlap counts (a couple session crossing an individual one, the 10-min
+      // break), not just the same start time.
+      let packageType = null;
+      if (paymentRecord.package_id) {
+        const { data: pkg } = await supabaseAdmin
+          .from('packages').select('package_type').eq('id', paymentRecord.package_id).maybeSingle();
+        packageType = pkg?.package_type || null;
+      }
+      const { findOverlaps, sessionMinutesForPackageType } = require('../utils/sessionSlots');
+      const clashes = await findOverlaps({
+        psychologistId: slotLock.psychologist_id,
+        date: slotLock.scheduled_date,
+        time: slotLock.scheduled_time,
+        minutes: sessionMinutesForPackageType(packageType),
+      });
+
+      if (clashes.length > 0) {
+        console.error('❌ Paid time was taken while the client was paying - refunding');
+        return await refundTakenSlot({ paymentRecord, slotLock, paymentId, amount, clashes });
       }
       
       console.log('✅ Slot is still available - proceeding with session creation');
@@ -440,8 +542,9 @@ const processPaymentCaptured = async (payload, eventId, skipSignatureCheck = fal
  */
 const handlePaymentCaptured = async (payload, eventId, res) => {
   const result = await processPaymentCaptured(payload, eventId, false);
-  
-  if (result.success) {
+
+  // A refunded "paid after the time was taken" is finished; a 500 would make Razorpay retry.
+  if (result.success || (result.error === 'SLOT_ALREADY_BOOKED' && result.refunded)) {
     return res.status(200).json(result);
   } else {
     return res.status(500).json(result);

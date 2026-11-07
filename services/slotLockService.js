@@ -12,6 +12,7 @@
 
 const { supabaseAdmin } = require('../config/supabase');
 const { errorResponse } = require('../utils/helpers');
+const { recoverIfPaid } = require('../utils/razorpayRecovery');
 
 // Time to finish paying. 5 minutes was too short for UPI apps and card OTP pages: the
 // hold lapsed mid-payment, another client could take the time, and the first payment
@@ -569,7 +570,7 @@ const releaseExpiredSlots = async () => {
     // Find expired slots that are still in SLOT_HELD or PAYMENT_PENDING status
     const { data: expiredLocks, error: findError } = await supabaseAdmin
       .from('slot_locks')
-      .select('id, order_id, status')
+      .select('id, order_id, status, created_at')
       .in('status', ['SLOT_HELD', 'PAYMENT_PENDING'])
       .lt('slot_expires_at', now);
 
@@ -669,12 +670,29 @@ const releaseExpiredSlots = async () => {
       }
     }
 
+    // Before giving up on a "pending" payment, ask Razorpay: the client may have paid and
+    // lost the connection before the browser could tell us. Paid → the booking is created
+    // now; still settling at the bank → wait for the next run (up to an hour); Razorpay
+    // unreachable → leave it for the next run rather than guess.
+    const keepLockIds = new Set();
+    for (const lock of pendingPaymentLocks) {
+      try {
+        const { state } = await recoverIfPaid(lock.order_id);
+        const ageMs = Date.now() - new Date(lock.created_at).getTime();
+        if (state === 'captured' || (state === 'authorized' && ageMs < 60 * 60 * 1000)) keepLockIds.add(lock.id);
+      } catch (checkError) {
+        console.warn('⚠️ Could not ask Razorpay about order', lock.order_id, '- trying again next run:', checkError.message);
+        keepLockIds.add(lock.id);
+      }
+    }
+    const notKept = (lock) => !keepLockIds.has(lock.id);
+
     // Combine all sets of locks to release
     const locksToRelease = [];
     const lockIds = new Set();
-    
+
     if (expiredLocks) {
-      expiredLocks.forEach(lock => {
+      expiredLocks.filter(notKept).forEach(lock => {
         if (!lockIds.has(lock.id)) {
           lockIds.add(lock.id);
           locksToRelease.push(lock);
@@ -718,8 +736,8 @@ const releaseExpiredSlots = async () => {
 
     // Mark associated pending payments as 'failed' (user cancelled/exited)
     let paymentsUpdated = 0;
-    if (pendingPaymentLocks.length > 0) {
-      const orderIds = pendingPaymentLocks.map(lock => lock.order_id).filter(Boolean);
+    if (pendingPaymentLocks.some(notKept)) {
+      const orderIds = pendingPaymentLocks.filter(notKept).map(lock => lock.order_id).filter(Boolean);
       
       if (orderIds.length > 0) {
         const { error: paymentUpdateError, count } = await supabaseAdmin
@@ -803,8 +821,13 @@ const cleanupAbandonedPendingPayments = async () => {
         .in('status', ['SLOT_HELD', 'PAYMENT_PENDING']);
       const lockedOrderIds = new Set((matchingLocks || []).map(l => l.order_id));
       for (const orderId of orderIds) {
-        if (!lockedOrderIds.has(orderId)) {
-          abandonedPayments.push(orderId);
+        if (lockedOrderIds.has(orderId)) continue;
+        // Only call it abandoned once Razorpay confirms no money came in (see releaseExpiredSlots).
+        try {
+          const { state } = await recoverIfPaid(orderId);
+          if (state === 'unpaid') abandonedPayments.push(orderId);
+        } catch (checkError) {
+          console.warn('⚠️ Could not ask Razorpay about order', orderId, '- trying again next run:', checkError.message);
         }
       }
     }

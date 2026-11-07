@@ -58,11 +58,15 @@ const RAZORPAY_CONFIG = {
   test: {
     keyId: process.env.RAZORPAY_TEST_KEY_ID || '',
     keySecret: process.env.RAZORPAY_TEST_KEY_SECRET || '',
+    // Razorpay Dashboard (test mode) → Webhooks → the secret typed there
+    webhookSecret: process.env.RAZORPAY_TEST_WEBHOOK_SECRET || process.env.RAZORPAY_WEBHOOK_SECRET || '',
   },
   // Production Environment (for live payments)
   production: {
     keyId: process.env.RAZORPAY_PROD_KEY_ID,
     keySecret: process.env.RAZORPAY_PROD_KEY_SECRET,
+    // Razorpay Dashboard (live mode) → Webhooks → the secret typed there
+    webhookSecret: process.env.RAZORPAY_PROD_WEBHOOK_SECRET || process.env.RAZORPAY_WEBHOOK_SECRET || '',
   }
 };
 

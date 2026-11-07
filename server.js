@@ -202,7 +202,14 @@ try {
 }
 
 // Body parsing middleware
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({
+  limit: '10mb',
+  // Razorpay signs the exact bytes it sends; re-serialising the parsed body can differ,
+  // so the webhook keeps the raw text for its signature check.
+  verify: (req, _res, buf) => {
+    if (req.originalUrl && req.originalUrl.startsWith('/api/payment/webhook')) req.rawBody = buf.toString('utf8');
+  }
+}));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Static files for uploads
