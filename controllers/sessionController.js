@@ -2631,6 +2631,33 @@ async function transferSession(req, res) {
     const finalDate = new_date || session.scheduled_date;
     const finalTime = new_time || session.scheduled_time;
 
+    // ── 3b. The new therapist must be free then (overlap + 10-min break), like every
+    //        other admin booking. Transfers never checked, so one could land on top of the
+    //        new therapist's own client. Runs before anything is changed.
+    {
+      const { findOverlaps, sessionLengthMinutes } = require('../utils/sessionSlots');
+      let packageType = null;
+      if (session.package_id) {
+        const { data: pkg } = await supabaseAdmin
+          .from('packages').select('package_type').eq('id', session.package_id).maybeSingle();
+        packageType = pkg?.package_type || null;
+      }
+      const clashes = await findOverlaps({
+        psychologistId: new_psychologist_id,
+        date: finalDate,
+        time: formatTime(finalTime),
+        minutes: sessionLengthMinutes({ packageType, sessionType: session.session_type }),
+        excludeSessionId: session.id,
+      });
+      if (clashes.length) {
+        const at = clashes.map((c) => String(c.start != null
+          ? `${String(Math.floor(c.start / 60)).padStart(2, '0')}:${String(c.start % 60).padStart(2, '0')}` : '')).join(', ');
+        return res.status(409).json(errorResponse(
+          `The new therapist is not free then — it overlaps another booking at ${at} IST. Pick another time.`
+        ));
+      }
+    }
+
     // ── 4. Delete old calendar event from old therapist ──────────────────────
     const oldPsych = Array.isArray(session.psychologist) ? session.psychologist[0] : session.psychologist;
     let calendarEventRemoved = false;

@@ -229,7 +229,25 @@ const refundTakenSlot = async ({ paymentRecord, slotLock, paymentId, amount, cla
  * @param {boolean} skipSignatureCheck - Skip signature verification (for manual triggers)
  * @returns {Promise<Object>} { success: boolean, sessionId?: string, message: string }
  */
+/**
+ * Wrapper: the paid order's therapist is held (utils/therapistLock) while its session is
+ * created, so a payment landing at the same moment as an admin booking or another
+ * client's checkout for that therapist is handled one after the other, never both.
+ */
 const processPaymentCaptured = async (payload, eventId, skipSignatureCheck = false) => {
+  const orderId = payload?.payment?.entity?.order_id;
+  let psychologistId = null;
+  if (orderId) {
+    const { data } = await supabaseAdmin
+      .from('payments').select('psychologist_id').eq('razorpay_order_id', orderId).maybeSingle();
+    psychologistId = data?.psychologist_id || null;
+  }
+  if (!psychologistId) return processPaymentCapturedUnlocked(payload, eventId, skipSignatureCheck);
+  const { withTherapistLock } = require('../utils/therapistLock');
+  return withTherapistLock(psychologistId, () => processPaymentCapturedUnlocked(payload, eventId, skipSignatureCheck));
+};
+
+const processPaymentCapturedUnlocked = async (payload, eventId, skipSignatureCheck = false) => {
   try {
     const payment = payload.payment?.entity;
     

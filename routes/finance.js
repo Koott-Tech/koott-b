@@ -1,5 +1,7 @@
 const express = require('express');
 const router = express.Router();
+// One booking change at a time per therapist (utils/therapistLock.js)
+const { serializeByTherapist } = require('../utils/therapistLock');
 const { authenticateToken, requireFinance } = require('../middleware/auth');
 const financeController = require('../controllers/financeController');
 const sessionController = require('../controllers/sessionController');
@@ -33,7 +35,7 @@ router.get('/doctors/:psychologistId/bookings', financeController.getDoctorBooki
 router.get('/doctors/:psychologistId/profile', financeController.getDoctorFinanceProfile);
 router.get('/sessions/all', sessionController.getAllSessions); // Use same method as admin for consistency
 router.get('/sessions/:sessionId', financeController.getSessionDetails);
-router.put('/sessions/:sessionId', adminController.updateSession);
+router.put('/sessions/:sessionId', serializeByTherapist, adminController.updateSession);
 router.put('/sessions/:sessionId/commission', financeController.updateSessionCommission);
 router.patch('/sessions/:sessionId/verify-payment', sessionController.verifyPayment);
 router.patch('/sessions/:sessionId/cancel-refund', sessionController.cancelRefundSession);

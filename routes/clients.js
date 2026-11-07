@@ -1,5 +1,7 @@
 const express = require('express');
 const router = express.Router();
+// One booking change at a time per therapist (utils/therapistLock.js)
+const { serializeByTherapist } = require('../utils/therapistLock');
 const clientController = require('../controllers/clientController');
 const assessmentBookingController = require('../controllers/assessmentBookingController');
 const { authenticateToken, requireClient } = require('../middleware/auth');
@@ -24,7 +26,7 @@ router.get('/sessions/:sessionId', clientController.getSession);
 // router.post('/book-session', clientController.bookSession); // DISABLED - Use payment flow instead
 router.put('/sessions/:sessionId/cancel', clientController.cancelSession);
 router.post('/sessions/:sessionId/reschedule-request', clientController.requestReschedule);
-router.put('/sessions/:sessionId/reschedule', clientController.rescheduleSession);
+router.put('/sessions/:sessionId/reschedule', serializeByTherapist, clientController.rescheduleSession);
 router.post('/sessions/:sessionId/feedback', clientController.submitSessionFeedback);
 
 // Psychologist discovery
@@ -32,7 +34,7 @@ router.get('/psychologists', clientController.getAvailablePsychologists);
 router.get('/psychologists/:psychologistId/packages', clientController.getPsychologistPackages);
 
 // Book remaining session from package
-router.post('/book-remaining-session', clientController.bookRemainingSession);
+router.post('/book-remaining-session', serializeByTherapist, clientController.bookRemainingSession);
 
 // Reserve time slot for payment
 router.post('/reserve-slot', clientController.reserveTimeSlot);
@@ -50,7 +52,7 @@ router.get('/packages', clientController.getClientPackages);
 
 // Payment credit and booking with existing payment
 router.get('/payment-credit/:transactionId', clientController.getPaymentCredit);
-router.post('/book-session-with-credit', clientController.bookSessionWithCredit);
+router.post('/book-session-with-credit', serializeByTherapist, clientController.bookSessionWithCredit);
 
 // Get all receipts for a client
 router.get('/receipts', getClientReceipts);

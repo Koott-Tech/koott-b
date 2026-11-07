@@ -1,5 +1,7 @@
 const express = require('express');
 const router = express.Router();
+// One booking change at a time per therapist (utils/therapistLock.js)
+const { serializeByTherapist } = require('../utils/therapistLock');
 const adminController = require('../controllers/adminController');
 const sessionController = require('../controllers/sessionController');
 const psychologistController = require('../controllers/psychologistController');
@@ -248,13 +250,13 @@ router.get('/sessions/all', sessionController.getAllSessions);
 router.get('/sessions/:sessionId', sessionController.getSessionById);
 
 // Session rescheduling
-router.put('/sessions/:sessionId', adminController.updateSession);
+router.put('/sessions/:sessionId', serializeByTherapist, adminController.updateSession);
 router.put('/sessions/:sessionId/no-show', sessionController.markSessionAsNoShow);
 router.post('/sessions/:sessionId/complete', sessionController.completeSession);
 router.patch('/sessions/:sessionId/cancel-refund', sessionController.cancelRefundSession);
 router.patch('/sessions/:sessionId/cancel-only', sessionController.cancelOnlySession);
 router.patch('/sessions/:sessionId/verify-payment', sessionController.verifyPayment);
-router.post('/sessions/:sessionId/transfer', sessionController.transferSession);
+router.post('/sessions/:sessionId/transfer', serializeByTherapist, sessionController.transferSession);
 router.delete('/sessions/:sessionId', sessionController.deleteSession);
 router.get('/psychologists/:psychologistId/availability', adminController.getPsychologistAvailabilityForReschedule);
 
@@ -303,18 +305,18 @@ router.put('/therapist-listing-pattern', therapistListingController.savePattern)
 router.get('/booking-leads', require('../controllers/bookingLeadsController').list);
 
 // Manual booking (admin only - for edge cases)
-router.post('/bookings/manual', adminController.createManualBooking);
+router.post('/bookings/manual', serializeByTherapist, adminController.createManualBooking);
 
 // Manual package booking (admin only): schedule ALL N sessions of a package upfront
-router.post('/bookings/manual-package', adminController.createManualPackageBooking);
+router.post('/bookings/manual-package', serializeByTherapist, adminController.createManualPackageBooking);
 
 // Record-only booking (admin only): add session record only, no Meet creation, no notifications
-router.post('/bookings/record-only', adminController.createRecordOnlyBooking);
+router.post('/bookings/record-only', serializeByTherapist, adminController.createRecordOnlyBooking);
 // Record-only PACKAGE (admin only): record N already-happened sessions of a package, rest bookable later
-router.post('/bookings/record-only-package', adminController.createRecordOnlyPackage);
+router.post('/bookings/record-only-package', serializeByTherapist, adminController.createRecordOnlyPackage);
 
 // Book next package session (admin only - for clients who prefer admin to book remaining sessions)
-router.post('/bookings/book-package-next-session', adminController.bookPackageNextSession);
+router.post('/bookings/book-package-next-session', serializeByTherapist, adminController.bookPackageNextSession);
 
 // Packages with remaining sessions (admin only - for Packages tab)
 router.get('/bookings/packages-with-remaining', adminController.getPackagesWithRemainingSessions);

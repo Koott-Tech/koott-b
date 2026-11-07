@@ -1040,6 +1040,14 @@ const getProfile = async (req, res) => {
       profile = psychologist;
     }
 
+    // Never send secrets to the browser. Staff roles fell back to the raw users row
+    // (password_hash included) and therapists to the psychologists row (Google
+    // Calendar OAuth tokens). The browser gets the profile without them.
+    const SECRET_KEY = /password|hash|secret|token|credential|otp/i;
+    const withoutSecrets = (row) => (row && typeof row === 'object'
+      ? Object.fromEntries(Object.entries(row).filter(([k]) => !SECRET_KEY.test(k)))
+      : row);
+
     res.json(
       successResponse({
         user: {
@@ -1047,7 +1055,7 @@ const getProfile = async (req, res) => {
           email: req.user.email,
           role: req.user.role,
           profile_picture_url: req.user.profile_picture_url || null,
-          profile: profile || req.user
+          profile: withoutSecrets(profile || req.user)
         }
       })
     );

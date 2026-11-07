@@ -4481,7 +4481,7 @@ const getPsychologistAvailabilityForReschedule = async (req, res) => {
     // ?type=individual|couple cuts the free starts by session length (individual 50 min,
     // couple 80 min, 10-min break after each — utils/sessionSlots.js); ?excludeSessionId frees
     // the slot of the session being rescheduled. Times are IST.
-    const kind = req.query.type === 'couple' ? 'couple' : 'individual';
+    const kind = ['couple', 'psychiatry_15', 'psychiatry_30'].includes(req.query.type) ? req.query.type : 'individual';
     const excludeSessionId = req.query.excludeSessionId || null;
 
     console.log(`📅 [ADMIN] Getting ${kind} availability for psychologist ${psychologistId} from ${startDate} to ${endDate}`);

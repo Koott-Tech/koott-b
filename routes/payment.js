@@ -1,5 +1,7 @@
 const express = require('express');
 const router = express.Router();
+// One booking change at a time per therapist (utils/therapistLock.js)
+const { serializeByTherapist } = require('../utils/therapistLock');
 const { 
   createPaymentOrder,
   createCashPayment,
@@ -49,10 +51,10 @@ const paymentSuccessLimiter = rateLimit({
 });
 
 // Create payment order (requires authentication)
-router.post('/create-order', authenticateToken, createPaymentOrder);
+router.post('/create-order', authenticateToken, serializeByTherapist, createPaymentOrder);
 
 // Create cash payment (requires authentication)
-router.post('/cash', authenticateToken, createCashPayment);
+router.post('/cash', authenticateToken, serializeByTherapist, createCashPayment);
 
 // Razorpay webhook (PRIMARY SOURCE OF TRUTH - no authentication required)
 // This is where sessions are created after payment
