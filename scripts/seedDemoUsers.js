@@ -3,9 +3,10 @@
  * Demo LOGIN accounts — one for every dashboard, so each can be opened and checked.
  *
  *   superadmin      /superadmin        admin            /admin
- *   finance         /finance           event_organizer  /event-organizer
+ *   finance         /finance           marketing        /marketing
+ *   event_organizer /event-organizer
  *   client (India)  /profile           client (Dubai)   /profile  — emails/WhatsApp in Gulf time
- *   therapist       /psychologist      (demo therapist Anjali Menon)
+ *   therapist       /psychologist      (demo therapist Rahul Nair)
  *   psychiatrist    /psychologist      (demo psychiatrist Vishnu Prasad, 15/30-min consults)
  *
  * All emails are on demo.koott.invalid — a reserved TLD that can never receive
@@ -37,6 +38,7 @@ const STAFF = [
   { email: `demo.superadmin${DOMAIN}`, role: 'superadmin', name: 'Demo Superadmin', dashboard: '/superadmin' },
   { email: `demo.admin${DOMAIN}`, role: 'admin', name: 'Demo Admin', dashboard: '/admin' },
   { email: `demo.finance${DOMAIN}`, role: 'finance', name: 'Demo Finance', dashboard: '/finance' },
+  { email: `demo.marketing${DOMAIN}`, role: 'marketing', name: 'Demo Marketing', dashboard: '/marketing' },
   { email: `demo.events${DOMAIN}`, role: 'event_organizer', name: 'Demo Event Organizer', dashboard: '/event-organizer' },
 ];
 
@@ -45,8 +47,10 @@ const CLIENTS = [
   { email: `demo.client.dubai${DOMAIN}`, first: 'Demo', last: 'Client Dubai', phone: '+971500000001', timeZone: 'Asia/Dubai', label: 'client (Dubai)' },
 ];
 
+// Anjali Menon's login now uses a real inbox (Google Calendar testing), so the demo
+// therapist login is Rahul Nair; matching is by demo email, so Anjali is never touched.
 const THERAPISTS = [
-  { email: `anjali.menon${DOMAIN}`, label: 'therapist' },
+  { email: `rahul.nair${DOMAIN}`, label: 'therapist' },
   { email: `vishnu.prasad${DOMAIN}`, label: 'psychiatrist' },
 ];
 
