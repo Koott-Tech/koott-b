@@ -202,6 +202,11 @@ ${alert.contact_now ? `<p>Reach them now: <strong>${String(alert.contact_now).re
 <p><a href="${site}/admin/safety">Open the alert</a> and acknowledge it so they know you have it.</p>`,
       }).catch((e) => console.error('safety alert email failed:', e.message))));
     }
+    // WhatsApp to the lead too, once a template is approved (INTERAKT_TPL_SAFETY_ALERT: {{1}} = who, {{2}} = client ref)
+    if (lead?.phone && process.env.INTERAKT_TPL_SAFETY_ALERT) {
+      require('../utils/interaktService').sendTemplateMessage(lead.phone, process.env.INTERAKT_TPL_SAFETY_ALERT,
+        process.env.INTERAKT_TPL_SAFETY_ALERT_LANG || 'en', { bodyValues: [from, clientRef || 'not given'] }).catch(() => {});
+    }
     console.warn(`🚨 SAFETY ALERT ${alert.id} raised by ${me.type}:${me.id}${lead ? '' : ' — NO CLINICAL LEAD SET'}`);
     return ok(res, { alert, leadSet: Boolean(lead), emailed: to.length }, 201);
   } catch (e) {

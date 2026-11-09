@@ -105,11 +105,35 @@ async function notify(people, task, kind, message, actor, dedupeKey) {
       dedupe_key: dedupeKey ? `${dedupeKey}:${key(p.type, p.id)}` : null,
     }));
     await supabaseAdmin.from('task_notifications').upsert(rows, { onConflict: 'dedupe_key', ignoreDuplicates: true });
+    // WhatsApp for URGENT tasks, once a Meta-approved template is set (INTERAKT_TPL_URGENT_TASK,
+    // body {{1}} = task title, {{2}} = deadline). Off until then.
+    if (task.priority === 'urgent' && kind === 'assigned' && process.env.INTERAKT_TPL_URGENT_TASK) {
+      whatsappPeople(unique, task).catch(() => {});
+    }
     if (process.env.TASK_EMAILS === 'off') return;
     emailPeople(unique, task, message).catch(() => {});
   } catch (e) {
     console.warn('tasks: notification not saved:', e.message);
   }
+}
+
+async function whatsappPeople(people, task) {
+  const { sendTemplateMessage } = require('../utils/interaktService');
+  const users = people.filter((p) => p.type === 'user').map((p) => p.id);
+  const psychs = people.filter((p) => p.type === 'psychologist').map((p) => p.id);
+  const [u, p, prof] = await Promise.all([
+    users.length ? supabaseAdmin.from('users').select('id, phone_number').in('id', users) : { data: [] },
+    psychs.length ? supabaseAdmin.from('psychologists').select('id, phone').in('id', psychs) : { data: [] },
+    supabaseAdmin.from('staff_profiles').select('person_type, person_id, phone'),
+  ]);
+  const profPhone = new Map((prof.data || []).map((r) => [key(r.person_type, r.person_id), r.phone]));
+  const phones = [
+    ...(u.data || []).map((r) => profPhone.get(key('user', r.id)) || r.phone_number),
+    ...(p.data || []).map((r) => profPhone.get(key('psychologist', r.id)) || r.phone),
+  ].filter((x) => x && String(x).replace(/\D/g, '').length >= 10);
+  const due = task.deadline ? new Date(task.deadline).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' }) : 'as soon as possible';
+  await Promise.all([...new Set(phones)].map((ph) => sendTemplateMessage(ph, process.env.INTERAKT_TPL_URGENT_TASK,
+    process.env.INTERAKT_TPL_URGENT_TASK_LANG || 'en', { bodyValues: [String(task.title).slice(0, 120), due] }).catch(() => {})));
 }
 
 async function emailPeople(people, task, message) {
