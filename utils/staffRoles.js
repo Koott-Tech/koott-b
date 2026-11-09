@@ -83,7 +83,31 @@ function adminRouteGate(req, res, next) {
   return res.status(403).json({ error: 'Forbidden', message: 'Insufficient permissions' });
 }
 
+/**
+ * Non-admins reach /api/admin/users only for CLIENT records (Operations' Clients page,
+ * new clients from manual booking). Staff logins are managed in HR → People.
+ */
+async function clientsOnly(req, res, next) {
+  if (ADMINS.includes(req.user?.role)) return next();
+  if (req.method === 'GET' && req.path === '/users') { req.query.role = 'client'; return next(); }
+  if (req.method === 'POST' && req.path === '/users') {
+    if (req.body && req.body.role && req.body.role !== 'client') return res.status(403).json({ success: false, message: 'Only client accounts can be created here.' });
+    return next();
+  }
+  const m = /^\/users\/([^/]+)$/.exec(req.path);
+  if (m) {
+    const { supabaseAdmin } = require('../config/supabase');
+    const [{ data: u }, { data: c }] = await Promise.all([
+      supabaseAdmin.from('users').select('role').eq('id', m[1]).maybeSingle(),
+      supabaseAdmin.from('clients').select('id').eq('id', m[1]).maybeSingle(),
+    ]);
+    if ((u && u.role !== 'client') || (!u && !c)) return res.status(403).json({ success: false, message: 'Only client records are available here.' });
+  }
+  return next();
+}
+
 module.exports = {
+  clientsOnly,
   ADMINS, STAFF_USER_ROLES, ONBOARDABLE_ROLES, ROLE_LABEL, DASHBOARD_BY_ROLE,
   isAdmin, isStaff, personOf, allowRoles, requireStaffMember, adminRouteGate,
 };

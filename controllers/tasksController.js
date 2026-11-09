@@ -546,3 +546,84 @@ module.exports = {
   reportProblem, listNotifications, markNotificationsRead,
   createTask, notify, TEMPLATES, STATUSES, PRIORITIES,
 };
+
+/* ------------------------------------------------------------ attachments */
+// Files live in the private storage bucket "task-files" under <taskId>/; nothing in the
+// database. Opening one goes through the API (visibility checked) to a 5-minute link.
+const TASK_BUCKET = 'task-files';
+const cleanName = (n) => String(n || 'file').replace(/[^\w.\- ]+/g, '_').replace(/\s+/g, ' ').slice(0, 120);
+
+async function ensureBucket() {
+  const { error } = await supabaseAdmin.storage.createBucket(TASK_BUCKET, { public: false, fileSizeLimit: 15 * 1024 * 1024 });
+  if (error && !/already exists|already_exists|duplicate/i.test(error.message || '')) throw error;
+}
+
+async function listAttachments(taskId) {
+  const { data, error } = await supabaseAdmin.storage.from(TASK_BUCKET).list(taskId, { limit: 100, sortBy: { column: 'created_at', order: 'asc' } });
+  if (error) return [];
+  return (data || []).filter((f) => f.name && f.id).map((f) => ({
+    id: f.name, name: f.name.split('__').slice(1).join('__') || f.name,
+    size: f.metadata?.size || null, type: f.metadata?.mimetype || null, at: f.created_at,
+  }));
+}
+
+async function getAttachments(req, res) {
+  try {
+    const { data: task } = await supabaseAdmin.from('tasks').select('*').eq('id', req.params.id).maybeSingle();
+    if (!task || !(await canSee(req.user, task))) return fail(res, 404, 'Task not found.');
+    return ok(res, { attachments: await listAttachments(task.id) });
+  } catch (e) {
+    return handle(res, e, 'load the files');
+  }
+}
+
+async function uploadAttachment(req, res) {
+  try {
+    if (!req.file) return fail(res, 400, 'Choose a file.');
+    const { data: task } = await supabaseAdmin.from('tasks').select('*').eq('id', req.params.id).maybeSingle();
+    if (!task || !(await canSee(req.user, task))) return fail(res, 404, 'Task not found.');
+    if ((await listAttachments(task.id)).length >= 20) return fail(res, 400, 'A task can hold up to 20 files.');
+    const objectPath = `${task.id}/${require('crypto').randomUUID().slice(0, 8)}__${cleanName(req.file.originalname)}`;
+    const put = () => supabaseAdmin.storage.from(TASK_BUCKET).upload(objectPath, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
+    let { error } = await put();
+    if (error && /bucket not found|not found/i.test(error.message || '')) { await ensureBucket(); ({ error } = await put()); }
+    if (error) return handle(res, error, 'upload the file');
+    await logEvent(task.id, personOf(req.user), 'attachment', null, { name: cleanName(req.file.originalname) });
+    return ok(res, { attachments: await listAttachments(task.id) }, 201);
+  } catch (e) {
+    return handle(res, e, 'upload the file');
+  }
+}
+
+async function openAttachment(req, res) {
+  try {
+    const { data: task } = await supabaseAdmin.from('tasks').select('*').eq('id', req.params.id).maybeSingle();
+    if (!task || !(await canSee(req.user, task))) return fail(res, 404, 'Task not found.');
+    const name = String(req.params.file || '');
+    if (!name || name.includes('/') || name.includes('..')) return fail(res, 400, 'Unknown file.');
+    const { data, error } = await supabaseAdmin.storage.from(TASK_BUCKET).createSignedUrl(`${task.id}/${name}`, 300);
+    if (error || !data?.signedUrl) return fail(res, 404, 'File not found.');
+    return ok(res, { url: data.signedUrl });
+  } catch (e) {
+    return handle(res, e, 'open the file');
+  }
+}
+
+async function deleteAttachment(req, res) {
+  try {
+    const { data: task } = await supabaseAdmin.from('tasks').select('*').eq('id', req.params.id).maybeSingle();
+    if (!task || !(await canSee(req.user, task))) return fail(res, 404, 'Task not found.');
+    const name = String(req.params.file || '');
+    if (!name || name.includes('/') || name.includes('..')) return fail(res, 400, 'Unknown file.');
+    await supabaseAdmin.storage.from(TASK_BUCKET).remove([`${task.id}/${name}`]);
+    await logEvent(task.id, personOf(req.user), 'attachment_removed', null, { name: name.split('__').slice(1).join('__') });
+    return ok(res, { attachments: await listAttachments(task.id) });
+  } catch (e) {
+    return handle(res, e, 'remove the file');
+  }
+}
+
+module.exports.getAttachments = getAttachments;
+module.exports.uploadAttachment = uploadAttachment;
+module.exports.openAttachment = openAttachment;
+module.exports.deleteAttachment = deleteAttachment;

@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 // One booking change at a time per therapist (utils/therapistLock.js)
 const { serializeByTherapist } = require('../utils/therapistLock');
+// Record of access: who viewed or changed a client / session (utils/accessLog.js)
+const { logOnSuccess } = require('../utils/accessLog');
 const adminController = require('../controllers/adminController');
 const sessionController = require('../controllers/sessionController');
 const psychologistController = require('../controllers/psychologistController');
@@ -211,10 +213,11 @@ router.get('/therapists/summary', require('../utils/staffRoles').allowRoles('ope
 // The remaining routes: admins, plus the roles that share a page with Admin
 // (Operations: bookings, clients, sessions; HR: therapist onboarding) — utils/staffRoles.js
 router.use(require('../utils/staffRoles').adminRouteGate);
+router.use(require('../utils/staffRoles').clientsOnly);
 
 // User management
 router.get('/users', adminController.getAllUsers);
-router.get('/users/:userId', adminController.getUserDetails);
+router.get('/users/:userId', logOnSuccess('viewed', 'client', (r) => r.params.userId), adminController.getUserDetails);
 router.put('/users/:userId/role', adminController.updateUserRole);
 router.put('/users/:userId/deactivate', adminController.deactivateUser);
 
@@ -243,15 +246,15 @@ router.post('/availability/update-all', adminController.updateAllPsychologistsAv
 
 // User management
 router.post('/users', adminController.createUser);
-router.put('/users/:userId', adminController.updateUser);
+router.put('/users/:userId', logOnSuccess('changed', 'client', (r) => r.params.userId), adminController.updateUser);
 router.delete('/users/:userId', adminController.deleteUser);
 
 // Session management
 router.get('/sessions/all', sessionController.getAllSessions);
-router.get('/sessions/:sessionId', sessionController.getSessionById);
+router.get('/sessions/:sessionId', logOnSuccess('viewed', 'session', (r) => r.params.sessionId), sessionController.getSessionById);
 
 // Session rescheduling
-router.put('/sessions/:sessionId', serializeByTherapist, adminController.updateSession);
+router.put('/sessions/:sessionId', serializeByTherapist, logOnSuccess('changed', 'session', (r) => r.params.sessionId), adminController.updateSession);
 router.put('/sessions/:sessionId/no-show', sessionController.markSessionAsNoShow);
 router.post('/sessions/:sessionId/complete', sessionController.completeSession);
 router.patch('/sessions/:sessionId/cancel-refund', sessionController.cancelRefundSession);

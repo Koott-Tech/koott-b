@@ -245,3 +245,42 @@ async function inboundLead(req, res) {
 }
 
 module.exports = { listLeads, createLead, updateLead, convertLead, leadSources, inboundLead };
+
+/** Admin: who viewed or changed client, lead and session records (audit_logs, utils/accessLog). */
+async function accessLog(req, res) {
+  try {
+    let q = supabaseAdmin.from('audit_logs')
+      .select('id, user_email, user_role, action, resource, resource_id, timestamp')
+      .like('action', 'RECORD_%').in('resource', ['client', 'lead', 'session'])
+      .order('timestamp', { ascending: false }).limit(300);
+    if (['client', 'lead', 'session'].includes(req.query.resource)) q = q.eq('resource', req.query.resource);
+    if (req.query.who) q = q.ilike('user_email', `%${String(req.query.who).replace(/[%,()]/g, ' ').slice(0, 80)}%`);
+    if (req.query.record) q = q.eq('resource_id', String(req.query.record));
+    if (req.query.from) q = q.gte('timestamp', new Date(req.query.from).toISOString());
+    const { data, error } = await q;
+    if (error) return handle(res, error, 'load the access record');
+    const rows = data || [];
+    // Name each record so the log reads "Demo Operations viewed client Anjali …"
+    const ids = (r) => [...new Set(rows.filter((x) => x.resource === r && x.resource_id).map((x) => x.resource_id))];
+    const [users, leads, sessions] = await Promise.all([
+      ids('client').length ? supabaseAdmin.from('users').select('id, name, email').in('id', ids('client')) : { data: [] },
+      ids('lead').length ? supabaseAdmin.from('leads').select('id, name, phone').in('id', ids('lead')) : { data: [] },
+      ids('session').length ? supabaseAdmin.from('sessions').select('id, scheduled_date, scheduled_time').in('id', ids('session')) : { data: [] },
+    ]);
+    const label = new Map([
+      ...(users.data || []).map((u) => [`client:${u.id}`, u.name || u.email]),
+      ...(leads.data || []).map((l) => [`lead:${l.id}`, l.name || l.phone || 'Lead']),
+      ...(sessions.data || []).map((s) => [`session:${s.id}`, `Session ${s.scheduled_date} ${String(s.scheduled_time || '').slice(0, 5)}`]),
+    ]);
+    return ok(res, {
+      entries: rows.map((r) => ({
+        ...r,
+        verb: String(r.action).replace(/^RECORD_/, '').toLowerCase(),
+        record: r.resource_id ? label.get(`${r.resource}:${r.resource_id}`) || (r.resource === 'lead' ? 'Lead (deleted)' : r.resource_id.slice(0, 8)) : '—',
+      })),
+    });
+  } catch (e) {
+    return handle(res, e, 'load the access record');
+  }
+}
+module.exports.accessLog = accessLog;
