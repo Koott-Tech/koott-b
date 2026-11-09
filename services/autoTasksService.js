@@ -41,11 +41,17 @@ async function make(fields) {
   return createTask(fields, { type: 'system' });
 }
 
+const warnedMissing = new Set();
 async function safe(name, fn) {
   try {
     return await fn();
   } catch (e) {
-    if (isMissingTable(e)) throw e;
+    // A rule whose table is not there yet (e.g. SQL 0022 not run) is skipped on its own;
+    // it must never stop the other rules.
+    if (isMissingTable(e)) {
+      if (!warnedMissing.has(name)) { console.warn(`autoTasks: ${name} off until its SQL migration is run.`); warnedMissing.add(name); }
+      return 0;
+    }
     console.warn(`autoTasks: ${name} skipped:`, e.message);
     return 0;
   }
