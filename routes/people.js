@@ -10,6 +10,7 @@ const c = require('../controllers/peopleController');
 const people = express.Router();
 people.use(authenticateToken);
 people.get('/', allowRoles('hr', 'finance'), c.getPeople);
+people.get('/therapist-onboarding', allowRoles('hr'), c.therapistOnboarding);
 people.post('/onboard', allowRoles('hr'), c.onboard);
 people.patch('/:type/:id', allowRoles('hr', 'finance'), c.updatePerson);
 people.post('/:type/:id/offboard', allowRoles('hr'), c.offboard);

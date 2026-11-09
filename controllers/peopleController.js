@@ -333,3 +333,41 @@ async function removeMember(req, res) {
 }
 
 module.exports = { getPeople, onboard, updatePerson, offboard, reactivate, getTeams, saveTeam, deleteTeam, addMember, removeMember };
+
+/**
+ * HR → Therapist onboarding: each therapist's steps, worked out from their record —
+ * profile (photo + description + designation), pricing (an active package or a price),
+ * availability (working hours or open days ahead), Google Calendar, group, login.
+ */
+async function therapistOnboarding(req, res) {
+  try {
+    const today = new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
+    const [psychs, pkgs, avail] = await Promise.all([
+      supabaseAdmin.from('psychologists').select('id, first_name, last_name, email, designation, description, profile_picture_url, cover_image_url, individual_session_price, psychiatrist_15min_price, working_hours, google_calendar_credentials, therapist_group_id, password_hash, is_active, created_at'),
+      supabaseAdmin.from('packages').select('psychologist_id, is_active'),
+      supabaseAdmin.from('availability').select('psychologist_id, is_available').gte('date', today).eq('is_available', true).limit(5000),
+    ]);
+    if (psychs.error) return handle(res, psychs.error, 'load therapists');
+    const hasPkg = new Set((pkgs.data || []).filter((p) => p.is_active !== false).map((p) => p.psychologist_id));
+    const hasDays = new Set((avail.data || []).map((a) => a.psychologist_id));
+    const rows = (psychs.data || []).filter((p) => p.is_active !== false).map((p) => {
+      const creds = p.google_calendar_credentials;
+      const steps = [
+        { key: 'login', label: 'Login created', done: Boolean(p.password_hash) },
+        { key: 'profile', label: 'Profile, photo and bio', done: Boolean((p.profile_picture_url || p.cover_image_url) && String(p.description || '').trim().length > 40 && p.designation) },
+        { key: 'pricing', label: 'Session pricing', done: hasPkg.has(p.id) || Number(p.individual_session_price) > 0 || Number(p.psychiatrist_15min_price) > 0 },
+        { key: 'availability', label: 'Working hours / availability', done: Boolean(p.working_hours) || hasDays.has(p.id) },
+        { key: 'calendar', label: 'Google Calendar connected', done: Boolean(creds && typeof creds === 'object' && creds.refresh_token) },
+        { key: 'group', label: 'In a therapist group', done: Boolean(p.therapist_group_id) },
+      ];
+      return {
+        id: p.id, name: `${p.first_name || ''} ${p.last_name || ''}`.trim() || p.email, email: p.email, designation: p.designation,
+        steps, done: steps.filter((s) => s.done).length, total: steps.length, createdAt: p.created_at,
+      };
+    }).sort((a, b) => a.done / a.total - b.done / b.total || a.name.localeCompare(b.name));
+    return ok(res, { therapists: rows });
+  } catch (e) {
+    return handle(res, e, 'load therapists');
+  }
+}
+module.exports.therapistOnboarding = therapistOnboarding;
