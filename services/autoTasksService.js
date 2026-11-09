@@ -434,4 +434,4 @@ function startAutoTasks() {
   console.log('🗂️  Automatic tasks scheduled (every 15 minutes)');
 }
 
-module.exports = { runAutoTasks, startAutoTasks, eventDayOf };
+module.exports = { runAutoTasks, startAutoTasks, eventDayOf, monthEnd };
