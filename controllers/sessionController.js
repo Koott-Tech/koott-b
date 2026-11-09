@@ -311,13 +311,11 @@ const bookSession = async (req, res) => {
 // Get all sessions (admin only)
 const getAllSessions = async (req, res) => {
   try {
-    console.log('getAllSessions called with user:', req.user);
-    
-    // Check if user is admin, superadmin, or finance
-    if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'superadmin' && req.user.role !== 'finance')) {
-      console.log('Access denied - user role:', req.user?.role);
+    // Admin, finance, and Operations (bookings & sessions are shared with Operations).
+    // Never log req.user: it is the full row, password hash included.
+    if (!req.user || !['admin', 'superadmin', 'finance', 'operations'].includes(req.user.role)) {
       return res.status(403).json(
-        errorResponse('Access denied. Admin, Superadmin, or Finance role required.')
+        errorResponse('Access denied. Admin, Operations or Finance role required.')
       );
     }
 
@@ -1072,9 +1070,9 @@ const getPsychologistSessions = async (req, res) => {
 // Get session by ID (admin only). Tries sessions table first, then assessment_sessions.
 const getSessionById = async (req, res) => {
   try {
-    if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'superadmin')) {
+    if (!req.user || !['admin', 'superadmin', 'operations'].includes(req.user.role)) {
       return res.status(403).json(
-        errorResponse('Access denied. Admin or Superadmin role required.')
+        errorResponse('Access denied. Admin or Operations role required.')
       );
     }
 

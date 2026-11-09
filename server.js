@@ -902,7 +902,7 @@ app.use('/api/clients', clientRoutes);
 app.use('/api/psychologists', psychologistRoutes);
 app.use('/api/sessions', sessionRoutes);
 app.use('/api/user-sessions', sessionRoutes);
-app.use('/api/admin/event-registrations', require('./middleware/auth').authenticateToken, require('./middleware/auth').requireEventOrganizer, eventRegistrationsAdminRoutes);
+app.use('/api/admin/event-registrations', require('./middleware/auth').authenticateToken, require('./utils/staffRoles').allowRoles('event_organizer', 'marketing', 'operations'), eventRegistrationsAdminRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/superadmin', superadminRoutes);
 // The tag vocabulary the booking filters are built from. Public: topics and
@@ -936,6 +936,11 @@ app.use('/api/coupons', couponRoutes);
 // First-party analytics (public, rate-limited) and the marketing dashboard API (marketing/admin roles)
 app.use('/api/analytics', require('./routes/analytics'));
 app.use('/api/marketing', require('./routes/marketing'));
+// Staff dashboards (plans/Koott dashboards and tasks plan): tasks, leads, people, teams
+app.use('/api/tasks', require('./routes/tasks'));
+app.use('/api/leads', require('./routes/leads'));
+app.use('/api/people', require('./routes/people').people);
+app.use('/api/teams', require('./routes/people').teams);
 
 // 404 handler
 app.use('*', (req, res) => {
@@ -1049,6 +1054,9 @@ console.log(`🚀 Koott Backend running on port ${PORT}`);
 
   const { startDailyCrawlerScheduler } = require('./jobs/dailyCrawlerJob');
   startDailyCrawlerScheduler();
+
+  // Automatic tasks (services/autoTasksService.js): leads, reschedules, renewals, availability…
+  require('./services/autoTasksService').startAutoTasks();
 
   // Analytics outbox: turns verified payments into funnel events (never on the booking path)
   require('./analytics/analyticsWorker').startAnalyticsWorker();

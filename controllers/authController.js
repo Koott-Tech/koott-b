@@ -310,7 +310,7 @@ const register = async (req, res) => {
           id: user.id,
           email: user.email,
           role: user.role,
-          profile: profileData
+          profile: require('../utils/helpers').withoutSecrets(profileData)
         },
         token
       }, 'User registered successfully')
@@ -544,7 +544,7 @@ const googleLogin = async (req, res) => {
           email: user.email,
           role: userRole,
           profile_picture_url: picture,
-          profile: profile
+          profile: require('../utils/helpers').withoutSecrets(profile)
         },
         token
       }, 'Google login successful')
@@ -689,6 +689,11 @@ const login = async (req, res) => {
         );
       }
 
+      // Offboarded (HR → Offboard): the login is switched off.
+      if (psychologist.is_active === false) {
+        return res.status(401).json(errorResponse('This login has been switched off. Please contact Koott HR.'));
+      }
+
       // Log successful login
       const ip = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
       await auditLogger.logAction({
@@ -742,7 +747,7 @@ const login = async (req, res) => {
             email: psychologist.email,
             role: 'psychologist',
             profile_picture_url: null,
-            profile: psychologist
+            profile: require('../utils/helpers').withoutSecrets(psychologist)
           },
           token
         }, 'Login successful')
@@ -945,6 +950,11 @@ const login = async (req, res) => {
       profile = user;
     }
 
+    // A switched-off login (HR → Offboard, or Admin deactivate) gets no token.
+    if (user.is_active === false) {
+      return res.status(401).json(errorResponse('This login has been switched off. Please contact Koott.'));
+    }
+
     // Generate JWT token - use user.id (from users table for new clients, or client.id for old clients)
     const token = generateToken(user.id, userRole);
 
@@ -979,7 +989,7 @@ const login = async (req, res) => {
           email: user.email,
           role: userRole,
           profile_picture_url: user.profile_picture_url,
-          profile
+          profile: require('../utils/helpers').withoutSecrets(profile)
         },
         token
       }, 'Login successful')
@@ -1043,10 +1053,7 @@ const getProfile = async (req, res) => {
     // Never send secrets to the browser. Staff roles fell back to the raw users row
     // (password_hash included) and therapists to the psychologists row (Google
     // Calendar OAuth tokens). The browser gets the profile without them.
-    const SECRET_KEY = /password|hash|secret|token|credential|otp/i;
-    const withoutSecrets = (row) => (row && typeof row === 'object'
-      ? Object.fromEntries(Object.entries(row).filter(([k]) => !SECRET_KEY.test(k)))
-      : row);
+    const { withoutSecrets } = require('../utils/helpers');
 
     res.json(
       successResponse({

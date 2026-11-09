@@ -306,6 +306,10 @@ const authenticateToken = async (req, res, next) => {
     const { data: psychologist, error: psychologistError } = psychologistLookup;
 
     if (psychologist && !psychologistError) {
+      // Offboarded therapists (HR → Offboard) lose access at once, like staff users.
+      if (psychologist.is_active === false) {
+        return res.status(401).json({ error: 'Access denied', message: 'Account has been deactivated' });
+      }
       // Psychologist exists in psychologists table (standalone)
       req.user = {
         id: psychologist.id,

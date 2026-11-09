@@ -207,7 +207,17 @@ const addMinutesToTime = (timeString, minutes) => {
   }
 };
 
+/**
+ * A row as the browser may see it: no password hashes, OAuth tokens, secrets or codes.
+ * Used for every profile the auth endpoints send back.
+ */
+const SECRET_FIELD = /password|hash|secret|token|credential|otp/i;
+const withoutSecrets = (row) => (row && typeof row === 'object' && !Array.isArray(row)
+  ? Object.fromEntries(Object.entries(row).filter(([k]) => !SECRET_FIELD.test(k)).map(([k, v]) => [k, (v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Date)) ? withoutSecrets(v) : v]))
+  : row);
+
 module.exports = {
+  withoutSecrets,
   generateToken,
   hashPassword,
   comparePassword,

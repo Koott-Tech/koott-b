@@ -81,7 +81,7 @@ router.post('/workshop-register', async (req, res) => {
       },
     };
 
-    let { error: dbError } = await supabaseAdmin.from('event_registrations').insert(insertPayload);
+    let { data: registration, error: dbError } = await supabaseAdmin.from('event_registrations').insert(insertPayload).select('id').single();
 
     if (dbError) {
       const code = dbError.code || '';
@@ -98,6 +98,12 @@ router.post('/workshop-register', async (req, res) => {
 
     // Respond immediately after DB success so UI can show instant success popup.
     ok(res, null, "Thank you — we've received your registration.");
+
+    // Also a lead for Operations, tagged with the event (utils/leads.js).
+    require('../utils/leads').upsertSourceLead({
+      source: 'event', sourceRef: registration?.id, sourceDetail: eventTitle,
+      name: fullName, phone: registrantWhatsApp || phone, email,
+    });
 
     // Send notifications in background; failures here never affect registration result.
     setImmediate(async () => {

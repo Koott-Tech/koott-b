@@ -74,10 +74,16 @@ async function saveLead(phone, fields = {}) {
     Object.keys(next).forEach((k) => { if (next[k] === undefined || next[k] === '') delete next[k]; });
     if (existing && next.status && LEAD_ORDER.indexOf(existing.status) > LEAD_ORDER.indexOf(next.status)) delete next.status;
 
-    const { error: writeError } = existing
-      ? await supabaseAdmin.from('booking_leads').update(next).eq('id', existing.id)
-      : await supabaseAdmin.from('booking_leads').insert({ phone, ...next });
+    const { data: written, error: writeError } = existing
+      ? await supabaseAdmin.from('booking_leads').update(next).eq('id', existing.id).select('id, name, email, client_id, psychologist_id, status').single()
+      : await supabaseAdmin.from('booking_leads').insert({ phone, ...next }).select('id, name, email, client_id, psychologist_id, status').single();
     if (writeError) throw writeError;
+    // Also in the Operations lead list (utils/leads.js), tagged as a booking-flow lead.
+    require('./leads').upsertSourceLead({
+      source: 'booking', sourceRef: written.id, name: written.name, phone, email: written.email,
+      clientId: written.client_id, psychologistId: written.psychologist_id,
+      converted: written.status === 'booked', meta: { booking_status: written.status },
+    });
   } catch (e) {
     console.warn('⚠️ Booking lead not saved (is migration 0010 applied?):', e.message);
   }
@@ -89,6 +95,7 @@ async function markLeadBooked(clientId) {
   const { error } = await supabaseAdmin
     .from('booking_leads').update({ status: 'booked', updated_at: now() }).eq('client_id', clientId);
   if (error && error.code !== 'PGRST205') console.warn('⚠️ Could not mark lead booked:', error.message);
+  require('./leads').markClientConverted(clientId);
 }
 
 /** Update a client row, retrying without columns a database may not have yet (migration 0010). */

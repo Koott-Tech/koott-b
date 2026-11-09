@@ -24,7 +24,8 @@ const adminLimiter = require('express-rate-limit')({
 router.use(adminLimiter);
 router.use(validateCSRF);
 router.use(authenticateToken);
-router.use(requireEventOrganizer);
+// Event organizers and Marketing (events CMS is in the Marketing dashboard)
+router.use(require('../utils/staffRoles').allowRoles('event_organizer', 'marketing'));
 
 router.get('/admin', listAdmin);
 router.get('/admin/:id', getByIdAdmin);

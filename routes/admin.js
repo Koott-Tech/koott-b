@@ -53,7 +53,7 @@ const upload = multer({
   }
 });
 
-router.post('/upload/image', requireEventOrganizer, upload.single('file'), async (req, res) => {
+router.post('/upload/image', require('../utils/staffRoles').allowRoles('event_organizer', 'marketing', 'hr'), upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No file uploaded' });
@@ -147,7 +147,7 @@ const uploadDoc = multer({
   }
 });
 
-router.post('/upload/document', requireEventOrganizer, uploadDoc.single('file'), async (req, res) => {
+router.post('/upload/document', require('../utils/staffRoles').allowRoles('event_organizer', 'marketing', 'hr'), uploadDoc.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
 
@@ -203,13 +203,14 @@ router.post('/upload/document', requireEventOrganizer, uploadDoc.single('file'),
 });
 
 // Psychologists accessible by both Admin and Event Organizer (for dropdowns)
-router.get('/psychologists', requireEventOrganizer, adminController.getAllPsychologists);
+router.get('/psychologists', require('../utils/staffRoles').allowRoles('event_organizer', 'operations', 'hr', 'marketing', 'finance'), adminController.getAllPsychologists);
 
 // Therapist roster with booking activity (replaces the old Wix therapist-discovery screen)
-router.get('/therapists/summary', adminController.getTherapistsSummary);
+router.get('/therapists/summary', require('../utils/staffRoles').allowRoles('operations', 'hr', 'marketing'), adminController.getTherapistsSummary);
 
-// All remaining routes require Admin
-router.use(requireAdmin);
+// The remaining routes: admins, plus the roles that share a page with Admin
+// (Operations: bookings, clients, sessions; HR: therapist onboarding) — utils/staffRoles.js
+router.use(require('../utils/staffRoles').adminRouteGate);
 
 // User management
 router.get('/users', adminController.getAllUsers);
