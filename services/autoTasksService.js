@@ -16,6 +16,7 @@
  *   therapist blocks time over booked sessions  → Reschedule the client      Operations team
  *   blog post not updated for 6 months          → Review this post           Marketing team         (daily)
  *   an event is 3 days away                     → Send reminders, confirm    Marketing team (+ Ops) (daily)
+ *   a client cancels a paid session             → Process the refund         Finance team
  *   the month ends                              → Run payouts; check receipts Finance team          (1st)
  *
  * Plus deadline reminders: a notification the day before and on the day.
@@ -71,8 +72,9 @@ async function uncontactedLeads(ops) {
 
 async function cancelledSessions(ops) {
   const today = istDay();
+  // 'cancelled' (admin) and 'canceled' (the client cancelled from their dashboard)
   const { data } = await supabaseAdmin.from('sessions').select('id, client_id, scheduled_date, scheduled_time')
-    .eq('status', 'cancelled').gte('updated_at', new Date(Date.now() - 2 * 864e5).toISOString()).gte('scheduled_date', today).limit(100);
+    .in('status', ['cancelled', 'canceled']).gte('updated_at', new Date(Date.now() - 2 * 864e5).toISOString()).gte('scheduled_date', today).limit(100);
   let n = 0;
   for (const s of data || []) {
     if (await make({
@@ -255,6 +257,25 @@ async function monthEnd(finance) {
   return t ? 1 : 0;
 }
 
+/** A client cancelled a paid session → Process the refund (Finance). Admin's "cancel & refund" refunds itself. */
+async function refundRequests(finance) {
+  const { data } = await supabaseAdmin.from('sessions').select('id, client_id, scheduled_date, scheduled_time, payment_id, price, amount')
+    .eq('status', 'canceled').gte('updated_at', new Date(Date.now() - 3 * 864e5).toISOString()).limit(100);
+  let n = 0;
+  for (const s of data || []) {
+    const paid = s.payment_id || Number(s.price) > 0 || Number(s.amount) > 0;
+    if (!paid) continue;
+    const amount = Number(s.amount || s.price || 0);
+    if (await make({
+      title: `Process the refund: client ${clientRef(s.client_id)} cancelled the session on ${s.scheduled_date}${amount ? ` (₹${amount.toLocaleString('en-IN')})` : ''}`,
+      details: 'Check the refund policy (time before the session), then refund through Razorpay or keep it as credit, and tell the client.',
+      assignee_type: 'team', assignee_id: finance.id, priority: 'high', deadline: inHours(48),
+      link_type: 'session', link_id: s.id, link_label: `Session ${s.scheduled_date}`, auto_key: `refund:${s.id}`,
+    })) n += 1;
+  }
+  return n;
+}
+
 /** Therapist blocks out time that already has booked sessions → reschedule them (Operations). */
 async function unavailableOverBookings(ops) {
   const today = istDay();
@@ -349,6 +370,7 @@ async function runAutoTasks({ daily = null } = {}) {
     out.payments = await safe('payments', () => failedPayments(ops));
     out.complete = await safe('complete', () => sessionsNotCompleted());
     out.unavailable = await safe('unavailable', () => unavailableOverBookings(ops));
+    out.refunds = await safe('refunds', () => refundRequests(finance));
     out.reminders = await safe('reminders', () => reminders());
     const today = istDay();
     const runDaily = daily === true || (daily === null && lastDaily !== today && istNow().getUTCHours() >= 9);

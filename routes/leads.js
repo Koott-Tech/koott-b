@@ -15,6 +15,7 @@ router.post('/inbound', inboundLimiter, c.inboundLead);
 
 router.use(authenticateToken);
 router.get('/sources', allowRoles('operations', 'marketing'), c.leadSources);
+router.get('/event-results', allowRoles('operations', 'marketing'), c.eventResults);
 const { logOnSuccess } = require('../utils/accessLog');
 const byId = (r) => r.params.id;
 router.get('/', allowRoles('operations'), c.listLeads);

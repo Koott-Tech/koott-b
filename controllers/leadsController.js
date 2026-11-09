@@ -333,3 +333,42 @@ async function clientTimeline(req, res) {
   }
 }
 module.exports.clientTimeline = clientTimeline;
+
+/**
+ * Marketing → Event results: per event, registrations, attended, leads that became
+ * clients and paying clients (event registrations + the event-tagged leads).
+ */
+async function eventResults(req, res) {
+  try {
+    const [regs, pages, leads] = await Promise.all([
+      supabaseAdmin.from('event_registrations').select('id, event_slug, event_title, attendance_status, metadata, created_at').limit(20000),
+      supabaseAdmin.from('event_pages').select('slug, title, is_published').limit(500),
+      supabaseAdmin.from('leads').select('source_ref, source_detail, stage, client_id').eq('source', 'event').limit(20000),
+    ]);
+    if (regs.error) return handle(res, regs.error, 'load event results');
+    const titleOf = new Map((pages.data || []).map((p) => [p.slug, p.title]));
+    const leadByReg = new Map((leads.data || []).map((l) => [String(l.source_ref), l]));
+    const clientIds = [...new Set((leads.data || []).map((l) => l.client_id).filter(Boolean))];
+    let paying = new Set();
+    if (clientIds.length) {
+      const { data: pays } = await supabaseAdmin.from('payments').select('client_id').in('client_id', clientIds.slice(0, 1000)).eq('status', 'success');
+      paying = new Set((pays || []).map((p) => p.client_id));
+    }
+    const rows = {};
+    (regs.data || []).forEach((r) => {
+      const k = r.event_slug || 'unknown';
+      const row = rows[k] || (rows[k] = { slug: k, title: titleOf.get(k) || r.event_title || r.metadata?.event_title || k, registrations: 0, attended: 0, converted: 0, paying: 0, first: r.created_at, last: r.created_at });
+      row.registrations += 1;
+      if (/attend|present|joined/i.test(r.attendance_status || '')) row.attended += 1;
+      const lead = leadByReg.get(String(r.id));
+      if (lead?.stage === 'converted') row.converted += 1;
+      if (lead?.client_id && paying.has(lead.client_id)) row.paying += 1;
+      if (r.created_at < row.first) row.first = r.created_at;
+      if (r.created_at > row.last) row.last = r.created_at;
+    });
+    return ok(res, { events: Object.values(rows).sort((a, b) => new Date(b.last) - new Date(a.last)) });
+  } catch (e) {
+    return handle(res, e, 'load event results');
+  }
+}
+module.exports.eventResults = eventResults;
