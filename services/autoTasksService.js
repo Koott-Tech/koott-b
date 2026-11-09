@@ -13,7 +13,9 @@
  *   session ended, not marked done              → Mark the session complete  the therapist
  *   therapist has no open slots for 2 weeks     → Update your availability   the therapist          (daily)
  *   therapist's Google Calendar needs reconnect → Reconnect your calendar    the therapist (+ HR)   (daily)
+ *   therapist blocks time over booked sessions  → Reschedule the client      Operations team
  *   blog post not updated for 6 months          → Review this post           Marketing team         (daily)
+ *   an event is 3 days away                     → Send reminders, confirm    Marketing team (+ Ops) (daily)
  *   the month ends                              → Run payouts; check receipts Finance team          (1st)
  *
  * Plus deadline reminders: a notification the day before and on the day.
@@ -253,6 +255,63 @@ async function monthEnd(finance) {
   return t ? 1 : 0;
 }
 
+/** Therapist blocks out time that already has booked sessions → reschedule them (Operations). */
+async function unavailableOverBookings(ops) {
+  const today = istDay();
+  const { data: blocks } = await supabaseAdmin.from('psychologist_date_blocks')
+    .select('id, psychologist_id, date, block_entire_day, time_slots, updated_at')
+    .gte('date', today).gte('updated_at', new Date(Date.now() - 3 * 864e5).toISOString()).limit(200);
+  const toMin = (t) => { const m = /^(\d{1,2}):(\d{2})/.exec(String(t || '')); return m ? Number(m[1]) * 60 + Number(m[2]) : null; };
+  let n = 0;
+  for (const b of blocks || []) {
+    const { data: sessions } = await supabaseAdmin.from('sessions')
+      .select('id, client_id, scheduled_date, scheduled_time, session_type')
+      .eq('psychologist_id', b.psychologist_id).eq('scheduled_date', b.date)
+      .in('status', ['booked', 'rescheduled', 'confirmed', 'scheduled', 'upcoming']);
+    const hours = (b.time_slots || []).map(toMin).filter((x) => x !== null);
+    for (const s of sessions || []) {
+      const start = toMin(s.scheduled_time);
+      const len = /couple/i.test(s.session_type || '') ? 80 : 50;
+      const hit = b.block_entire_day || hours.some((h) => start !== null && start < h + 60 && h < start + len);
+      if (!hit) continue;
+      if (await make({
+        title: `Reschedule client ${clientRef(s.client_id)} — the therapist is now unavailable on ${s.scheduled_date} at ${String(s.scheduled_time).slice(0, 5)}`,
+        assignee_type: 'team', assignee_id: ops.id, priority: 'urgent', deadline: inHours(12),
+        link_type: 'session', link_id: s.id, link_label: `Session ${s.scheduled_date} ${String(s.scheduled_time).slice(0, 5)}`,
+        auto_key: `unavailable:${s.id}:${b.date}`,
+      })) n += 1;
+    }
+  }
+  return n;
+}
+
+/** An event is 3 days away → send reminders, confirm the link or venue (Marketing; Operations told). */
+const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+function eventDayOf(page) {
+  const text = JSON.stringify(page.cms_data || page.content || {});
+  const sched = /"schedule"\s*:\s*"([^"]+)"/.exec(text)?.[1] || /"date"\s*:\s*"([^"]+)"/.exec(text)?.[1] || '';
+  const m = /(\d{1,2})\s+([A-Za-z]{3})[a-z]*,?\s+(\d{4})/.exec(sched);
+  if (!m || MONTHS[m[2].toLowerCase()] === undefined) return null;
+  return new Date(Date.UTC(Number(m[3]), MONTHS[m[2].toLowerCase()], Number(m[1]))).toISOString().slice(0, 10);
+}
+async function eventsSoon(mkt, ops) {
+  const { data } = await supabaseAdmin.from('event_pages').select('slug, title, is_published, cms_data, content').eq('is_published', true).limit(200);
+  const today = istDay();
+  const { notify } = require('../controllers/tasksController');
+  let n = 0;
+  for (const p of data || []) {
+    const day = eventDayOf(p);
+    if (!day || day < today || day > addDays(today, 3)) continue;
+    const t = await make({
+      title: `Event on ${day}: send reminders and confirm the meeting link or venue — ${p.title || p.slug}`,
+      assignee_type: 'team', assignee_id: mkt.id, priority: 'high', deadline: new Date(`${addDays(day, -1)}T18:00:00+05:30`).toISOString(),
+      link_type: 'url', link_url: `/events/${p.slug}`, link_label: p.title || p.slug, auto_key: `event3:${p.slug}:${day}`,
+    });
+    if (t) { n += 1; await notify(await teamMembers(ops.id), t, 'status', 'FYI: an event is 3 days away.', { type: 'system' }); }
+  }
+  return n;
+}
+
 /** Deadline reminders: the day before and on the day (once each). */
 async function reminders() {
   const today = istDay();
@@ -289,6 +348,7 @@ async function runAutoTasks({ daily = null } = {}) {
     out.missed = await safe('missed', () => missedSessions(ops));
     out.payments = await safe('payments', () => failedPayments(ops));
     out.complete = await safe('complete', () => sessionsNotCompleted());
+    out.unavailable = await safe('unavailable', () => unavailableOverBookings(ops));
     out.reminders = await safe('reminders', () => reminders());
     const today = istDay();
     const runDaily = daily === true || (daily === null && lastDaily !== today && istNow().getUTCHours() >= 9);
@@ -298,6 +358,7 @@ async function runAutoTasks({ daily = null } = {}) {
       out.availability = await safe('availability', () => therapistAvailability());
       out.calendar = await safe('calendar', () => calendarReconnect());
       out.blog = await safe('blog', () => staleBlogPosts(mkt));
+      out.events = await safe('events', () => eventsSoon(mkt, ops));
       out.monthEnd = await safe('month end', () => monthEnd(finance));
     }
     const made = Object.values(out).reduce((a, b) => a + (Number(b) || 0), 0);
@@ -322,4 +383,4 @@ function startAutoTasks() {
   console.log('🗂️  Automatic tasks scheduled (every 15 minutes)');
 }
 
-module.exports = { runAutoTasks, startAutoTasks };
+module.exports = { runAutoTasks, startAutoTasks, eventDayOf };

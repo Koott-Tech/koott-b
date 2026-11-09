@@ -23,6 +23,8 @@ router.patch('/:id', allowRoles('operations'), logOnSuccess('changed', 'lead', b
 router.post('/:id/convert', allowRoles('operations'), logOnSuccess('converted', 'lead', byId), c.convertLead);
 // The lead panel was opened (record of access)
 router.post('/:id/viewed', allowRoles('operations'), logOnSuccess('viewed', 'lead', byId), (req, res) => res.json({ success: true, data: {} }));
+// Operations: one timeline per client (lead source, bookings, payments, tasks)
+router.get('/client-timeline/:id', allowRoles('operations'), c.clientTimeline);
 // Admin: the record of access for clients, leads and sessions
 router.get('/access-log', require('../utils/staffRoles').allowRoles(), c.accessLog);
 

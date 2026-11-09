@@ -284,3 +284,52 @@ async function accessLog(req, res) {
   }
 }
 module.exports.accessLog = accessLog;
+
+/**
+ * Operations: one timeline per client — where they came from (lead + source), every
+ * booking/session, payment, and the tasks about them, newest first. Accepts the
+ * users.id or the clients.id. No clinical notes: only dates, statuses and amounts.
+ */
+async function clientTimeline(req, res) {
+  try {
+    const id = String(req.params.id || '');
+    let { data: client } = await supabaseAdmin.from('clients').select('id, user_id, first_name, last_name, email, phone_number, created_at').eq('id', id).maybeSingle();
+    if (!client) ({ data: client } = await supabaseAdmin.from('clients').select('id, user_id, first_name, last_name, email, phone_number, created_at').eq('user_id', id).maybeSingle());
+    if (!client) return fail(res, 404, 'Client not found.');
+    const [leads, sessions, payments] = await Promise.all([
+      supabaseAdmin.from('leads').select('id, source, source_detail, stage, created_at, contacted_at, converted_at, lost_reason').eq('client_id', client.id),
+      supabaseAdmin.from('sessions').select('id, scheduled_date, scheduled_time, status, session_type, created_at, psychologist:psychologists!sessions_psychologist_id_fkey(first_name, last_name)').eq('client_id', client.id).order('scheduled_date', { ascending: false }).limit(200),
+      supabaseAdmin.from('payments').select('id, amount, status, created_at, session_type').eq('client_id', client.id).order('created_at', { ascending: false }).limit(200),
+    ]);
+    const sessionIds = (sessions.data || []).map((s) => s.id);
+    const linkFilters = [`and(link_type.eq.client,link_id.eq.${client.id})`];
+    if (sessionIds.length) linkFilters.push(`and(link_type.eq.session,link_id.in.(${sessionIds.slice(0, 150).join(',')}))`);
+    const tasks = await supabaseAdmin.from('tasks').select('id, title, status, created_at, completed_at').or(linkFilters.join(',')).neq('status', 'cancelled').limit(200);
+    const name = (p) => (Array.isArray(p) ? p[0] : p) ? `${(Array.isArray(p) ? p[0] : p).first_name || ''} ${(Array.isArray(p) ? p[0] : p).last_name || ''}`.trim() : '';
+    const ev = [];
+    (leads.data || []).forEach((l) => {
+      ev.push({ at: l.created_at, kind: 'lead', text: `Arrived as a lead from ${l.source}${l.source_detail ? ` (${l.source_detail})` : ''}` });
+      if (l.contacted_at) ev.push({ at: l.contacted_at, kind: 'lead', text: 'Contacted by Operations' });
+      if (l.converted_at) ev.push({ at: l.converted_at, kind: 'lead', text: 'Converted to client' });
+      if (l.stage === 'lost') ev.push({ at: l.created_at, kind: 'lead', text: `Lead lost: ${l.lost_reason || 'no reason given'}` });
+    });
+    (sessions.data || []).forEach((s) => ev.push({
+      at: s.scheduled_date ? `${s.scheduled_date}T${String(s.scheduled_time || '00:00:00').slice(0, 8)}+05:30` : s.created_at,
+      kind: 'session', text: `Session ${String(s.status || '').replace(/_/g, ' ')}${name(s.psychologist) ? ` with ${name(s.psychologist)}` : ''}`,
+      detail: `${s.scheduled_date || ''} ${String(s.scheduled_time || '').slice(0, 5)}${s.session_type ? ` · ${s.session_type}` : ''}`, id: s.id,
+    }));
+    (payments.data || []).forEach((p) => ev.push({ at: p.created_at, kind: 'payment', text: `Payment ${p.status} — ₹${Number(p.amount || 0).toLocaleString('en-IN')}`, detail: p.session_type || '' }));
+    (tasks.data || []).forEach((t) => ev.push({ at: t.created_at, kind: 'task', text: `Task: ${t.title}`, detail: t.status.replace('_', ' '), id: t.id }));
+    ev.push({ at: client.created_at, kind: 'account', text: 'Client account created' });
+    ev.sort((a, b) => new Date(b.at) - new Date(a.at));
+    require('../utils/accessLog').logAccess(req, { action: 'viewed', resource: 'client', resourceId: client.user_id || client.id, details: { view: 'timeline' } });
+    return ok(res, {
+      client: { id: client.id, userId: client.user_id, name: `${client.first_name || ''} ${client.last_name || ''}`.trim() || client.email, email: client.email, phone: client.phone_number },
+      events: ev,
+      counts: { sessions: (sessions.data || []).length, payments: (payments.data || []).filter((p) => p.status === 'success').length, tasks: (tasks.data || []).length },
+    });
+  } catch (e) {
+    return handle(res, e, 'load the timeline');
+  }
+}
+module.exports.clientTimeline = clientTimeline;
