@@ -141,11 +141,23 @@ async function failedPayments(ops) {
   let n = 0;
   const { notify } = require('../controllers/tasksController');
   const finance = await teamByName('Finance');
-  for (const p of data || []) {
+  // One task per client per day, however many times they retried checkout — and none
+  // when they paid successfully afterwards.
+  const latest = new Map();
+  (data || []).forEach((p) => {
+    if (!p.client_id) return;
+    const prev = latest.get(p.client_id);
+    if (!prev || new Date(p.created_at) > new Date(prev.created_at)) latest.set(p.client_id, p);
+  });
+  for (const p of latest.values()) {
+    const { count: paidAfter } = await supabaseAdmin.from('payments').select('id', { count: 'exact', head: true })
+      .eq('client_id', p.client_id).eq('status', 'success').gt('created_at', p.created_at);
+    if (paidAfter) continue;
     const t = await make({
       title: `Payment follow-up: client ${clientRef(p.client_id)} — ₹${Number(p.amount || 0).toLocaleString('en-IN')} not paid`,
       assignee_type: 'team', assignee_id: ops.id, priority: 'high', deadline: inHours(24),
-      link_type: 'client', link_id: p.client_id, link_label: `Client ${clientRef(p.client_id)}`, auto_key: `payfail:${p.id}`,
+      link_type: 'client', link_id: p.client_id, link_label: `Client ${clientRef(p.client_id)}`,
+      auto_key: `payfail:${p.client_id}:${istDay(new Date(p.created_at))}`,
     });
     if (t) {
       n += 1;

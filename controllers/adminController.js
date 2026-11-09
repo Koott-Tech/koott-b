@@ -3742,6 +3742,14 @@ const deleteUser = async (req, res) => {
       console.log(`   ✅ Deleted notifications`);
     }
 
+    // Staff records that point at this login (migration 0021): teams, profile, notifications.
+    // Tasks they gave or got stay, as history.
+    await Promise.all([
+      supabaseAdmin.from('team_members').delete().eq('person_type', 'user').eq('person_id', userId),
+      supabaseAdmin.from('staff_profiles').delete().eq('person_type', 'user').eq('person_id', userId),
+      supabaseAdmin.from('task_notifications').delete().eq('recipient_type', 'user').eq('recipient_id', userId),
+    ]).catch(() => {});
+
     // Delete user account
     const { error: deleteUserError } = await supabaseAdmin
       .from('users')

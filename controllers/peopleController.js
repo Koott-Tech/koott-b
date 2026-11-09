@@ -242,12 +242,17 @@ async function getTeams(req, res) {
     const refs = [...(members.data || []).map((m) => ({ type: m.person_type, id: m.person_id })),
       ...(teams.data || []).filter((t) => t.lead_person_id).map((t) => ({ type: t.lead_person_type, id: t.lead_person_id }))];
     const names = await namesFor(refs);
+    const orphans = (members.data || []).filter((m) => !names[key(m.person_type, m.person_id)]);
+    orphans.forEach((m) => {
+      supabaseAdmin.from('team_members').delete().eq('team_id', m.team_id).eq('person_type', m.person_type).eq('person_id', m.person_id).then(() => {}, () => {});
+    });
     return ok(res, {
       teams: (teams.data || []).map((t) => ({
         ...t,
         lead: t.lead_person_id ? { key: key(t.lead_person_type, t.lead_person_id), name: names[key(t.lead_person_type, t.lead_person_id)]?.name } : null,
-        members: (members.data || []).filter((m) => m.team_id === t.id).map((m) => ({
-          key: key(m.person_type, m.person_id), type: m.person_type, id: m.person_id, name: names[key(m.person_type, m.person_id)]?.name || 'Unknown',
+        // A member whose login was deleted has no name: left out (and removed below).
+        members: (members.data || []).filter((m) => m.team_id === t.id && names[key(m.person_type, m.person_id)]).map((m) => ({
+          key: key(m.person_type, m.person_id), type: m.person_type, id: m.person_id, name: names[key(m.person_type, m.person_id)].name,
         })),
       })),
     });
