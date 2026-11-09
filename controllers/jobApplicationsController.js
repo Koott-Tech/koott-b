@@ -70,11 +70,24 @@ async function update(req, res) {
       patch.stage = req.body.stage;
     }
     if (req.body.notes !== undefined) patch.notes = req.body.notes ? String(req.body.notes).slice(0, 4000) : null;
+    if (req.body.interview_at !== undefined) patch.interview_at = req.body.interview_at ? new Date(req.body.interview_at).toISOString() : null;
+    if (req.body.interviewer !== undefined) patch.interviewer = req.body.interviewer ? String(req.body.interviewer).slice(0, 120) : null;
     const { data, error } = await supabaseAdmin.from('job_applications').update(patch).eq('id', req.params.id).select('*').single();
     if (error) return handle(res, error, 'update the application');
     if (patch.stage && patch.stage !== 'applied') {
       await supabaseAdmin.from('tasks').update({ status: 'done', completed_at: patch.updated_at, updated_at: patch.updated_at })
         .eq('auto_key', `application:${data.id}`).not('status', 'in', '(done,cancelled)');
+    }
+    // An interview time puts an "Interview" task on HR's calendar (one per application + time).
+    if (patch.interview_at) {
+      try {
+        const hr = await teamByName('HR');
+        await require('./tasksController').createTask({
+          title: `Interview: ${data.name} — ${data.career_title || 'application'}${data.interviewer ? ` (with ${data.interviewer})` : ''}`,
+          assignee_type: 'team', assignee_id: hr.id, priority: 'high', deadline: patch.interview_at, deadline_has_time: true,
+          link_type: 'application', link_id: data.id, link_label: data.name, auto_key: `interview:${data.id}:${patch.interview_at}`,
+        }, { type: 'user', id: req.user.id });
+      } catch (e) { console.warn('applications: interview task not created:', e.message); }
     }
     return ok(res, { application: data });
   } catch (e) {

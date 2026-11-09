@@ -14,6 +14,7 @@
  *   therapist has no open slots for 2 weeks     → Update your availability   the therapist          (daily)
  *   therapist's Google Calendar needs reconnect → Reconnect your calendar    the therapist (+ HR)   (daily)
  *   therapist blocks time over booked sessions  → Reschedule the client      Operations team
+ *   a licence / contract expires within 30 days → Renew the document     the person (+ HR)      (daily)
  *   blog post not updated for 6 months          → Review this post           Marketing team         (daily)
  *   an event is 3 days away                     → Send reminders, confirm    Marketing team (+ Ops) (daily)
  *   a client cancels a paid session             → Process the refund         Finance team
@@ -333,6 +334,27 @@ async function eventsSoon(mkt, ops) {
   return n;
 }
 
+/** A licence / contract expires within 30 days → Renew the document (HR team + the person). */
+async function expiringDocuments(hr) {
+  const today = istDay();
+  const { data, error } = await supabaseAdmin.from('staff_documents').select('id, person_type, person_id, title, kind, expires_on')
+    .not('expires_on', 'is', null).lte('expires_on', addDays(today, 30)).gte('expires_on', addDays(today, -60)).limit(200);
+  if (error) throw error;
+  const { notify } = require('../controllers/tasksController');
+  let n = 0;
+  for (const d of data || []) {
+    const t = await make({
+      title: `Renew the ${d.kind === 'id_proof' ? 'ID' : d.kind}: "${d.title}" ${d.expires_on < today ? 'expired' : 'expires'} on ${d.expires_on}`,
+      assignee_type: d.person_type, assignee_id: d.person_id, priority: d.expires_on < today ? 'urgent' : 'high',
+      deadline: new Date(`${d.expires_on}T12:00:00+05:30`).toISOString(),
+      details: 'Upload the renewed document in Documents (HR keeps a copy).',
+      link_type: 'person', link_id: `${d.person_type}:${d.person_id}`, link_label: d.title, auto_key: `docexpiry:${d.id}:${d.expires_on}`,
+    });
+    if (t) { n += 1; await notify(await teamMembers(hr.id), t, 'status', 'FYI: a document is about to expire.', { type: 'system' }); }
+  }
+  return n;
+}
+
 /** Deadline reminders: the day before and on the day (once each). */
 async function reminders() {
   const today = istDay();
@@ -381,6 +403,7 @@ async function runAutoTasks({ daily = null } = {}) {
       out.calendar = await safe('calendar', () => calendarReconnect());
       out.blog = await safe('blog', () => staleBlogPosts(mkt));
       out.events = await safe('events', () => eventsSoon(mkt, ops));
+      out.documents = await safe('documents', async () => expiringDocuments(await teamByName('HR')));
       out.monthEnd = await safe('month end', () => monthEnd(finance));
     }
     const made = Object.values(out).reduce((a, b) => a + (Number(b) || 0), 0);

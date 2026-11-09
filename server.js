@@ -942,6 +942,9 @@ app.use('/api/leads', require('./routes/leads'));
 app.use('/api/people', require('./routes/people').people);
 app.use('/api/teams', require('./routes/people').teams);
 app.use('/api/me', require('./routes/therapistInsights'));
+app.use('/api/documents', require('./routes/hrExtras').documents);
+app.use('/api/safety', require('./routes/hrExtras').safety);
+app.use('/api/blog-calendar', require('./routes/blogCalendar'));
 
 // 404 handler
 app.use('*', (req, res) => {
