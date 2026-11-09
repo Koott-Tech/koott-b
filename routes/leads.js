@@ -22,6 +22,7 @@ router.get('/', allowRoles('operations'), c.listLeads);
 router.post('/', allowRoles('operations'), logOnSuccess('created', 'lead'), c.createLead);
 router.patch('/:id', allowRoles('operations'), logOnSuccess('changed', 'lead', byId), c.updateLead);
 router.post('/:id/convert', allowRoles('operations'), logOnSuccess('converted', 'lead', byId), c.convertLead);
+router.post('/:id/contact', allowRoles('operations'), logOnSuccess('changed', 'lead', byId), c.logContact);
 // The lead panel was opened (record of access)
 router.post('/:id/viewed', allowRoles('operations'), logOnSuccess('viewed', 'lead', byId), (req, res) => res.json({ success: true, data: {} }));
 // Operations: one timeline per client (lead source, bookings, payments, tasks)

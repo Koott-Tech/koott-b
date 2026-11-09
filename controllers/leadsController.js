@@ -391,3 +391,30 @@ async function eventResults(req, res) {
   }
 }
 module.exports.eventResults = eventResults;
+
+/** Operations pressed Call / WhatsApp / Email on a lead: log it, and a New lead becomes Contacted. */
+async function logContact(req, res) {
+  try {
+    const channel = ['call', 'whatsapp', 'email'].includes(req.body.channel) ? req.body.channel : 'call';
+    const { data: lead, error } = await supabaseAdmin.from('leads').select('*').eq('id', req.params.id).maybeSingle();
+    if (error) return handle(res, error, 'log the contact');
+    if (!lead) return fail(res, 404, 'Lead not found.');
+    const me = personOf(req.user);
+    const now = new Date().toISOString();
+    const log = Array.isArray(lead.meta?.contacts) ? lead.meta.contacts.slice(-49) : [];
+    log.push({ at: now, channel, by: key(me.type, me.id) });
+    const patch = { meta: { ...(lead.meta || {}), contacts: log }, updated_at: now };
+    if (!lead.contacted_at) patch.contacted_at = now;
+    if (lead.stage === 'new') { patch.stage = 'contacted'; patch.stage_changed_at = now; }
+    if (!lead.owner_id) { patch.owner_type = me.type; patch.owner_id = me.id; }
+    const { data: updated, error: upErr } = await supabaseAdmin.from('leads').update(patch).eq('id', lead.id).select('*').single();
+    if (upErr) return handle(res, upErr, 'log the contact');
+    await supabaseAdmin.from('tasks').update({ status: 'done', completed_at: now, updated_at: now })
+      .eq('auto_key', `lead_call:${lead.id}`).not('status', 'in', '(done,cancelled)');
+    const [out] = await withNames([updated]);
+    return ok(res, { lead: out });
+  } catch (e) {
+    return handle(res, e, 'log the contact');
+  }
+}
+module.exports.logContact = logContact;
