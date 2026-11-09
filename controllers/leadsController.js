@@ -241,6 +241,25 @@ async function inboundLead(req, res) {
     name, email: email || null, phone: phone ? (normalizePhone(phone) || phone) : null,
     meta: { message: String(b.message || '').slice(0, 2000) },
   });
+  // A complaint (contact-form topic, or the words in the message) → Respond to it (Operations, Admin told).
+  const text = `${b.topic || ''} ${b.message || ''}`;
+  if (/complain|complaint|unhappy|disappointed|refund|bad experience|feedback/i.test(text)) {
+    try {
+      const { teamByName, teamMembers } = require('../utils/people');
+      const ops = await teamByName('Operations');
+      const { createTask, notify } = require('./tasksController');
+      const t = await createTask({
+        title: `Respond to a complaint from ${name}`, assignee_type: 'team', assignee_id: ops.id, priority: 'high',
+        deadline: new Date(Date.now() + 24 * 3600e3).toISOString(),
+        details: `From the contact form${b.topic ? ` (${String(b.topic).slice(0, 80)})` : ''}. Their message is on the lead.`,
+        link_type: id ? 'lead' : null, link_id: id || null, link_label: name, auto_key: id ? `complaint:${id}` : null,
+      }, { type: 'system' });
+      if (t) {
+        const { data: admins } = await supabaseAdmin.from('users').select('id').in('role', ['admin', 'superadmin']).eq('is_active', true);
+        await notify((admins || []).map((a) => ({ type: 'user', id: a.id })), t, 'status', 'FYI: a complaint came in through the website.', { type: 'system' });
+      }
+    } catch (e) { console.warn('complaint task not created:', e.message); }
+  }
   return ok(res, { saved: Boolean(id) }, 201);
 }
 

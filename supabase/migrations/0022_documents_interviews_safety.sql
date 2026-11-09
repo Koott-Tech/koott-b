@@ -9,6 +9,7 @@
 --   safety_alerts    a therapist's urgent safety concern about a client: goes straight
 --                    to the named clinical lead (email), never into the task queue.
 --   app_settings     small settings (who the clinical lead is).
+--   training_*       the therapist training module (courses, lessons, progress).
 --
 -- Additive and safe to re-run.
 -- ============================================================================
@@ -60,5 +61,43 @@ create table if not exists app_settings (
 alter table staff_documents enable row level security;
 alter table safety_alerts   enable row level security;
 alter table app_settings    enable row level security;
+
+-- ---------------------------------------------------------------- training module
+-- Courses HR builds (therapists, staff or everyone), lessons in order, and each person's
+-- completed lessons — HR sees the progress.
+create table if not exists training_courses (
+  id            uuid primary key default gen_random_uuid(),
+  title         text not null,
+  description   text,
+  audience      text not null default 'therapists' check (audience in ('therapists', 'staff', 'all')),
+  is_published  boolean not null default false,
+  required      boolean not null default false,
+  created_by    uuid,
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now()
+);
+create table if not exists training_lessons (
+  id            uuid primary key default gen_random_uuid(),
+  course_id     uuid not null references training_courses(id) on delete cascade,
+  position      integer not null default 0,
+  title         text not null,
+  body          text,
+  video_url     text,
+  resource_url  text,
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now()
+);
+create index if not exists training_lessons_course_idx on training_lessons (course_id, position);
+create table if not exists training_progress (
+  id            uuid primary key default gen_random_uuid(),
+  person_type   text not null check (person_type in ('user', 'psychologist')),
+  person_id     uuid not null,
+  lesson_id     uuid not null references training_lessons(id) on delete cascade,
+  completed_at  timestamptz not null default now(),
+  unique (person_type, person_id, lesson_id)
+);
+alter table training_courses  enable row level security;
+alter table training_lessons  enable row level security;
+alter table training_progress enable row level security;
 
 notify pgrst, 'reload schema';

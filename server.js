@@ -945,6 +945,7 @@ app.use('/api/me', require('./routes/therapistInsights'));
 app.use('/api/documents', require('./routes/hrExtras').documents);
 app.use('/api/safety', require('./routes/hrExtras').safety);
 app.use('/api/blog-calendar', require('./routes/blogCalendar'));
+app.use('/api/training', require('./routes/training'));
 
 // 404 handler
 app.use('*', (req, res) => {
