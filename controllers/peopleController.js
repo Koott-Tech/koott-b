@@ -7,8 +7,8 @@
 const crypto = require('crypto');
 const { supabaseAdmin } = require('../config/supabase');
 const { hashPassword } = require('../utils/helpers');
-const { isAdmin, personOf, ONBOARDABLE_ROLES, ROLE_LABEL } = require('../utils/staffRoles');
-const { key, listPeople, namesFor, teamByName, isMissingTable, NOT_READY } = require('../utils/people');
+const { isAdmin, personOf, ONBOARDABLE_ROLES, ROLE_LABEL, STAFF_USER_ROLES, UUID_RE } = require('../utils/staffRoles');
+const { key, listPeople, namesFor, teamByName, isMissingTable, NOT_READY, COMPLETE } = require('../utils/people');
 
 const ok = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
@@ -17,7 +17,29 @@ const handle = (res, e, what) => {
   console.error(`people: ${what}:`, e?.message || e);
   return fail(res, 500, `Could not ${what}.`);
 };
-const parsePerson = (type, id) => (['user', 'psychologist'].includes(type) && id ? { type, id } : null);
+const parsePerson = (type, id) => (['user', 'psychologist'].includes(type) && UUID_RE.test(String(id || '')) ? { type, id } : null);
+const YMD = /^\d{4}-\d{2}-\d{2}$/;
+const validDay = (v) => YMD.test(String(v || '')) && !Number.isNaN(new Date(`${v}T00:00:00Z`).getTime());
+
+/**
+ * May this signed-in HR / Admin person act on this login? Superadmins never; admins only
+ * by Admin; client logins are not people (they are Operations' clients) — so HR can never
+ * hand a staff role to a client account or bring back someone Admin switched off.
+ */
+async function guardTarget(req, person) {
+  if (person.type === 'psychologist') {
+    const { data: p, error } = await supabaseAdmin.from('psychologists').select('id').eq('id', person.id).maybeSingle();
+    if (error) throw error;
+    return p ? null : [404, 'Person not found.'];
+  }
+  const { data: u, error } = await supabaseAdmin.from('users').select('role').eq('id', person.id).maybeSingle();
+  if (error) throw error;
+  if (!u) return [404, 'Person not found.'];
+  if (!STAFF_USER_ROLES.includes(u.role)) return [400, 'That login is not a Koott staff member.'];
+  if (u.role === 'superadmin') return [403, 'The superadmin is managed by the superadmin.'];
+  if (u.role === 'admin' && !isAdmin(req.user)) return [403, 'Only Admin can change an admin login.'];
+  return null;
+}
 
 async function upsertProfile(person, fields) {
   const row = { person_type: person.type, person_id: person.id, ...fields, updated_at: new Date().toISOString() };
@@ -60,6 +82,8 @@ async function onboard(req, res) {
     if (!name || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return fail(res, 400, 'Name and a valid email are needed.');
     if (!ONBOARDABLE_ROLES.includes(role)) return fail(res, 400, 'Pick a role.');
     if (role === 'admin' && !isAdmin(req.user)) return fail(res, 403, 'Only Admin can create another admin.');
+    if (b.start_date && !validDay(b.start_date)) return fail(res, 400, 'Start date must be a date (YYYY-MM-DD).');
+    if (b.team_id && !UUID_RE.test(String(b.team_id))) return fail(res, 400, 'Unknown team.');
 
     const [{ data: takenUser }, { data: takenPsych }] = await Promise.all([
       supabaseAdmin.from('users').select('id').eq('email', email).maybeSingle(),
@@ -120,6 +144,10 @@ async function updatePerson(req, res) {
     const person = parsePerson(req.params.type, req.params.id);
     if (!person) return fail(res, 400, 'Unknown person.');
     const b = req.body || {};
+    const denied = await guardTarget(req, person);
+    if (denied) return fail(res, denied[0], denied[1]);
+    if (b.start_date && !validDay(b.start_date)) return fail(res, 400, 'Start date must be a date (YYYY-MM-DD).');
+    if (Array.isArray(b.team_ids) && b.team_ids.some((t) => !UUID_RE.test(String(t)))) return fail(res, 400, 'Unknown team.');
     const role = req.user.role;
     const canHr = isAdmin(req.user) || role === 'hr';
     const canPay = isAdmin(req.user) || role === 'finance' || role === 'hr';
@@ -217,6 +245,8 @@ async function reactivate(req, res) {
   try {
     const person = parsePerson(req.params.type, req.params.id);
     if (!person) return fail(res, 400, 'Unknown person.');
+    const denied = await guardTarget(req, person);
+    if (denied) return fail(res, denied[0], denied[1]);
     const now = new Date().toISOString();
     if (person.type === 'user') await supabaseAdmin.from('users').update({ is_active: true, updated_at: now }).eq('id', person.id);
     else await supabaseAdmin.from('psychologists').update({ is_active: true, updated_at: now }).eq('id', person.id);
@@ -241,8 +271,11 @@ async function getTeams(req, res) {
     if (teams.error) return handle(res, teams.error, 'load teams');
     const refs = [...(members.data || []).map((m) => ({ type: m.person_type, id: m.person_id })),
       ...(teams.data || []).filter((t) => t.lead_person_id).map((t) => ({ type: t.lead_person_type, id: t.lead_person_id }))];
+    if (members.error) return handle(res, members.error, 'load teams');
     const names = await namesFor(refs);
-    const orphans = (members.data || []).filter((m) => !names[key(m.person_type, m.person_id)]);
+    // A member is removed only when the name lookups really worked: a Supabase blip must
+    // never read as "every member was deleted" and empty the teams.
+    const orphans = names[COMPLETE] ? (members.data || []).filter((m) => !names[key(m.person_type, m.person_id)]) : [];
     orphans.forEach((m) => {
       supabaseAdmin.from('team_members').delete().eq('team_id', m.team_id).eq('person_type', m.person_type).eq('person_id', m.person_id).then(() => {}, () => {});
     });

@@ -64,6 +64,8 @@ async function list(req, res) {
 
 async function update(req, res) {
   try {
+    if (!require('../utils/staffRoles').UUID_RE.test(String(req.params.id || ''))) return fail(res, 404, 'Application not found.');
+    if (req.body.interview_at && Number.isNaN(new Date(req.body.interview_at).getTime())) return fail(res, 400, 'The interview time is not a date.');
     const patch = { updated_at: new Date().toISOString() };
     if (req.body.stage !== undefined) {
       if (!STAGES.includes(req.body.stage)) return fail(res, 400, 'Unknown stage.');
@@ -72,8 +74,10 @@ async function update(req, res) {
     if (req.body.notes !== undefined) patch.notes = req.body.notes ? String(req.body.notes).slice(0, 4000) : null;
     if (req.body.interview_at !== undefined) patch.interview_at = req.body.interview_at ? new Date(req.body.interview_at).toISOString() : null;
     if (req.body.interviewer !== undefined) patch.interviewer = req.body.interviewer ? String(req.body.interviewer).slice(0, 120) : null;
-    const { data, error } = await supabaseAdmin.from('job_applications').update(patch).eq('id', req.params.id).select('*').single();
+    const { data: rows, error } = await supabaseAdmin.from('job_applications').update(patch).eq('id', req.params.id).select('*');
     if (error) return handle(res, error, 'update the application');
+    const data = (rows || [])[0];
+    if (!data) return fail(res, 404, 'Application not found.');
     if (patch.stage && patch.stage !== 'applied') {
       await supabaseAdmin.from('tasks').update({ status: 'done', completed_at: patch.updated_at, updated_at: patch.updated_at })
         .eq('auto_key', `application:${data.id}`).not('status', 'in', '(done,cancelled)');

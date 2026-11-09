@@ -9,10 +9,12 @@
 const crypto = require('crypto');
 const { supabaseAdmin } = require('../config/supabase');
 const { hashPassword } = require('../utils/helpers');
-const { personOf } = require('../utils/staffRoles');
+const { personOf, UUID_RE } = require('../utils/staffRoles');
+const validDate = (v) => !Number.isNaN(new Date(v).getTime());
 const { key, namesFor, isMissingTable, NOT_READY } = require('../utils/people');
 const { STAGES, SOURCES, upsertSourceLead } = require('../utils/leads');
 const { normalizePhone } = require('../utils/phoneVerification');
+const { fetchAll } = require('../utils/fetchAll');
 
 const ok = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
@@ -40,6 +42,31 @@ async function withNames(leads) {
   }));
 }
 
+/**
+ * Stage / source totals for the Leads header. Every Operations screen polls the list each
+ * minute, so the totals are worked out once per 30 s for everyone (COUNT queries: nothing
+ * downloaded, and right past Supabase's 1,000-row answer limit).
+ */
+let countsCache = { at: 0, value: null, pending: null };
+async function leadCounts() {
+  if (countsCache.value && Date.now() - countsCache.at < 30 * 1000) return countsCache.value;
+  if (countsCache.pending) return countsCache.pending;
+  const countOf = (col, v) => supabaseAdmin.from('leads').select('id', { count: 'exact', head: true }).eq(col, v);
+  countsCache.pending = Promise.all([Promise.all(STAGES.map((s) => countOf('stage', s))), Promise.all(SOURCES.map((s) => countOf('source', s)))])
+    .then(([stageCounts, sourceCounts]) => {
+      const value = {
+        byStage: Object.fromEntries(STAGES.map((s, i) => [s, stageCounts[i].count || 0])),
+        bySource: Object.fromEntries(SOURCES.map((s, i) => [s, sourceCounts[i].count || 0]).filter(([, n]) => n)),
+      };
+      if (![...stageCounts, ...sourceCounts].some((r) => r.error)) countsCache = { at: Date.now(), value, pending: null };
+      return value;
+    })
+    .finally(() => { countsCache.pending = null; });
+  return countsCache.pending;
+}
+/** A lead changed: the next list shows fresh totals. */
+const dropLeadCounts = () => { countsCache = { at: 0, value: null, pending: null }; };
+
 async function listLeads(req, res) {
   try {
     let q = supabaseAdmin.from('leads').select('*').order('created_at', { ascending: false }).limit(1000);
@@ -51,11 +78,11 @@ async function listLeads(req, res) {
       const t = String(req.query.q).replace(/[%,()]/g, ' ').trim().slice(0, 60);
       if (t) q = q.or(`name.ilike.%${t}%,phone.ilike.%${t}%,email.ilike.%${t}%`);
     }
-    const [{ data, error }, counts] = await Promise.all([q, supabaseAdmin.from('leads').select('stage, source').limit(20000)]);
+    // Counts as COUNT queries (polled every minute by each Operations screen): no rows are
+    // downloaded, and they stay right past Supabase's 1,000-row answer limit.
+    const [{ data, error }, counts] = await Promise.all([q, leadCounts()]);
     if (error) return handle(res, error, 'load leads');
-    const byStage = Object.fromEntries(STAGES.map((s) => [s, 0]));
-    const bySource = {};
-    (counts.data || []).forEach((r) => { byStage[r.stage] = (byStage[r.stage] || 0) + 1; bySource[r.source] = (bySource[r.source] || 0) + 1; });
+    const { byStage, bySource } = counts;
     return ok(res, { leads: await withNames(data || []), counts: { byStage, bySource }, stages: STAGES, sources: SOURCES });
   } catch (e) {
     return handle(res, e, 'load leads');
@@ -77,6 +104,7 @@ async function createLead(req, res) {
       owner_type: me.type, owner_id: me.id,
     }).select('*').single();
     if (error) return handle(res, error, 'add the lead');
+    dropLeadCounts();
     const [lead] = await withNames([data]);
     return ok(res, { lead }, 201);
   } catch (e) {
@@ -87,9 +115,13 @@ async function createLead(req, res) {
 async function updateLead(req, res) {
   try {
     const b = req.body || {};
+    if (!UUID_RE.test(String(req.params.id || ''))) return fail(res, 404, 'Lead not found.');
     const { data: lead, error } = await supabaseAdmin.from('leads').select('*').eq('id', req.params.id).maybeSingle();
     if (error) return handle(res, error, 'update the lead');
     if (!lead) return fail(res, 404, 'Lead not found.');
+    if (b.next_follow_up_at && !validDate(b.next_follow_up_at)) return fail(res, 400, 'The follow-up date is not a date.');
+    // A converted lead is a client now: its stage is history and stays put.
+    if (lead.stage === 'converted' && b.stage !== undefined && b.stage !== 'converted') return fail(res, 400, 'This lead is already a client; its stage cannot change.');
     const now = new Date().toISOString();
     const patch = { updated_at: now };
     ['name', 'email', 'notes', 'source_detail'].forEach((f) => { if (b[f] !== undefined) patch[f] = b[f] ? String(b[f]).slice(0, f === 'notes' ? 5000 : 200) : null; });
@@ -98,7 +130,7 @@ async function updateLead(req, res) {
     if (b.owner !== undefined) {
       if (b.owner === null || b.owner === '') { patch.owner_type = null; patch.owner_id = null; } else {
         const [t, id] = String(b.owner).split(':');
-        if (!['user', 'psychologist'].includes(t) || !id) return fail(res, 400, 'Unknown owner.');
+        if (b.owner !== 'me' && (!['user', 'psychologist'].includes(t) || !UUID_RE.test(String(id || '')))) return fail(res, 400, 'Unknown owner.');
         patch.owner_type = t; patch.owner_id = id;
       }
     }
@@ -116,6 +148,7 @@ async function updateLead(req, res) {
     if (b.lost_reason !== undefined) patch.lost_reason = b.lost_reason ? String(b.lost_reason).slice(0, 500) : null;
     const { data: updated, error: upErr } = await supabaseAdmin.from('leads').update(patch).eq('id', lead.id).select('*').single();
     if (upErr) return handle(res, upErr, 'update the lead');
+    dropLeadCounts();
     // The "call this lead" task closes once someone has been in touch.
     if (patch.contacted_at) {
       await supabaseAdmin.from('tasks').update({ status: 'done', completed_at: now, updated_at: now })
@@ -148,10 +181,25 @@ async function findClient(phone, email) {
 
 async function convertLead(req, res) {
   try {
+    if (!UUID_RE.test(String(req.params.id || ''))) return fail(res, 404, 'Lead not found.');
     const { data: lead, error } = await supabaseAdmin.from('leads').select('*').eq('id', req.params.id).maybeSingle();
     if (error) return handle(res, error, 'convert the lead');
     if (!lead) return fail(res, 404, 'Lead not found.');
     if (lead.stage === 'converted' && lead.client_id) return fail(res, 400, 'This lead is already a client.');
+    if (req.body.client_id && !UUID_RE.test(String(req.body.client_id))) return fail(res, 400, 'Unknown client.');
+    if (req.body.client_id) {
+      const { data: c } = await supabaseAdmin.from('clients').select('id').eq('id', req.body.client_id).maybeSingle();
+      if (!c) return fail(res, 404, 'Client not found.');
+    }
+    // Claim the conversion first (one request wins): pressing "Convert" twice, or two people
+    // at once, never creates two client logins. The claim is a write that only succeeds
+    // while the row is exactly as we read it (same updated_at).
+    const claimAt = new Date().toISOString();
+    const { data: claimed, error: claimErr } = await supabaseAdmin.from('leads')
+      .update({ updated_at: claimAt })
+      .eq('id', lead.id).eq('updated_at', lead.updated_at).or('stage.neq.converted,client_id.is.null').select('id');
+    if (claimErr) return handle(res, claimErr, 'convert the lead');
+    if (!claimed || !claimed.length) return fail(res, 409, 'This lead was just changed or converted by someone else. Reload it.');
 
     let clientId = req.body.client_id || lead.client_id || null;
     let created = false;
@@ -184,6 +232,7 @@ async function convertLead(req, res) {
       meta: { ...(lead.meta || {}), converted_by: key(me.type, me.id), client_created: created },
     }).eq('id', lead.id).select('*').single();
     if (upErr) return handle(res, upErr, 'convert the lead');
+    dropLeadCounts();
     await supabaseAdmin.from('tasks').update({ status: 'done', completed_at: now, updated_at: now })
       .eq('auto_key', `lead_call:${lead.id}`).not('status', 'in', '(done,cancelled)');
     const [out] = await withNames([updated]);
@@ -197,17 +246,13 @@ async function convertLead(req, res) {
 /** Marketing: leads, converted and paying clients per source over a date range. */
 async function leadSources(req, res) {
   try {
+    if ((req.query.from && !validDate(req.query.from)) || (req.query.to && !/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.to)))) return fail(res, 400, 'Dates must be YYYY-MM-DD.');
     const from = req.query.from ? new Date(req.query.from).toISOString() : new Date(Date.now() - 90 * 864e5).toISOString();
-    const to = req.query.to ? new Date(`${req.query.to}T23:59:59`).toISOString() : new Date().toISOString();
-    const { data, error } = await supabaseAdmin.from('leads').select('source, source_detail, stage, client_id, lost_reason')
-      .gte('created_at', from).lte('created_at', to).limit(20000);
-    if (error) return handle(res, error, 'load lead sources');
+    const to = req.query.to ? new Date(`${req.query.to}T23:59:59+05:30`).toISOString() : new Date().toISOString();
+    const data = await fetchAll(() => supabaseAdmin.from('leads').select('id, source, source_detail, stage, client_id, lost_reason')
+      .gte('created_at', from).lte('created_at', to).order('id'));
     const clientIds = [...new Set((data || []).map((l) => l.client_id).filter(Boolean))];
-    let paying = new Set();
-    if (clientIds.length) {
-      const { data: pays } = await supabaseAdmin.from('payments').select('client_id').in('client_id', clientIds.slice(0, 1000)).eq('status', 'success');
-      paying = new Set((pays || []).map((p) => p.client_id));
-    }
+    const paying = await payingClients(clientIds);
     const rows = {};
     const lost = {};
     (data || []).forEach((l) => {
@@ -263,6 +308,16 @@ async function inboundLead(req, res) {
   return ok(res, { saved: Boolean(id) }, 201);
 }
 
+/** Which of these clients have a successful payment (in chunks: long .in() lists break the URL). */
+async function payingClients(clientIds) {
+  const paying = new Set();
+  for (let i = 0; i < clientIds.length; i += 150) {
+    const rows = await fetchAll(() => supabaseAdmin.from('payments').select('id, client_id').in('client_id', clientIds.slice(i, i + 150)).eq('status', 'success').order('id'));
+    rows.forEach((p) => paying.add(p.client_id));
+  }
+  return paying;
+}
+
 module.exports = { listLeads, createLead, updateLead, convertLead, leadSources, inboundLead };
 
 /** Admin: who viewed or changed client, lead and session records (audit_logs, utils/accessLog). */
@@ -275,7 +330,7 @@ async function accessLog(req, res) {
     if (['client', 'lead', 'session'].includes(req.query.resource)) q = q.eq('resource', req.query.resource);
     if (req.query.who) q = q.ilike('user_email', `%${String(req.query.who).replace(/[%,()]/g, ' ').slice(0, 80)}%`);
     if (req.query.record) q = q.eq('resource_id', String(req.query.record));
-    if (req.query.from) q = q.gte('timestamp', new Date(req.query.from).toISOString());
+    if (req.query.from) { if (!validDate(req.query.from)) return fail(res, 400, 'Bad date.'); q = q.gte('timestamp', new Date(req.query.from).toISOString()); }
     const { data, error } = await q;
     if (error) return handle(res, error, 'load the access record');
     const rows = data || [];
@@ -359,20 +414,17 @@ module.exports.clientTimeline = clientTimeline;
  */
 async function eventResults(req, res) {
   try {
-    const [regs, pages, leads] = await Promise.all([
-      supabaseAdmin.from('event_registrations').select('id, event_slug, event_title, attendance_status, metadata, created_at').limit(20000),
-      supabaseAdmin.from('event_pages').select('slug, title, is_published').limit(500),
-      supabaseAdmin.from('leads').select('source_ref, source_detail, stage, client_id').eq('source', 'event').limit(20000),
+    const [regRows, pages, leadRows] = await Promise.all([
+      fetchAll(() => supabaseAdmin.from('event_registrations').select('id, event_slug, event_title, attendance_status, metadata, created_at').order('id')),
+      supabaseAdmin.from('event_pages').select('slug, title, is_published').limit(1000),
+      fetchAll(() => supabaseAdmin.from('leads').select('id, source_ref, source_detail, stage, client_id').eq('source', 'event').order('id')),
     ]);
-    if (regs.error) return handle(res, regs.error, 'load event results');
+    const regs = { data: regRows };
+    const leads = { data: leadRows };
     const titleOf = new Map((pages.data || []).map((p) => [p.slug, p.title]));
     const leadByReg = new Map((leads.data || []).map((l) => [String(l.source_ref), l]));
     const clientIds = [...new Set((leads.data || []).map((l) => l.client_id).filter(Boolean))];
-    let paying = new Set();
-    if (clientIds.length) {
-      const { data: pays } = await supabaseAdmin.from('payments').select('client_id').in('client_id', clientIds.slice(0, 1000)).eq('status', 'success');
-      paying = new Set((pays || []).map((p) => p.client_id));
-    }
+    const paying = await payingClients(clientIds);
     const rows = {};
     (regs.data || []).forEach((r) => {
       const k = r.event_slug || 'unknown';
@@ -396,6 +448,7 @@ module.exports.eventResults = eventResults;
 async function logContact(req, res) {
   try {
     const channel = ['call', 'whatsapp', 'email'].includes(req.body.channel) ? req.body.channel : 'call';
+    if (!UUID_RE.test(String(req.params.id || ''))) return fail(res, 404, 'Lead not found.');
     const { data: lead, error } = await supabaseAdmin.from('leads').select('*').eq('id', req.params.id).maybeSingle();
     if (error) return handle(res, error, 'log the contact');
     if (!lead) return fail(res, 404, 'Lead not found.');

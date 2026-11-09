@@ -7,11 +7,17 @@ const { supabaseAdmin } = require('../config/supabase');
 const { STAFF_USER_ROLES, ROLE_LABEL } = require('./staffRoles');
 
 const key = (type, id) => `${type}:${id}`;
+const COMPLETE = Symbol('namesFor.complete');
 const psychName = (p) => `${p.first_name || ''} ${p.last_name || ''}`.trim() || p.email || 'Therapist';
 
 /** Missing table (migration 0021 not run yet) → a clear message instead of a 500 with SQL text. */
 function isMissingTable(error) {
-  return Boolean(error) && (error.code === '42P01' || error.code === 'PGRST205' || /does not exist|schema cache/i.test(error.message || ''));
+  if (!error) return false;
+  if (error.code === '42P01' || error.code === 'PGRST205') return true;
+  // "Could not query the database for the schema cache" (PGRST002) and timeouts happen when
+  // Supabase is busy: that is not a missing migration, and must not tell staff to run SQL.
+  if (error.code === 'PGRST002' || /could not query|timeout|fetch failed/i.test(error.message || '')) return false;
+  return /relation .* does not exist|Could not find the table .* in the schema cache/i.test(error.message || '');
 }
 const NOT_READY = 'The tasks / people tables are not set up yet. Run backend/supabase/RUN_PENDING_0021.sql in Supabase.';
 
@@ -81,6 +87,8 @@ async function namesFor(refs) {
     ids.psychologist.size ? supabaseAdmin.from('psychologists').select('id, first_name, last_name, email').in('id', [...ids.psychologist]) : { data: [] },
     ids.team.size ? supabaseAdmin.from('teams').select('id, name').in('id', [...ids.team]) : { data: [] },
   ]);
+  // Non-enumerable flag: every lookup answered (callers that delete "unknown" rows check it).
+  Object.defineProperty(out, COMPLETE, { value: ![u, p, t].some((r) => r.error), enumerable: false });
   (u.data || []).forEach((x) => { out[key('user', x.id)] = { name: x.name || x.email, role: x.role }; });
   (p.data || []).forEach((x) => { out[key('psychologist', x.id)] = { name: psychName(x), role: 'psychologist' }; });
   (t.data || []).forEach((x) => { out[key('team', x.id)] = { name: `${x.name} team`, role: 'team' }; });
@@ -106,8 +114,12 @@ async function teamByName(name) {
   const { data } = await supabaseAdmin.from('teams').select('id, name, lead_person_type, lead_person_id').eq('name', name).maybeSingle();
   if (data) return data;
   const { data: created, error } = await supabaseAdmin.from('teams').insert({ name }).select('id, name, lead_person_type, lead_person_id').single();
+  if (error && error.code === '23505') { // created by a parallel request a moment ago
+    const again = await supabaseAdmin.from('teams').select('id, name, lead_person_type, lead_person_id').eq('name', name).maybeSingle();
+    if (again.data) return again.data;
+  }
   if (error) throw error;
   return created;
 }
 
-module.exports = { key, psychName, listPeople, namesFor, teamIdsOf, teamMembers, teamByName, isMissingTable, NOT_READY };
+module.exports = { COMPLETE, key, psychName, listPeople, namesFor, teamIdsOf, teamMembers, teamByName, isMissingTable, NOT_READY };

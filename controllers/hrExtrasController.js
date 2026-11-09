@@ -14,7 +14,7 @@
  */
 const crypto = require('crypto');
 const { supabaseAdmin } = require('../config/supabase');
-const { isAdmin, personOf } = require('../utils/staffRoles');
+const { isAdmin, personOf, UUID_RE } = require('../utils/staffRoles');
 const { key, namesFor, isMissingTable } = require('../utils/people');
 
 const NOT_READY = 'Documents and safety alerts need backend/supabase/RUN_PENDING_0022.sql to be run in Supabase.';
@@ -60,12 +60,15 @@ async function uploadDocument(req, res) {
     const me = personOf(req.user);
     const b = req.body || {};
     let person = me;
-    if (b.person && canManage(req.user)) { const [t, id] = String(b.person).split(':'); if (['user', 'psychologist'].includes(t) && id) person = { type: t, id }; }
+    if (b.person && canManage(req.user)) { const [t, id] = String(b.person).split(':'); if (['user', 'psychologist'].includes(t) && UUID_RE.test(String(id || ''))) person = { type: t, id }; }
     const title = String(b.title || '').trim().slice(0, 150);
     if (!title) return fail(res, 400, 'Give the document a name.');
     const kind = KINDS.includes(b.kind) ? b.kind : 'other';
     const expires = /^\d{4}-\d{2}-\d{2}$/.test(String(b.expires_on || '')) ? b.expires_on : null;
     let filePath = null;
+    if (req.file && !require('../utils/fileSniff').contentMatches(req.file.mimetype, req.file.buffer)) {
+      return fail(res, 400, 'That file is not what its type says. PDF, Word or image files only.');
+    }
     if (req.file) {
       filePath = `${person.type}-${person.id}/${crypto.randomUUID().slice(0, 8)}__${cleanName(req.file.originalname)}`;
       const put = () => supabaseAdmin.storage.from(BUCKET).upload(filePath, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
@@ -88,6 +91,7 @@ async function uploadDocument(req, res) {
 }
 
 async function getDoc(req) {
+  if (!UUID_RE.test(String(req.params.id || ''))) return null;
   const { data } = await supabaseAdmin.from('staff_documents').select('*').eq('id', req.params.id).maybeSingle();
   if (!data) return null;
   const me = personOf(req.user);
@@ -111,6 +115,8 @@ async function updateDocument(req, res) {
   try {
     const doc = await getDoc(req);
     if (!doc) return fail(res, 404, 'Document not found.');
+    // A document HR filed (licence, contract) keeps the expiry HR set: only HR / Admin change it.
+    if (!canManage(req.user) && doc.uploaded_by !== req.user.id) return fail(res, 403, 'Ask HR to change this document.');
     const patch = { updated_at: new Date().toISOString() };
     if (req.body.title !== undefined) patch.title = String(req.body.title || '').trim().slice(0, 150) || doc.title;
     if (req.body.kind !== undefined && KINDS.includes(req.body.kind)) patch.kind = req.body.kind;
@@ -184,7 +190,7 @@ async function raiseAlert(req, res) {
     const me = personOf(req.user);
     const summary = String(req.body.summary || '').trim().slice(0, 1500);
     if (!summary) return fail(res, 400, 'Say briefly what is happening.');
-    const clientId = req.body.client_id || null;
+    const clientId = UUID_RE.test(String(req.body.client_id || '')) ? req.body.client_id : null;
     const clientRef = clientId ? `K-${String(clientId).replace(/-/g, '').slice(0, 6).toUpperCase()}` : null;
     const { data: alert, error } = await supabaseAdmin.from('safety_alerts').insert({
       raised_by_type: me.type, raised_by_id: me.id, client_id: clientId, client_ref: clientRef, summary,
@@ -204,9 +210,9 @@ async function raiseAlert(req, res) {
       await Promise.all([...new Set(to)].map((addr) => emailService.sendEmail({
         to: addr,
         subject: `URGENT safety concern from ${from}`,
-        html: `<p><strong>${from}</strong> raised an urgent safety concern${clientRef ? ` about client ${clientRef}` : ''}.</p>
-<p style="white-space:pre-wrap">${summary.replace(/</g, '&lt;')}</p>
-${alert.contact_now ? `<p>Reach them now: <strong>${String(alert.contact_now).replace(/</g, '&lt;')}</strong></p>` : ''}
+        html: `<p><strong>${String(from).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)}</strong> raised an urgent safety concern${clientRef ? ` about client ${clientRef}` : ''}.</p>
+<p style="white-space:pre-wrap">${summary.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)}</p>
+${alert.contact_now ? `<p>Reach them now: <strong>${String(alert.contact_now).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)}</strong></p>` : ''}
 <p><a href="${site}/admin/safety">Open the alert</a> and acknowledge it so they know you have it.</p>`,
       }).catch((e) => console.error('safety alert email failed:', e.message))));
     }
@@ -247,11 +253,22 @@ async function updateAlert(req, res) {
     const lead = await getSetting('clinical_lead');
     const isLead = lead && lead.type === me.type && lead.id === me.id;
     if (!isAdmin(req.user) && !isLead) return fail(res, 403, 'Only the clinical lead or Admin.');
+    if (!UUID_RE.test(String(req.params.id || ''))) return fail(res, 404, 'Alert not found.');
+    const { data: current, error: getErr } = await supabaseAdmin.from('safety_alerts').select('id, status').eq('id', req.params.id).maybeSingle();
+    if (getErr) return handle(res, getErr, 'update the alert');
+    if (!current) return fail(res, 404, 'Alert not found.');
+    // open -> acknowledged -> closed; a closed alert stays closed.
+    const next = req.body.status;
+    if (!['acknowledged', 'closed'].includes(next)) return fail(res, 400, 'Status is acknowledged or closed.');
+    if (current.status === 'closed') return fail(res, 409, 'This alert is already closed.');
+    if (next === 'acknowledged' && current.status === 'acknowledged') return ok(res, { alert: current });
     const patch = { updated_at: new Date().toISOString() };
-    if (req.body.status === 'acknowledged') { patch.status = 'acknowledged'; patch.acknowledged_by = req.user.id; patch.acknowledged_at = patch.updated_at; }
-    if (req.body.status === 'closed') { patch.status = 'closed'; patch.closed_note = req.body.note ? String(req.body.note).slice(0, 1000) : null; }
-    const { data, error } = await supabaseAdmin.from('safety_alerts').update(patch).eq('id', req.params.id).select('*').single();
+    if (next === 'acknowledged') { patch.status = 'acknowledged'; patch.acknowledged_by = req.user.id; patch.acknowledged_at = patch.updated_at; }
+    if (next === 'closed') { patch.status = 'closed'; patch.closed_note = req.body.note ? String(req.body.note).slice(0, 1000) : null; }
+    const { data: rows, error } = await supabaseAdmin.from('safety_alerts').update(patch).eq('id', current.id).eq('status', current.status).select('*');
     if (error) return handle(res, error, 'update the alert');
+    const data = (rows || [])[0];
+    if (!data) return fail(res, 409, 'Someone else updated this alert a moment ago.');
     if (patch.status === 'acknowledged') {
       // Tell the therapist someone has it (dashboard notification, not a task).
       await supabaseAdmin.from('task_notifications').insert({

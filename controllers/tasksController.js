@@ -10,7 +10,7 @@
  * teams; the people concerned get a notification in their dashboard (and an email).
  */
 const { supabaseAdmin } = require('../config/supabase');
-const { isAdmin, personOf } = require('../utils/staffRoles');
+const { isAdmin, personOf, UUID_RE } = require('../utils/staffRoles');
 const { key, namesFor, teamIdsOf, teamMembers, listPeople, teamByName, isMissingTable, NOT_READY } = require('../utils/people');
 
 const STATUSES = ['todo', 'in_progress', 'waiting', 'done', 'cancelled'];
@@ -47,10 +47,30 @@ const TEMPLATES = {
   },
 };
 
+const isUuid = (v) => UUID_RE.test(String(v || ''));
+const bad = (message) => Object.assign(new Error(message), { status: 400 });
+/** A date the API was given, or null; throws a 400 for something that is not a date. */
+function parseDate(v, what = 'deadline') {
+  if (v === undefined || v === null || v === '') return null;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) throw bad(`The ${what} is not a date.`);
+  return d.toISOString();
+}
+/** Links open in the dashboard: http(s) or a path on this site. Never javascript:/data:. */
+function safeLinkUrl(v) {
+  if (!v) return null;
+  const s = String(v).trim().slice(0, 500);
+  if (/^\/(?!\/)/.test(s) || /^https?:\/\//i.test(s)) return s;
+  throw bad('Links must start with https:// or /.');
+}
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
 const ok = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
 const handle = (res, error, what) => {
+  if (error?.status === 400) return fail(res, 400, error.message);
   if (isMissingTable(error)) return fail(res, 503, NOT_READY);
+  if (error?.code === '22P02') return fail(res, 400, 'That id is not valid.'); // malformed uuid reached Postgres
   console.error(`tasks: ${what}:`, error?.message || error);
   return fail(res, 500, `Could not ${what}.`);
 };
@@ -79,6 +99,19 @@ async function canSee(user, task) {
   return false;
 }
 
+/** canSee for someone other than the signed-in user (an @mention). */
+async function personCanSee(person, task) {
+  if (task.creator_type === person.type && task.creator_id === person.id) return true;
+  if (task.assignee_type === person.type && task.assignee_id === person.id) return true;
+  if (task.claimed_by_type === person.type && task.claimed_by_id === person.id) return true;
+  if (task.assignee_type === 'team' && (await teamIdsOf(person)).includes(task.assignee_id)) return true;
+  if (person.type === 'user') {
+    const { data } = await supabaseAdmin.from('users').select('role').eq('id', person.id).maybeSingle();
+    return isAdmin(data);
+  }
+  return false;
+}
+
 /* --------------------------------------------------------------- helpers */
 
 async function recipientsOf(task) {
@@ -104,17 +137,66 @@ async function notify(people, task, kind, message, actor, dedupeKey) {
       recipient_type: p.type, recipient_id: p.id, task_id: task.id, kind, message,
       dedupe_key: dedupeKey ? `${dedupeKey}:${key(p.type, p.id)}` : null,
     }));
-    await supabaseAdmin.from('task_notifications').upsert(rows, { onConflict: 'dedupe_key', ignoreDuplicates: true });
+    let fresh = unique;
+    if (dedupeKey) {
+      // Only the rows really inserted come back: a reminder that already went out (the runner
+      // passes every 15 minutes) is not emailed again.
+      const { data: inserted, error } = await supabaseAdmin.from('task_notifications')
+        .upsert(rows, { onConflict: 'dedupe_key', ignoreDuplicates: true }).select('recipient_type, recipient_id');
+      if (error) throw error;
+      fresh = unique.filter((p) => (inserted || []).some((r) => r.recipient_type === p.type && r.recipient_id === p.id));
+    } else {
+      const { error } = await supabaseAdmin.from('task_notifications').insert(rows);
+      if (error) throw error;
+    }
+    if (!fresh.length) return;
     // WhatsApp for URGENT tasks, once a Meta-approved template is set (INTERAKT_TPL_URGENT_TASK,
     // body {{1}} = task title, {{2}} = deadline). Off until then.
     if (task.priority === 'urgent' && kind === 'assigned' && process.env.INTERAKT_TPL_URGENT_TASK) {
-      whatsappPeople(unique, task).catch(() => {});
+      whatsappPeople(fresh, task).catch(() => {});
     }
     if (process.env.TASK_EMAILS === 'off') return;
-    emailPeople(unique, task, message).catch(() => {});
+    emailPeople(fresh, task, message).catch(() => {});
   } catch (e) {
     console.warn('tasks: notification not saved:', e.message);
   }
+}
+
+/**
+ * Many deduplicated notifications at once (the deadline reminders): one upsert per 500
+ * rows instead of one round trip per task, and email only for rows that are new.
+ * entries: [{ people, task, kind, message, dedupeKey }]. Returns how many were new.
+ */
+async function notifyMany(entries) {
+  const rows = [];
+  const byKey = new Map();
+  entries.forEach((e) => {
+    const seen = new Set();
+    e.people.forEach((p) => {
+      if (!p?.id || !PERSON_TYPES.includes(p.type) || seen.has(key(p.type, p.id))) return;
+      seen.add(key(p.type, p.id));
+      const dk = `${e.dedupeKey}:${key(p.type, p.id)}`;
+      byKey.set(dk, { entry: e, person: p });
+      rows.push({ recipient_type: p.type, recipient_id: p.id, task_id: e.task.id, kind: e.kind, message: e.message, dedupe_key: dk });
+    });
+  });
+  const fresh = [];
+  for (let i = 0; i < rows.length; i += 500) {
+    const { data, error } = await supabaseAdmin.from('task_notifications')
+      .upsert(rows.slice(i, i + 500), { onConflict: 'dedupe_key', ignoreDuplicates: true }).select('dedupe_key');
+    if (error) throw error;
+    (data || []).forEach((r) => { if (byKey.has(r.dedupe_key)) fresh.push(byKey.get(r.dedupe_key)); });
+  }
+  if (process.env.TASK_EMAILS !== 'off') {
+    const perTask = new Map();
+    fresh.forEach(({ entry, person }) => {
+      const k = entry.task.id;
+      if (!perTask.has(k)) perTask.set(k, { entry, people: [] });
+      perTask.get(k).people.push(person);
+    });
+    for (const { entry, people } of perTask.values()) await emailPeople(people, entry.task, entry.message).catch(() => {});
+  }
+  return fresh.length;
 }
 
 async function whatsappPeople(people, task) {
@@ -144,13 +226,21 @@ async function emailPeople(people, task, message) {
     users.length ? supabaseAdmin.from('users').select('email').in('id', users) : { data: [] },
     psychs.length ? supabaseAdmin.from('psychologists').select('email').in('id', psychs) : { data: [] },
   ]);
-  const site = (process.env.FRONTEND_URL || 'https://www.koott.in').replace(/\/$/, '');
   const emails = [...(u.data || []), ...(p.data || [])].map((r) => r.email).filter((e) => e && !/\.invalid$/i.test(e));
   await Promise.all(emails.map((to) => emailService.sendEmail({
     to,
-    subject: `Koott task: ${task.title}`,
-    html: `<p>${message}</p><p><strong>${task.title}</strong>${task.deadline ? `<br>Due ${new Date(task.deadline).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: task.deadline_has_time ? 'short' : undefined })}` : ''}</p><p><a href="${site}/tasks/open?id=${task.id}">Open the task</a></p>`,
+    subject: `Koott task: ${String(task.title).replace(/[\r\n]+/g, ' ').slice(0, 150)}`,
+    html: emailHtml(task, message),
   }).catch(() => {})));
+}
+
+/** The task email body. Titles come from staff and from public forms: always escaped. */
+function emailHtml(task, message) {
+  const site = (process.env.FRONTEND_URL || 'https://www.koott.in').replace(/\/$/, '');
+  const due = task.deadline
+    ? `<br>Due ${esc(new Date(task.deadline).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: task.deadline_has_time ? 'short' : undefined }))}`
+    : '';
+  return `<p>${esc(message)}</p><p><strong>${esc(task.title)}</strong>${due}</p><p><a href="${site}/tasks/open?id=${encodeURIComponent(task.id)}">Open the task</a></p>`;
 }
 
 async function logEvent(taskId, actor, action, fromValue, toValue) {
@@ -227,7 +317,7 @@ async function createTask(fields, creator) {
     checklist: cleanChecklist(fields.checklist),
     status: STATUSES.includes(fields.status) ? fields.status : 'todo',
     priority: PRIORITIES.includes(fields.priority) ? fields.priority : 'normal',
-    deadline: fields.deadline ? new Date(fields.deadline).toISOString() : null,
+    deadline: parseDate(fields.deadline),
     deadline_has_time: Boolean(fields.deadline_has_time),
     assignee_type: fields.assignee_type,
     assignee_id: fields.assignee_id,
@@ -236,12 +326,13 @@ async function createTask(fields, creator) {
     link_type: LINK_TYPES.includes(fields.link_type) ? fields.link_type : null,
     link_id: fields.link_id ? String(fields.link_id).slice(0, 200) : null,
     link_label: fields.link_label ? String(fields.link_label).slice(0, 200) : null,
-    link_url: fields.link_url ? String(fields.link_url).slice(0, 500) : null,
+    link_url: safeLinkUrl(fields.link_url),
     recurrence: fields.recurrence && nextOccurrence(fields.recurrence) ? fields.recurrence : null,
     template_key: fields.template_key || null,
     auto_key: fields.auto_key || null,
   };
-  if (!row.title) throw Object.assign(new Error('A task needs a title.'), { status: 400 });
+  if (!row.title) throw bad('A task needs a title.');
+  if (!ASSIGNEE_TYPES.includes(row.assignee_type) || !isUuid(row.assignee_id)) throw bad('Pick who the task is for.');
   const query = supabaseAdmin.from('tasks');
   const { data, error } = row.auto_key
     ? await query.upsert(row, { onConflict: 'auto_key', ignoreDuplicates: true }).select('*')
@@ -285,11 +376,12 @@ async function listTasks(req, res) {
     if (PRIORITIES.includes(req.query.priority)) q = q.eq('priority', req.query.priority);
     if (req.query.assignee) {
       const [t, id] = String(req.query.assignee).split(':');
-      if (ASSIGNEE_TYPES.includes(t) && id) q = q.eq('assignee_type', t).eq('assignee_id', id);
+      if (!ASSIGNEE_TYPES.includes(t) || !isUuid(id)) return fail(res, 400, 'Unknown assignee.');
+      q = q.eq('assignee_type', t).eq('assignee_id', id);
     }
     if (req.query.q) q = q.ilike('title', `%${String(req.query.q).replace(/[%,()]/g, ' ').slice(0, 80)}%`);
-    if (req.query.from) q = q.gte('deadline', new Date(req.query.from).toISOString());
-    if (req.query.to) q = q.lte('deadline', new Date(req.query.to).toISOString());
+    if (req.query.from) q = q.gte('deadline', parseDate(req.query.from, 'start date'));
+    if (req.query.to) q = q.lte('deadline', parseDate(req.query.to, 'end date'));
     if (req.query.link_type && req.query.link_id) q = q.eq('link_type', req.query.link_type).eq('link_id', String(req.query.link_id));
 
     const { data, error } = await q;
@@ -331,7 +423,15 @@ async function createTaskHandler(req, res) {
     const me = personOf(req.user);
     const assignee = parseAssignee(req.body, me);
     if (!assignee) return fail(res, 400, 'Pick who the task is for.');
-    let fields = { ...req.body, assignee_type: assignee.type, assignee_id: assignee.id };
+    // Only what a person may set: never auto_key (reserved for automatic tasks), creator,
+    // pick-up or a template the API does not offer.
+    const b = req.body || {};
+    let fields = {
+      title: b.title, details: b.details, checklist: b.checklist, status: b.status === 'cancelled' ? 'todo' : b.status,
+      priority: b.priority, deadline: b.deadline, deadline_has_time: b.deadline_has_time,
+      link_type: b.link_type, link_id: b.link_id, link_label: b.link_label, link_url: b.link_url, recurrence: b.recurrence,
+      assignee_type: assignee.type, assignee_id: assignee.id,
+    };
     if (req.body.template_key && TEMPLATES[req.body.template_key]) {
       const t = TEMPLATES[req.body.template_key];
       fields = {
@@ -340,13 +440,13 @@ async function createTaskHandler(req, res) {
         priority: req.body.priority || t.priority,
         recurrence: req.body.recurrence || t.recurrence || null,
         checklist: t.steps.map((text, i) => ({ id: `s${i}`, text, done: false })),
+        template_key: req.body.template_key,
       };
     }
     const task = await createTask(fields, me);
     const [enriched] = await enrich([task]);
     return ok(res, { task: enriched }, 201);
   } catch (e) {
-    if (e.status === 400) return fail(res, 400, e.message);
     return handle(res, e, 'create the task');
   }
 }
@@ -367,10 +467,15 @@ async function updateTask(req, res) {
     if (patch.priority !== undefined && !PRIORITIES.includes(patch.priority)) return fail(res, 400, 'Unknown priority.');
     if (patch.title !== undefined) { patch.title = String(patch.title).trim().slice(0, 300); if (!patch.title) return fail(res, 400, 'A task needs a title.'); }
     if (patch.checklist !== undefined) patch.checklist = cleanChecklist(patch.checklist);
-    if (patch.deadline !== undefined) patch.deadline = patch.deadline ? new Date(patch.deadline).toISOString() : null;
+    if (patch.deadline !== undefined) patch.deadline = parseDate(patch.deadline);
+    if (patch.link_url !== undefined) patch.link_url = safeLinkUrl(patch.link_url);
+    if (patch.details !== undefined) patch.details = patch.details ? String(patch.details).slice(0, 10000) : null;
+    if (patch.link_id !== undefined) patch.link_id = patch.link_id ? String(patch.link_id).slice(0, 200) : null;
+    if (patch.link_label !== undefined) patch.link_label = patch.link_label ? String(patch.link_label).slice(0, 200) : null;
+    if (patch.deadline_has_time !== undefined) patch.deadline_has_time = Boolean(patch.deadline_has_time);
     if (patch.assignee_type !== undefined || patch.assignee_id !== undefined) {
       const a = { type: patch.assignee_type || task.assignee_type, id: patch.assignee_id || task.assignee_id };
-      if (!ASSIGNEE_TYPES.includes(a.type) || !a.id) return fail(res, 400, 'Pick who the task is for.');
+      if (!ASSIGNEE_TYPES.includes(a.type) || !isUuid(a.id)) return fail(res, 400, 'Pick who the task is for.');
       patch.assignee_type = a.type; patch.assignee_id = a.id;
       patch.claimed_by_type = null; patch.claimed_by_id = null;
     }
@@ -384,8 +489,14 @@ async function updateTask(req, res) {
     if (patch.status && patch.status !== 'done') patch.completed_at = null;
     patch.updated_at = new Date().toISOString();
 
-    const { data: updated, error: upErr } = await supabaseAdmin.from('tasks').update(patch).eq('id', task.id).select('*').single();
+    // Written only if nobody changed the status since we read it: two people pressing
+    // "Done" at once give one completion (and one next repeat), not two.
+    let upd = supabaseAdmin.from('tasks').update(patch).eq('id', task.id);
+    if (patch.status !== undefined) upd = upd.eq('status', task.status);
+    const { data: rows, error: upErr } = await upd.select('*');
     if (upErr) return handle(res, upErr, 'update the task');
+    const updated = (rows || [])[0];
+    if (!updated) return fail(res, 409, 'Someone else changed this task a moment ago. Reload it and try again.');
 
     // History: one entry per field that changed.
     const tracked = ['title', 'status', 'priority', 'deadline', 'details', 'checklist', 'recurrence', 'link_label'];
@@ -428,10 +539,16 @@ async function claimTask(req, res) {
     const { data: task } = await supabaseAdmin.from('tasks').select('*').eq('id', req.params.id).maybeSingle();
     if (!task || !(await canSee(req.user, task))) return fail(res, 404, 'Task not found.');
     if (task.assignee_type !== 'team') return fail(res, 400, 'Only team tasks are picked up.');
-    const { data: updated, error } = await supabaseAdmin.from('tasks')
+    if (task.claimed_by_id && !(task.claimed_by_type === me.type && task.claimed_by_id === me.id)) {
+      return fail(res, 409, 'Someone already picked this task up.');
+    }
+    // Only while nobody has it: two people pressing "Pick it up" at once -> one wins.
+    const { data: rows, error } = await supabaseAdmin.from('tasks')
       .update({ claimed_by_type: me.type, claimed_by_id: me.id, status: task.status === 'todo' ? 'in_progress' : task.status, updated_at: new Date().toISOString() })
-      .eq('id', task.id).select('*').single();
+      .eq('id', task.id).or(`claimed_by_id.is.null,and(claimed_by_type.eq.${me.type},claimed_by_id.eq.${me.id})`).select('*');
     if (error) return handle(res, error, 'pick up the task');
+    const updated = (rows || [])[0];
+    if (!updated) return fail(res, 409, 'Someone already picked this task up.');
     await logEvent(task.id, me, 'claimed', null, { type: me.type, id: me.id });
     const [enriched] = await enrich([updated]);
     return ok(res, { task: enriched });
@@ -447,8 +564,17 @@ async function addComment(req, res) {
     if (!body) return fail(res, 400, 'Write a comment first.');
     const { data: task } = await supabaseAdmin.from('tasks').select('*').eq('id', req.params.id).maybeSingle();
     if (!task || !(await canSee(req.user, task))) return fail(res, 404, 'Task not found.');
-    const mentions = (Array.isArray(req.body.mentions) ? req.body.mentions : [])
-      .filter((m) => m && ASSIGNEE_TYPES.includes(m.type) && m.id).slice(0, 20);
+    // @mentions reach only people who can open the task (need to know): the giver, the
+    // assignee / its team, whoever picked it up, Admin. Mentioning anyone else does nothing.
+    const asked = (Array.isArray(req.body.mentions) ? req.body.mentions : [])
+      .filter((m) => m && ASSIGNEE_TYPES.includes(m.type) && isUuid(m.id)).slice(0, 20)
+      .map((m) => ({ type: m.type, id: m.id }));
+    const mentions = [];
+    const skipped = [];
+    for (const m of asked) {
+      if (m.type === 'team' ? (task.assignee_type === 'team' && task.assignee_id === m.id) : await personCanSee(m, task)) mentions.push(m);
+      else skipped.push(m);
+    }
     const { data: comment, error } = await supabaseAdmin.from('task_comments')
       .insert({ task_id: task.id, author_type: me.type, author_id: me.id, body, mentions }).select('*').single();
     if (error) return handle(res, error, 'add the comment');
@@ -464,7 +590,12 @@ async function addComment(req, res) {
     const others = [creator, ...(await recipientsOf(task))].filter((p) => p && !mentionPeople.some((m) => samePerson(m, p)));
     await notify(others, task, 'comment', 'New comment on a task.', me);
     const names = await namesFor([{ type: me.type, id: me.id }]);
-    return ok(res, { comment: { ...comment, authorName: names[key(me.type, me.id)]?.name || 'You' } }, 201);
+    const skippedNames = skipped.length ? await namesFor(skipped) : {};
+    return ok(res, {
+      comment: { ...comment, authorName: names[key(me.type, me.id)]?.name || 'You' },
+      // Mentioned but not told: they cannot see this task (need to know). The panel says so.
+      skippedMentions: skipped.map((m) => ({ ...m, name: skippedNames[key(m.type, m.id)]?.name || 'Someone' })),
+    }, 201);
   } catch (e) {
     return handle(res, e, 'add the comment');
   }
@@ -492,9 +623,8 @@ async function assignable(req, res) {
 async function workload(req, res) {
   try {
     if (!isAdmin(req.user)) return fail(res, 403, 'Workload is for Admin only.');
-    const { data, error } = await supabaseAdmin.from('tasks')
-      .select('assignee_type, assignee_id, claimed_by_type, claimed_by_id, status, deadline').not('status', 'in', '(done,cancelled)');
-    if (error) return handle(res, error, 'load the workload');
+    const data = await require('../utils/fetchAll').fetchAll(() => supabaseAdmin.from('tasks')
+      .select('id, assignee_type, assignee_id, claimed_by_type, claimed_by_id, status, deadline').not('status', 'in', '(done,cancelled)').order('id'));
     const now = Date.now();
     const rows = new Map();
     (data || []).forEach((t) => {
@@ -556,7 +686,11 @@ async function markNotificationsRead(req, res) {
     const me = personOf(req.user);
     let q = supabaseAdmin.from('task_notifications').update({ read_at: new Date().toISOString() })
       .eq('recipient_type', me.type).eq('recipient_id', me.id).is('read_at', null);
-    if (Array.isArray(req.body.ids) && req.body.ids.length) q = q.in('id', req.body.ids.slice(0, 100));
+    if (Array.isArray(req.body.ids) && req.body.ids.length) {
+      const ids = req.body.ids.filter(isUuid).slice(0, 100);
+      if (!ids.length) return ok(res, {});
+      q = q.in('id', ids);
+    }
     const { error } = await q;
     if (error) return handle(res, error, 'update notifications');
     return ok(res, {});
@@ -568,7 +702,8 @@ async function markNotificationsRead(req, res) {
 module.exports = {
   listTasks, getTask, createTaskHandler, updateTask, claimTask, addComment, assignable, workload,
   reportProblem, listNotifications, markNotificationsRead,
-  createTask, notify, TEMPLATES, STATUSES, PRIORITIES,
+  createTask, notify, notifyMany, TEMPLATES, STATUSES, PRIORITIES, isUuid,
+  _emailHtml: emailHtml, _safeLinkUrl: safeLinkUrl,
 };
 
 /* ------------------------------------------------------------ attachments */
@@ -604,6 +739,9 @@ async function getAttachments(req, res) {
 async function uploadAttachment(req, res) {
   try {
     if (!req.file) return fail(res, 400, 'Choose a file.');
+    if (!require('../utils/fileSniff').contentMatches(req.file.mimetype, req.file.buffer)) {
+      return fail(res, 400, 'That file is not what its type says. Images, PDF, Word, Excel, PowerPoint, CSV or text files only.');
+    }
     const { data: task } = await supabaseAdmin.from('tasks').select('*').eq('id', req.params.id).maybeSingle();
     if (!task || !(await canSee(req.user, task))) return fail(res, 404, 'Task not found.');
     if ((await listAttachments(task.id)).length >= 20) return fail(res, 400, 'A task can hold up to 20 files.');

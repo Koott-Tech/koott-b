@@ -246,15 +246,13 @@ class TokenRevocationService {
       if (this.useDatabase) {
         try {
           // Upsert (update if exists, insert if not)
+          // revoked_users has no unique key on user_id (0001_initial_schema), so an upsert
+          // with onConflict fails (42P10) and the revocation never reached the database.
+          // Replace this user's row instead.
+          await supabaseAdmin.from('revoked_users').delete().eq('user_id', userId);
           const { error: dbError } = await supabaseAdmin
             .from('revoked_users')
-            .upsert({
-              user_id: userId,
-              expires_at: expiresAt,
-              reason: reason
-            }, {
-              onConflict: 'user_id'
-            });
+            .insert({ user_id: userId, expires_at: expiresAt, reason: reason });
 
           if (dbError) {
             if (dbError.code === '42P01') { // Table doesn't exist

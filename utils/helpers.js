@@ -216,8 +216,32 @@ const withoutSecrets = (row) => (row && typeof row === 'object' && !Array.isArra
   ? Object.fromEntries(Object.entries(row).filter(([k]) => !SECRET_FIELD.test(k)).map(([k, v]) => [k, (v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Date)) ? withoutSecrets(v) : v]))
   : row);
 
+/**
+ * Same rule for whole API responses (arrays and nested rows too), used as middleware on
+ * every staff-dashboard router: a `select('*')` on users / psychologists can never send a
+ * password hash or OAuth token to the browser. Booleans (e.g. has_password) are kept.
+ */
+const SECRET_KEY = /(^|_)(password|password_hash|hash|secret|token|tokens|credentials?|otp|otp_code)($|_)|google_calendar_credentials|refresh_token|access_token|api_key/i;
+const deepWithoutSecrets = (v, depth = 0) => {
+  if (depth > 12 || v === null || typeof v !== 'object' || v instanceof Date) return v;
+  if (Array.isArray(v)) return v.map((x) => deepWithoutSecrets(x, depth + 1));
+  const out = {};
+  for (const [k, val] of Object.entries(v)) {
+    if (SECRET_KEY.test(k) && typeof val !== 'boolean') continue;
+    out[k] = deepWithoutSecrets(val, depth + 1);
+  }
+  return out;
+};
+const stripSecretsFromResponses = (req, res, next) => {
+  const json = res.json.bind(res);
+  res.json = (body) => json(deepWithoutSecrets(body));
+  next();
+};
+
 module.exports = {
   withoutSecrets,
+  deepWithoutSecrets,
+  stripSecretsFromResponses,
   generateToken,
   hashPassword,
   comparePassword,

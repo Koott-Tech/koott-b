@@ -10,7 +10,19 @@ const { authenticateToken } = require('../middleware/auth');
 const { allowRoles } = require('../utils/staffRoles');
 const c = require('../controllers/leadsController');
 
-const inboundLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
+// The website's contact form posts here from the Next server, so every visitor would share
+// that server's IP (one spammer = no enquiries for anyone). The Next route sends the
+// visitor's IP with a shared secret (CONTACT_RELAY_SECRET); only then is that IP the key.
+const relayKey = (req) => {
+  const secret = process.env.CONTACT_RELAY_SECRET;
+  const given = String(req.headers['x-koott-relay'] || '');
+  if (secret && given.length === secret.length && require('crypto').timingSafeEqual(Buffer.from(given), Buffer.from(secret))) {
+    const ip = String(req.headers['x-client-ip'] || '').trim().slice(0, 64);
+    if (ip) return `relay:${ip}`;
+  }
+  return req.ip;
+};
+const inboundLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, keyGenerator: relayKey });
 router.post('/inbound', inboundLimiter, c.inboundLead);
 
 router.use(authenticateToken);

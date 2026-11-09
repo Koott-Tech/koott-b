@@ -8,7 +8,7 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateToken } = require('../middleware/auth');
-const { requireStaffMember, allowRoles, isAdmin, personOf } = require('../utils/staffRoles');
+const { requireStaffMember, allowRoles, isAdmin, personOf, UUID_RE } = require('../utils/staffRoles');
 const { supabaseAdmin } = require('../config/supabase');
 const { key, listPeople, isMissingTable } = require('../utils/people');
 
@@ -54,6 +54,15 @@ router.get('/', async (req, res) => {
 router.post('/lessons/:id/complete', async (req, res) => {
   try {
     const me = personOf(req.user);
+    // Only a lesson of a published course meant for this person (HR / Admin may test any).
+    if (!UUID_RE.test(String(req.params.id || ''))) return fail(res, 404, 'Lesson not found.');
+    const { data: target, error: tErr } = await supabaseAdmin.from('training_lessons')
+      .select('id, course:training_courses(is_published, audience)').eq('id', req.params.id).maybeSingle();
+    if (tErr) return handle(res, tErr, 'save progress');
+    const course = Array.isArray(target?.course) ? target.course[0] : target?.course;
+    if (!target || !course || (!canManage(req.user) && (!course.is_published || !['all', audienceOf(req.user)].includes(course.audience)))) {
+      return fail(res, 404, 'Lesson not found.');
+    }
     const { error } = await supabaseAdmin.from('training_progress')
       .upsert({ person_type: me.type, person_id: me.id, lesson_id: req.params.id }, { onConflict: 'person_type,person_id,lesson_id', ignoreDuplicates: true });
     if (error) return handle(res, error, 'save progress');
@@ -80,6 +89,7 @@ router.post('/lessons/:id/complete', async (req, res) => {
 router.delete('/lessons/:id/complete', async (req, res) => {
   try {
     const me = personOf(req.user);
+    if (!UUID_RE.test(String(req.params.id || ''))) return fail(res, 404, 'Lesson not found.');
     await supabaseAdmin.from('training_progress').delete().eq('person_type', me.type).eq('person_id', me.id).eq('lesson_id', req.params.id);
     return ok(res, { completed: false });
   } catch (e) {
@@ -129,7 +139,7 @@ router.patch('/courses/:id', manage, async (req, res) => {
   try {
     const b = req.body || {};
     const patch = { updated_at: new Date().toISOString() };
-    if (b.title !== undefined) patch.title = String(b.title).trim().slice(0, 200);
+    if (b.title !== undefined) { patch.title = String(b.title).trim().slice(0, 200); if (!patch.title) return fail(res, 400, 'Give the course a title.'); }
     if (b.description !== undefined) patch.description = b.description ? String(b.description).slice(0, 2000) : null;
     if (b.audience !== undefined && ['therapists', 'staff', 'all'].includes(b.audience)) patch.audience = b.audience;
     if (b.required !== undefined) patch.required = Boolean(b.required);
@@ -201,8 +211,8 @@ router.get('/progress', manage, async (req, res) => {
   try {
     const [courses, lessons, progress, people] = await Promise.all([
       supabaseAdmin.from('training_courses').select('id, title, audience, is_published, required').eq('is_published', true),
-      supabaseAdmin.from('training_lessons').select('id, course_id'),
-      supabaseAdmin.from('training_progress').select('person_type, person_id, lesson_id, completed_at'),
+      supabaseAdmin.from('training_lessons').select('id, course_id').limit(1000),
+      require('../utils/fetchAll').fetchAll(() => supabaseAdmin.from('training_progress').select('id, person_type, person_id, lesson_id, completed_at').order('id')).then((data) => ({ data })),
       listPeople({ includeInactive: false }),
     ]);
     if (courses.error) return handle(res, courses.error, 'load progress');

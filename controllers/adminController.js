@@ -2274,7 +2274,9 @@ const searchUsers = async (req, res) => {
 
 const getRecentUsers = async (req, res) => {
   try {
-    const { data } = await supabaseAdmin.from('users').select('id, email, name, created_at').order('created_at', { ascending: false }).limit(10);
+    let q = supabaseAdmin.from('users').select('id, email, name, created_at').order('created_at', { ascending: false }).limit(10);
+    if (req.clientsOnly) q = q.eq('role', 'client'); // non-admins: client logins only (staffRoles.clientsOnly)
+    const { data } = await q;
     return res.json(successResponse(data || []));
   } catch (error) {
     return res.status(500).json(errorResponse('Internal server error'));
@@ -2329,7 +2331,10 @@ const getAllPsychologists = async (req, res) => {
       const lastName = psychologist.last_name || '';
       const fullName = `${firstName} ${lastName}`.trim() || psychologist.email?.split('@')[0] || 'No Name';
       
-      const { google_calendar_credentials, ...safePsychologist } = psychologist;
+      // Ops / HR / Marketing / Finance / Events read this list too: no password hash,
+      // OAuth tokens or other secrets ever leave the server (helpers.withoutSecrets).
+      const { google_calendar_credentials, ...rest } = psychologist;
+      const safePsychologist = require('../utils/helpers').withoutSecrets(rest);
 
       return {
         ...safePsychologist,

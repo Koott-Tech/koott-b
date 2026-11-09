@@ -177,8 +177,9 @@ const authenticateToken = async (req, res, next) => {
         }
 
         if (psychologist && !psychologistError) {
-          if (process.env.NODE_ENV === 'development' && process.env.DEBUG_AUTH === 'true') {
-            console.log('🔍 Found existing psychologist:', psychologist.id);
+          // Offboarded therapists are refused on this path too (Supabase / Google sign-in).
+          if (psychologist.is_active === false) {
+            return res.status(401).json({ error: 'Access denied', message: 'Account has been deactivated' });
           }
           req.user = {
             id: psychologist.id,
@@ -327,6 +328,13 @@ const authenticateToken = async (req, res, next) => {
       console.log('🔍 Looking up user in users table with userId:', userId);
     }
     const { data: user, error: userError } = userLookup;
+
+    // Supabase unreachable / timed out is not "user not found": answering 401 would sign
+    // the person out on a network blip. Tell the browser to retry instead.
+    const lookupDown = [psychologistLookup, userLookup].some((r) => r.error && !/no rows|PGRST116/i.test(`${r.error.code || ''} ${r.error.message || ''}`));
+    if (!psychologist && !user && lookupDown) {
+      return res.status(503).json({ error: 'Service unavailable', message: 'Could not check your sign-in just now. Please try again.' });
+    }
 
     if (process.env.NODE_ENV === 'development' && process.env.DEBUG_AUTH === 'true') {
       console.log('🔍 User lookup result:', { 

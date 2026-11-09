@@ -27,8 +27,13 @@ const adminLimiter = require('express-rate-limit')({
   legacyHeaders: false,
   skipSuccessfulRequests: false, // Count all requests
   keyGenerator: (req) => {
-    // Use IP only (user ID not available before authentication)
-    return `admin-${req.ip}`;
+    // Per signed-in person, not per IP: a whole office behind one address (Operations
+    // working the bookings pages all day) must not share 100 requests / 15 min. The token
+    // is not verified yet here, so it is only hashed into the key; forged tokens fail auth
+    // and are counted by the general limiter (failed requests, per IP).
+    const auth = String(req.headers.authorization || '');
+    const who = auth.startsWith('Bearer ') ? require('crypto').createHash('sha256').update(auth.slice(7)).digest('hex').slice(0, 16) : 'anon';
+    return `admin-${req.ip}-${who}`;
   }
 });
 

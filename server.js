@@ -902,6 +902,10 @@ app.use('/api/clients', clientRoutes);
 app.use('/api/psychologists', psychologistRoutes);
 app.use('/api/sessions', sessionRoutes);
 app.use('/api/user-sessions', sessionRoutes);
+// Staff dashboards: no password hash / OAuth token ever leaves in a response (utils/helpers).
+['/api/admin', '/api/superadmin', '/api/finance', '/api/marketing', '/api/tasks', '/api/leads', '/api/people', '/api/teams',
+  '/api/documents', '/api/safety', '/api/training', '/api/blog-calendar', '/api/me', '/api/careers/admin']
+  .forEach((p) => app.use(p, require('./utils/helpers').stripSecretsFromResponses));
 app.use('/api/admin/event-registrations', require('./middleware/auth').authenticateToken, require('./utils/staffRoles').allowRoles('event_organizer', 'marketing', 'operations'), eventRegistrationsAdminRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/superadmin', superadminRoutes);

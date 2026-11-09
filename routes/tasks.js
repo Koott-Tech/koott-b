@@ -15,11 +15,20 @@ router.get('/people', c.assignable);
 router.get('/workload', c.workload);
 router.get('/notifications', c.listNotifications);
 router.post('/notifications/read', c.markNotificationsRead);
-router.post('/report', c.reportProblem);
+// Report a problem: 20 an hour per person (each one is a task + notifications for Developers)
+const reportLimiter = require('express-rate-limit')({
+  windowMs: 60 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
+  keyGenerator: (req) => `report-${req.user?.role === 'psychologist' ? 'p' : 'u'}:${req.user?.id}`,
+  message: { success: false, message: 'That is a lot of reports in an hour. Please try again later.' },
+});
+router.post('/report', reportLimiter, c.reportProblem);
 // Admin: run the automatic-task rules now (they also run every 15 minutes)
 router.post('/auto/run', async (req, res) => {
   if (!require('../utils/staffRoles').isAdmin(req.user)) return res.status(403).json({ success: false, message: 'Admin only.' });
-  const out = await require('../services/autoTasksService').runAutoTasks({ daily: true });
+  const auto = require('../services/autoTasksService');
+  // A run is already going (the 15-minute timer, or another admin pressed it)
+  if (auto.isRunning()) return res.status(409).json({ success: false, message: 'The automatic tasks are running right now. Try again in a minute.' });
+  const out = await auto.runAutoTasks({ daily: true });
   return res.json({ success: true, data: out });
 });
 router.post('/', c.createTaskHandler);

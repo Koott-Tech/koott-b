@@ -368,19 +368,27 @@ async function reminders() {
   const { data } = await supabaseAdmin.from('tasks').select('*').not('status', 'in', '(done,cancelled)')
     .gte('deadline', new Date(`${today}T00:00:00+05:30`).toISOString())
     .lt('deadline', new Date(`${addDays(today, 2)}T00:00:00+05:30`).toISOString()).limit(500);
-  const { notify } = require('../controllers/tasksController');
-  let n = 0;
+  const { notifyMany } = require('../controllers/tasksController');
+  // Members of every team involved, in one query (was one query per task: N+1).
+  const teamIds = [...new Set((data || []).filter((t) => t.assignee_type === 'team' && !t.claimed_by_id).map((t) => t.assignee_id))];
+  const membersOf = new Map(teamIds.map((id) => [id, []]));
+  if (teamIds.length) {
+    const { data: rows, error } = await supabaseAdmin.from('team_members').select('team_id, person_type, person_id').in('team_id', teamIds);
+    if (error) throw error;
+    (rows || []).forEach((m) => membersOf.get(m.team_id)?.push({ type: m.person_type, id: m.person_id }));
+  }
+  const entries = [];
   for (const t of data || []) {
     const due = istDay(new Date(t.deadline));
     const kind = due === today ? 'due_today' : due === tomorrow ? 'due_tomorrow' : null;
     if (!kind) continue;
     const people = t.claimed_by_id
       ? [{ type: t.claimed_by_type, id: t.claimed_by_id }]
-      : t.assignee_type === 'team' ? await teamMembers(t.assignee_id) : [{ type: t.assignee_type, id: t.assignee_id }];
-    await notify(people, t, kind, kind === 'due_today' ? 'A task is due today.' : 'A task is due tomorrow.', { type: 'system' }, `${kind}:${t.id}`);
-    n += 1;
+      : t.assignee_type === 'team' ? (membersOf.get(t.assignee_id) || []) : [{ type: t.assignee_type, id: t.assignee_id }];
+    entries.push({ people, task: t, kind, message: kind === 'due_today' ? 'A task is due today.' : 'A task is due tomorrow.', dedupeKey: `${kind}:${t.id}` });
   }
-  return n;
+  // One batched write for all of them; returns how many reminders were new this run.
+  return notifyMany(entries);
 }
 
 /* ------------------------------------------------------------------ runner */
@@ -434,4 +442,4 @@ function startAutoTasks() {
   console.log('🗂️  Automatic tasks scheduled (every 15 minutes)');
 }
 
-module.exports = { runAutoTasks, startAutoTasks, eventDayOf, monthEnd };
+module.exports = { runAutoTasks, startAutoTasks, eventDayOf, monthEnd, isRunning: () => running };

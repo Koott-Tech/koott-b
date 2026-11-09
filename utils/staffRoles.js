@@ -54,10 +54,10 @@ const requireStaffMember = (req, res, next) => {
  */
 const ADMIN_ROUTE_RULES = [
   // Operations: clients, bookings, sessions, rescheduling, leads
-  { methods: ['GET'], path: /^\/users(\/[^/]+)?$/, roles: ['operations', 'hr'] },
-  { methods: ['POST'], path: /^\/users$/, roles: ['operations', 'hr'] },                 // new client from manual booking; HR onboarding
-  { methods: ['PUT'], path: /^\/users\/[^/]+$/, roles: ['operations', 'hr'] },
-  { methods: ['PUT'], path: /^\/users\/[^/]+\/(role|deactivate)$/, roles: ['hr'] },      // offboarding / role change
+  // Clients are Operations' (need to know): HR onboards staff through /api/people, not here.
+  { methods: ['GET'], path: /^\/users(\/[^/]+)?$/, roles: ['operations'] },
+  { methods: ['POST'], path: /^\/users$/, roles: ['operations'] },                       // new client from manual booking
+  { methods: ['PUT'], path: /^\/users\/[^/]+$/, roles: ['operations'] },
   { methods: ['GET'], path: /^\/(search\/users|recent-users|recent-bookings|stats\/(platform|dashboard))$/, roles: ['operations'] },
   { path: /^\/sessions(\/|$)/, roles: ['operations'] },
   { path: /^\/bookings(\/|$)/, roles: ['operations'] },
@@ -87,20 +87,29 @@ function adminRouteGate(req, res, next) {
  * Non-admins reach /api/admin/users only for CLIENT records (Operations' Clients page,
  * new clients from manual booking). Staff logins are managed in HR → People.
  */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 async function clientsOnly(req, res, next) {
   if (ADMINS.includes(req.user?.role)) return next();
   if (req.method === 'GET' && req.path === '/users') { req.query.role = 'client'; return next(); }
+  // Search and "recent users" list every login: non-admins see clients only.
+  if (req.method === 'GET' && req.path === '/search/users') { req.query.role = 'client'; return next(); }
+  if (req.method === 'GET' && req.path === '/recent-users') { req.clientsOnly = true; return next(); }
   if (req.method === 'POST' && req.path === '/users') {
     if (req.body && req.body.role && req.body.role !== 'client') return res.status(403).json({ success: false, message: 'Only client accounts can be created here.' });
     return next();
   }
   const m = /^\/users\/([^/]+)$/.exec(req.path);
   if (m) {
+    if (!UUID_RE.test(m[1])) return res.status(404).json({ success: false, message: 'Not found.' });
+    // A client's password is reset by the client ("Forgot password"), never set by staff.
+    if (req.method === 'PUT' && req.body && req.body.password !== undefined) delete req.body.password;
     const { supabaseAdmin } = require('../config/supabase');
-    const [{ data: u }, { data: c }] = await Promise.all([
+    const [{ data: u, error: uErr }, { data: c, error: cErr }] = await Promise.all([
       supabaseAdmin.from('users').select('role').eq('id', m[1]).maybeSingle(),
       supabaseAdmin.from('clients').select('id').eq('id', m[1]).maybeSingle(),
     ]);
+    if (uErr || cErr) return res.status(503).json({ success: false, message: 'Please try again in a moment.' });
     if ((u && u.role !== 'client') || (!u && !c)) return res.status(403).json({ success: false, message: 'Only client records are available here.' });
   }
   return next();
@@ -109,5 +118,5 @@ async function clientsOnly(req, res, next) {
 module.exports = {
   clientsOnly,
   ADMINS, STAFF_USER_ROLES, ONBOARDABLE_ROLES, ROLE_LABEL, DASHBOARD_BY_ROLE,
-  isAdmin, isStaff, personOf, allowRoles, requireStaffMember, adminRouteGate,
+  isAdmin, isStaff, personOf, allowRoles, requireStaffMember, adminRouteGate, UUID_RE,
 };
