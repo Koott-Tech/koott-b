@@ -139,8 +139,14 @@ async function deleteDocument(req, res) {
 /* --------------------------------------------------------------- safety path */
 
 async function getSetting(k) {
-  const { data } = await supabaseAdmin.from('app_settings').select('value').eq('key', k).maybeSingle();
-  return data?.value ?? null;
+  // Retried once: a network blip here would send an urgent alert as if no clinical lead were set.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const { data, error } = await supabaseAdmin.from('app_settings').select('value').eq('key', k).maybeSingle();
+    if (!error) return data?.value ?? null;
+    if (attempt === 0) await new Promise((r) => setTimeout(r, 400));
+    else console.error(`settings: could not read ${k}:`, error.message);
+  }
+  return null;
 }
 
 async function clinicalLead(req, res) {
@@ -188,7 +194,9 @@ async function raiseAlert(req, res) {
     const lead = await getSetting('clinical_lead');
     const names = await namesFor([{ type: me.type, id: me.id }]);
     const from = names[key(me.type, me.id)]?.name || req.user.email;
-    const to = [lead?.email, lead?.backupEmail, process.env.PAYMENT_ALERT_EMAIL || process.env.COMPANY_ADMIN_EMAIL]
+    // Demo accounts (…@demo.koott.invalid) are for testing: never wake a real person up.
+    const demo = /\.invalid$/i.test(req.user.email || '');
+    const to = demo ? [] : [lead?.email, lead?.backupEmail, process.env.PAYMENT_ALERT_EMAIL || process.env.COMPANY_ADMIN_EMAIL]
       .filter((e) => e && !/\.invalid$/i.test(e));
     const site = (process.env.FRONTEND_URL || 'https://www.koott.in').replace(/\/$/, '');
     if (to.length) {
@@ -203,7 +211,7 @@ ${alert.contact_now ? `<p>Reach them now: <strong>${String(alert.contact_now).re
       }).catch((e) => console.error('safety alert email failed:', e.message))));
     }
     // WhatsApp to the lead too, once a template is approved (INTERAKT_TPL_SAFETY_ALERT: {{1}} = who, {{2}} = client ref)
-    if (lead?.phone && process.env.INTERAKT_TPL_SAFETY_ALERT) {
+    if (!demo && lead?.phone && process.env.INTERAKT_TPL_SAFETY_ALERT) {
       require('../utils/interaktService').sendTemplateMessage(lead.phone, process.env.INTERAKT_TPL_SAFETY_ALERT,
         process.env.INTERAKT_TPL_SAFETY_ALERT_LANG || 'en', { bodyValues: [from, clientRef || 'not given'] }).catch(() => {});
     }
