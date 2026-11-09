@@ -2537,8 +2537,13 @@ const createPsychologist = async (req, res) => {
       email = email.trim().toLowerCase();
     }
 
-    // Force fixed password for all new doctor accounts
-    password = 'Koott@#2026';
+    // A random one-time password per new therapist, shown once to whoever created the
+    // login (it used to be one fixed password, written in this file, for every therapist).
+    // They change it with "Forgot password".
+    {
+      const c = require('crypto');
+      password = `Koott-${c.randomBytes(5).toString('hex')}-${c.randomInt(10, 99)}!`;
+    }
 
     // Check if psychologist already exists with this email
     const { data: existingPsychologist } = await supabaseAdmin
@@ -2785,6 +2790,7 @@ const createPsychologist = async (req, res) => {
 
     res.status(201).json(
       successResponse({
+        tempPassword: password,
         psychologist: {
           id: psychologist.id,
           email: psychologist.email,
