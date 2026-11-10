@@ -2994,11 +2994,18 @@ async function cancelRefundSession(req, res) {
       return res.status(404).json(errorResponse('Session not found'));
     }
 
+    // Cancelled now; it becomes "refunded" only when the money really goes back — Operations
+    // gets a refund request (header icon → Refund → Razorpay). This used to mark the session
+    // "refunded" without any money moving.
     const { error: updateErr } = await supabaseAdmin
       .from('sessions')
-      .update({ status: 'refunded', updated_at: new Date().toISOString() })
+      .update({ status: 'cancelled', updated_at: new Date().toISOString() })
       .eq('id', sessionId);
     if (updateErr) return res.status(500).json(errorResponse(updateErr.message));
+    const { personOf } = require('../utils/staffRoles');
+    const refundRequest = await require('../utils/refunds').createRefundRequest({
+      sessionId, source: 'staff', requestedBy: personOf(req.user), reason: req.body?.reason || 'Cancelled by staff with Cancel & refund',
+    });
 
     // Remove Google Calendar event from therapist's calendar
     let calendarEventRemoved = false;
@@ -3073,8 +3080,10 @@ async function cancelRefundSession(req, res) {
 
     return res.json({
       success: true,
-      message: 'Session cancelled and marked as refunded. Calendar event removed. Emails sent.',
-      data: { sessionId, calendarEventRemoved },
+      message: refundRequest
+        ? 'Session cancelled. The refund is waiting for Operations to approve (refund icon in the Operations dashboard).'
+        : 'Session cancelled. Nothing was paid through Razorpay for it, so there is no refund to send.',
+      data: { sessionId, calendarEventRemoved, refundRequestId: refundRequest?.id || null },
     });
   } catch (e) {
     console.error('[cancelRefundSession]', e);

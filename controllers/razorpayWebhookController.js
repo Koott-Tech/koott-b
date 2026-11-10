@@ -115,6 +115,10 @@ const handleRazorpayWebhook = async (req, res) => {
       return await handlePaymentFailed(payload, eventId, res);
     } else if (event === 'payment.refunded') {
       return await handleRefundProcessed(payload, eventId, res);
+    } else if (['refund.processed', 'refund.failed', 'refund.created'].includes(event)) {
+      // Operations' refund requests (controllers/refundsController.js)
+      await require('./refundsController').refundWebhook(event, payload?.refund?.entity);
+      return res.status(200).json({ success: true, message: `${event} applied` });
     } else {
       console.log('ℹ️ Unhandled webhook event:', event);
       // Return 200 to acknowledge receipt (don't retry)

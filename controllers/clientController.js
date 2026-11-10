@@ -1561,6 +1561,11 @@ const cancelSession = async (req, res) => {
       );
     }
 
+    // A paid session: Operations gets a refund request (header icon → Refund).
+    await require('../utils/refunds').createRefundRequest({
+      sessionId, source: 'client', requestedBy: { type: 'client', id: client.id }, reason: 'Cancelled by the client',
+    });
+
     // Send email notifications for cancellation
     try {
       console.log('📧 Sending cancellation email notifications...');

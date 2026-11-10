@@ -269,16 +269,16 @@ async function refundRequests(finance) {
   const { data } = await supabaseAdmin.from('sessions').select('id, client_id, scheduled_date, scheduled_time, payment_id, price, amount')
     .eq('status', 'canceled').gte('updated_at', new Date(Date.now() - 3 * 864e5).toISOString()).limit(100);
   let n = 0;
+  // Refunds are Operations' refund requests now (header icon → Refund → Razorpay). This
+  // rule is the safety net: a cancelled paid session without a request gets one.
+  const { createRefundRequest } = require('../utils/refunds');
+  const { data: existing } = await supabaseAdmin.from('refund_requests').select('session_id')
+    .in('session_id', (data || []).map((s) => s.id).concat(['00000000-0000-0000-0000-000000000000']));
+  const has = new Set((existing || []).map((r) => r.session_id));
   for (const s of data || []) {
     const paid = s.payment_id || Number(s.price) > 0 || Number(s.amount) > 0;
-    if (!paid) continue;
-    const amount = Number(s.amount || s.price || 0);
-    if (await make({
-      title: `Process the refund: client ${clientRef(s.client_id)} cancelled the session on ${s.scheduled_date}${amount ? ` (₹${amount.toLocaleString('en-IN')})` : ''}`,
-      details: 'Check the refund policy (time before the session), then refund through Razorpay or keep it as credit, and tell the client.',
-      assignee_type: 'team', assignee_id: finance.id, priority: 'high', deadline: inHours(48),
-      link_type: 'session', link_id: s.id, link_label: `Session ${s.scheduled_date}`, auto_key: `refund:${s.id}`,
-    })) n += 1;
+    if (!paid || has.has(s.id)) continue;
+    if (await createRefundRequest({ sessionId: s.id, source: 'system', reason: 'Cancelled by the client (found automatically)' })) n += 1;
   }
   return n;
 }
