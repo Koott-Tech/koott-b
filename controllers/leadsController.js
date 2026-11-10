@@ -12,7 +12,7 @@ const { hashPassword } = require('../utils/helpers');
 const { personOf, UUID_RE } = require('../utils/staffRoles');
 const validDate = (v) => !Number.isNaN(new Date(v).getTime());
 const { key, namesFor, isMissingTable, NOT_READY } = require('../utils/people');
-const { STAGES, SOURCES, upsertSourceLead } = require('../utils/leads');
+const { STAGES, SOURCES, upsertSourceLead, cleanPhone } = require('../utils/leads');
 const { normalizePhone } = require('../utils/phoneVerification');
 const { fetchAll } = require('../utils/fetchAll');
 
@@ -27,15 +27,19 @@ const handle = (res, e, what) => {
 async function withNames(leads) {
   const refs = leads.filter((l) => l.owner_id).map((l) => ({ type: l.owner_type, id: l.owner_id }));
   const psychIds = [...new Set(leads.map((l) => l.psychologist_id).filter(Boolean))];
-  const [names, psychs] = await Promise.all([
+  const { attributionsFor, pick } = require('../utils/attribution');
+  const [names, psychs, where] = await Promise.all([
     namesFor(refs),
     psychIds.length ? supabaseAdmin.from('psychologists').select('id, first_name, last_name').in('id', psychIds) : { data: [] },
+    // Where each lead came from (Instagram, Google Ads, direct…): own form data, booking, or phone
+    attributionsFor({ clientIds: leads.map((l) => l.client_id), phones: leads.map((l) => l.phone) }),
   ]);
   const psychName = new Map((psychs.data || []).map((p) => [p.id, `${p.first_name || ''} ${p.last_name || ''}`.trim()]));
   const now = Date.now();
   return leads.map((l) => ({
     ...l,
     ownerName: l.owner_id ? names[key(l.owner_type, l.owner_id)]?.name || null : null,
+    attribution: pick({ lead: l, clientId: l.client_id, phone: l.phone }, where),
     therapistName: l.psychologist_id ? psychName.get(l.psychologist_id) || null : null,
     followUpDue: Boolean(l.next_follow_up_at) && new Date(l.next_follow_up_at).getTime() <= now && !['converted', 'lost'].includes(l.stage),
     waitingTooLong: l.stage === 'new' && now - new Date(l.created_at).getTime() > 2 * 3600 * 1000,
@@ -98,7 +102,7 @@ async function createLead(req, res) {
       source: SOURCES.includes(b.source) ? b.source : 'manual',
       source_detail: b.source_detail ? String(b.source_detail).slice(0, 200) : null,
       name: b.name ? String(b.name).trim().slice(0, 120) : null,
-      phone: b.phone ? (normalizePhone(b.phone) || String(b.phone).trim()) : null,
+      phone: cleanPhone(b.phone),
       email: b.email ? String(b.email).trim().toLowerCase() : null,
       notes: b.notes ? String(b.notes).slice(0, 5000) : null,
       owner_type: me.type, owner_id: me.id,
@@ -125,7 +129,7 @@ async function updateLead(req, res) {
     const now = new Date().toISOString();
     const patch = { updated_at: now };
     ['name', 'email', 'notes', 'source_detail'].forEach((f) => { if (b[f] !== undefined) patch[f] = b[f] ? String(b[f]).slice(0, f === 'notes' ? 5000 : 200) : null; });
-    if (b.phone !== undefined) patch.phone = b.phone ? (normalizePhone(b.phone) || String(b.phone).trim()) : null;
+    if (b.phone !== undefined) patch.phone = cleanPhone(b.phone);
     if (b.next_follow_up_at !== undefined) patch.next_follow_up_at = b.next_follow_up_at ? new Date(b.next_follow_up_at).toISOString() : null;
     if (b.owner !== undefined) {
       if (b.owner === null || b.owner === '') { patch.owner_type = null; patch.owner_id = null; } else {
@@ -283,9 +287,16 @@ async function inboundLead(req, res) {
   if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return fail(res, 400, 'That email does not look right.');
   const id = await upsertSourceLead({
     source: 'contact', sourceRef: `contact:${crypto.randomUUID()}`, sourceDetail: b.topic ? String(b.topic).slice(0, 120) : 'Contact form',
-    name, email: email || null, phone: phone ? (normalizePhone(phone) || phone) : null,
-    meta: { message: String(b.message || '').slice(0, 2000) },
+    name, email: email || null, phone: cleanPhone(phone),
+    meta: {
+      message: String(b.message || '').slice(0, 2000),
+      // where the visitor came from (the browser's first-party touch; see utils/attribution)
+      attribution: require('../utils/attribution').fromContext(b.analytics) || undefined,
+    },
   });
+  if (phone && b.analytics) {
+    require('../analytics/analytics.service').recordLeadAttribution({ phone: normalizePhone(phone) || phone, rawContext: b.analytics, req }).catch(() => {});
+  }
   // A complaint (contact-form topic, or the words in the message) → Respond to it (Operations, Admin told).
   const text = `${b.topic || ''} ${b.message || ''}`;
   if (/complain|complaint|unhappy|disappointed|refund|bad experience|feedback/i.test(text)) {
@@ -397,8 +408,10 @@ async function clientTimeline(req, res) {
     ev.push({ at: client.created_at, kind: 'account', text: 'Client account created' });
     ev.sort((a, b) => new Date(b.at) - new Date(a.at));
     require('../utils/accessLog').logAccess(req, { action: 'viewed', resource: 'client', resourceId: client.user_id || client.id, details: { view: 'timeline' } });
+    const attribution = await clientAttribution(client, leads.data || []);
     return ok(res, {
       client: { id: client.id, userId: client.user_id, name: `${client.first_name || ''} ${client.last_name || ''}`.trim() || client.email, email: client.email, phone: client.phone_number },
+      attribution,
       events: ev,
       counts: { sessions: (sessions.data || []).length, payments: (payments.data || []).filter((p) => p.status === 'success').length, tasks: (tasks.data || []).length },
     });
@@ -407,6 +420,40 @@ async function clientTimeline(req, res) {
   }
 }
 module.exports.clientTimeline = clientTimeline;
+
+/** Where a client came from: their first booking's tracking, a lead's form data, or their phone. */
+async function clientAttribution(client, leadRows) {
+  const { attributionsFor, pick } = require('../utils/attribution');
+  let leadsFull = [];
+  if (!leadRows.length || !leadRows.some((l) => l.meta)) {
+    const { data } = await supabaseAdmin.from('leads').select('id, source, source_detail, meta, phone, created_at').eq('client_id', client.id).order('created_at').limit(20);
+    leadsFull = data || [];
+  }
+  const maps = await attributionsFor({ clientIds: [client.id], phones: [client.phone_number, ...leadsFull.map((l) => l.phone)] });
+  const firstLead = leadsFull.find((l) => l.meta?.attribution) || null;
+  const best = pick({ lead: firstLead, clientId: client.id, phone: client.phone_number }, maps)
+    || leadsFull.map((l) => maps.byPhone.get(require('../utils/attribution').last10(l.phone))).find(Boolean) || null;
+  const firstAny = leadsFull[0] || null;
+  return {
+    ...(best || {}),
+    leadSource: firstAny ? { source: firstAny.source, detail: firstAny.source_detail, at: firstAny.created_at } : null,
+  };
+}
+
+/** GET /api/leads/client-source/:id — where a client came from (users.id or clients.id). */
+async function clientSource(req, res) {
+  try {
+    const id = String(req.params.id || '');
+    if (!require('../utils/staffRoles').UUID_RE.test(id)) return fail(res, 404, 'Client not found.');
+    let { data: client } = await supabaseAdmin.from('clients').select('id, user_id, phone_number, email').eq('id', id).maybeSingle();
+    if (!client) ({ data: client } = await supabaseAdmin.from('clients').select('id, user_id, phone_number, email').eq('user_id', id).maybeSingle());
+    if (!client) return fail(res, 404, 'Client not found.');
+    return ok(res, { attribution: await clientAttribution(client, []) });
+  } catch (e) {
+    return handle(res, e, 'load where the client came from');
+  }
+}
+module.exports.clientSource = clientSource;
 
 /**
  * Marketing → Event results: per event, registrations, attended, leads that became

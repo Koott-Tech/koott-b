@@ -391,6 +391,24 @@ async function reminders() {
   return notifyMany(entries);
 }
 
+/**
+ * A lead who booked becomes a client: sessions booked by ANY route (website, manual,
+ * package, credit) in the window convert the client's open leads matched by phone or email.
+ * (Paid website bookings also do this at once — utils/bookingAccounts.markLeadBooked.)
+ */
+async function leadsThatBooked(hours) {
+  const { data, error } = await supabaseAdmin.from('sessions').select('client_id')
+    .gte('created_at', new Date(Date.now() - hours * 3600e3).toISOString())
+    .not('status', 'in', '(cancelled,canceled,refunded)').not('client_id', 'is', null).limit(500);
+  if (error) throw error;
+  const { convertLeadsForClient } = require('../utils/leads');
+  let n = 0;
+  for (const clientId of [...new Set((data || []).map((s) => s.client_id))]) {
+    n += await convertLeadsForClient(clientId, { reason: 'Booked a session' });
+  }
+  return n;
+}
+
 /* ------------------------------------------------------------------ runner */
 
 async function runAutoTasks({ daily = null } = {}) {
@@ -408,6 +426,7 @@ async function runAutoTasks({ daily = null } = {}) {
     out.unavailable = await safe('unavailable', () => unavailableOverBookings(ops));
     out.refunds = await safe('refunds', () => refundRequests(finance));
     out.reminders = await safe('reminders', () => reminders());
+    out.leadsBooked = await safe('leads that booked', () => leadsThatBooked(1));
     const today = istDay();
     const runDaily = daily === true || (daily === null && lastDaily !== today && istNow().getUTCHours() >= 9);
     if (runDaily) {
@@ -419,6 +438,7 @@ async function runAutoTasks({ daily = null } = {}) {
       out.events = await safe('events', () => eventsSoon(mkt, ops));
       out.documents = await safe('documents', async () => expiringDocuments(await teamByName('HR')));
       out.monthEnd = await safe('month end', () => monthEnd(finance));
+      out.leadsBookedDaily = await safe('leads that booked (3 days)', () => leadsThatBooked(72));
     }
     const made = Object.values(out).reduce((a, b) => a + (Number(b) || 0), 0);
     if (made) console.log('🗂️  Automatic tasks:', out);
@@ -442,4 +462,4 @@ function startAutoTasks() {
   console.log('🗂️  Automatic tasks scheduled (every 15 minutes)');
 }
 
-module.exports = { runAutoTasks, startAutoTasks, eventDayOf, monthEnd, isRunning: () => running };
+module.exports = { runAutoTasks, startAutoTasks, eventDayOf, monthEnd, leadsThatBooked, isRunning: () => running };

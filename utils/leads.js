@@ -11,6 +11,15 @@ const { supabaseAdmin } = require('../config/supabase');
 const STAGES = ['new', 'contacted', 'follow_up', 'converted', 'lost'];
 const SOURCES = ['booking', 'contact', 'event', 'assessment', 'ad', 'manual', 'phone', 'whatsapp', 'referral', 'newsletter'];
 
+/** A phone as a lead keeps it: normalised when possible, else digits and + only (no spaces / dashes),
+ *  so matching a client on the last 10 digits always works. */
+function cleanPhone(p) {
+  if (!p) return null;
+  try { const n = require('./phoneVerification').normalizePhone(p); if (n) return n; } catch (_) { /* fall through */ }
+  const s = String(p).replace(/[^\d+]/g, '');
+  return s || null;
+}
+
 const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null && v !== ''));
 
 /**
@@ -28,7 +37,7 @@ async function upsertSourceLead({ source, sourceRef, sourceDetail, name, phone, 
     }
     const now = new Date().toISOString();
     const fields = clean({
-      source_detail: sourceDetail, name, phone, email, client_id: clientId, psychologist_id: psychologistId,
+      source_detail: sourceDetail, name, phone: cleanPhone(phone), email, client_id: clientId, psychologist_id: psychologistId,
       meta: meta && typeof meta === 'object' ? meta : undefined, updated_at: now,
     });
     if (converted) Object.assign(fields, { stage: 'converted', converted_at: now, stage_changed_at: now });
@@ -47,15 +56,53 @@ async function upsertSourceLead({ source, sourceRef, sourceDetail, name, phone, 
   }
 }
 
-/** A paid booking: this client's open leads are converted. */
-async function markClientConverted(clientId) {
-  if (!clientId) return;
+const OPEN_STAGES = ['new', 'contacted', 'follow_up'];
+const last10 = (p) => String(p || '').replace(/\D/g, '').slice(-10);
+
+/**
+ * A client booked: every open lead that is this person — the same client, the same phone
+ * (last 10 digits, so +91 / spaces / dashes do not matter) or the same email — becomes
+ * "converted" and is linked to the client. Its "Call this lead" task closes.
+ * @returns {Promise<number>} how many leads were converted
+ */
+async function convertLeadsForClient(clientId, { reason = 'Booked a session' } = {}) {
+  if (!clientId) return 0;
   try {
+    const { data: c } = await supabaseAdmin.from('clients').select('id, phone_number, email, user_id').eq('id', clientId).maybeSingle();
+    if (!c) return 0;
+    let email = c.email ? String(c.email).trim().toLowerCase() : null;
+    if (!email && c.user_id) {
+      const { data: u } = await supabaseAdmin.from('users').select('email').eq('id', c.user_id).maybeSingle();
+      email = u?.email ? String(u.email).trim().toLowerCase() : null;
+    }
+    const tail = last10(c.phone_number);
+    const parts = [`client_id.eq.${c.id}`];
+    if (tail.length === 10) parts.push(`phone.like.*${tail}`);
+    if (email && /^[^@\s,()]+@[^@\s,()]+$/.test(email)) parts.push(`email.eq.${email}`);
+    const { data: open } = await supabaseAdmin.from('leads').select('id, meta, phone, email').in('stage', OPEN_STAGES).or(parts.join(',')).limit(50);
+    const mine = open || [];
+    let n = 0;
     const now = new Date().toISOString();
-    await supabaseAdmin.from('leads')
-      .update({ stage: 'converted', converted_at: now, stage_changed_at: now, updated_at: now })
-      .eq('client_id', clientId).in('stage', ['new', 'contacted', 'follow_up']);
-  } catch (_) { /* table not there yet */ }
+    for (const l of mine) {
+      const { data: done } = await supabaseAdmin.from('leads').update({
+        stage: 'converted', client_id: c.id, converted_at: now, stage_changed_at: now, updated_at: now,
+        meta: { ...(l.meta || {}), converted_automatically: reason },
+      }).eq('id', l.id).in('stage', OPEN_STAGES).select('id');
+      if (done && done.length) {
+        n += 1;
+        await supabaseAdmin.from('tasks').update({ status: 'done', completed_at: now, updated_at: now })
+          .eq('auto_key', `lead_call:${l.id}`).not('status', 'in', '(done,cancelled)');
+      }
+    }
+    return n;
+  } catch (_) {
+    return 0; /* table not there yet */
+  }
 }
 
-module.exports = { STAGES, SOURCES, upsertSourceLead, markClientConverted };
+/** A paid booking: this client's open leads are converted (matched by client, phone or email). */
+async function markClientConverted(clientId) {
+  return convertLeadsForClient(clientId, { reason: 'Paid for a session' });
+}
+
+module.exports = { STAGES, SOURCES, upsertSourceLead, markClientConverted, convertLeadsForClient, cleanPhone };

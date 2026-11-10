@@ -39,6 +39,8 @@ router.post('/:id/contact', allowRoles('operations'), logOnSuccess('changed', 'l
 router.post('/:id/viewed', allowRoles('operations'), logOnSuccess('viewed', 'lead', byId), (req, res) => res.json({ success: true, data: {} }));
 // Operations: one timeline per client (lead source, bookings, payments, tasks)
 router.get('/client-timeline/:id', allowRoles('operations'), c.clientTimeline);
+// Where a client came from (Instagram, Google Ads, direct…) — the client profile popup
+router.get('/client-source/:id', allowRoles('operations'), c.clientSource);
 // Admin: the record of access for clients, leads and sessions
 router.get('/access-log', require('../utils/staffRoles').allowRoles(), c.accessLog);
 
