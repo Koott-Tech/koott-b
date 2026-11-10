@@ -253,7 +253,7 @@ async function leadSources(req, res) {
     if ((req.query.from && !validDate(req.query.from)) || (req.query.to && !/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.to)))) return fail(res, 400, 'Dates must be YYYY-MM-DD.');
     const from = req.query.from ? new Date(req.query.from).toISOString() : new Date(Date.now() - 90 * 864e5).toISOString();
     const to = req.query.to ? new Date(`${req.query.to}T23:59:59+05:30`).toISOString() : new Date().toISOString();
-    const data = await fetchAll(() => supabaseAdmin.from('leads').select('id, source, source_detail, stage, client_id, lost_reason')
+    const data = await fetchAll(() => supabaseAdmin.from('leads').select('id, source, source_detail, stage, client_id, lost_reason, phone, meta')
       .gte('created_at', from).lte('created_at', to).order('id'));
     const clientIds = [...new Set((data || []).map((l) => l.client_id).filter(Boolean))];
     const paying = await payingClients(clientIds);
@@ -267,14 +267,72 @@ async function leadSources(req, res) {
       if (l.stage === 'lost') { r.lost += 1; const k = (l.lost_reason || 'No reason given').slice(0, 60); lost[k] = (lost[k] || 0) + 1; }
       if (l.client_id && paying.has(l.client_id)) r.paying += 1;
     });
+    const [channels, bookingChannels] = await Promise.all([leadsByChannel(data || [], paying), paidBookingsByChannel(from, to)]);
     return ok(res, {
       from, to,
       sources: Object.values(rows).sort((a, b) => b.leads - a.leads),
       lostReasons: Object.entries(lost).map(([reason, count]) => ({ reason, count })).sort((a, b) => b.count - a.count),
+      channels,          // leads per channel (where each lead first found us)
+      bookingChannels,   // paid bookings per channel (including people who booked without being a lead)
     });
   } catch (e) {
     return handle(res, e, 'load lead sources');
   }
+}
+
+const NOT_TRACKED = 'Not tracked';
+
+/** Leads per channel (Instagram ads, Google Ads, direct…): totals only, no names. */
+async function leadsByChannel(leads, paying) {
+  const { attributionsFor, pick } = require('../utils/attribution');
+  const maps = await attributionsFor({ clientIds: leads.map((l) => l.client_id), phones: leads.map((l) => l.phone) });
+  const rows = {};
+  leads.forEach((l) => {
+    const a = pick({ lead: l, clientId: l.client_id, phone: l.phone }, maps);
+    const label = a?.first || NOT_TRACKED;
+    const r = rows[label] || (rows[label] = { label, channel: a?.firstChannel || null, leads: 0, contacted: 0, converted: 0, paying: 0 });
+    r.leads += 1;
+    if (['contacted', 'follow_up', 'converted'].includes(l.stage)) r.contacted += 1;
+    if (l.stage === 'converted') r.converted += 1;
+    if (l.client_id && paying.has(l.client_id)) r.paying += 1;
+  });
+  return Object.values(rows).sort((a, b) => (a.label === NOT_TRACKED) - (b.label === NOT_TRACKED) || b.paying - a.paying || b.leads - a.leads);
+}
+
+/**
+ * Paid bookings in the period per channel the client first found us through
+ * (booking_attribution, frozen at checkout). Bookings without tracking count as "Not tracked".
+ */
+async function paidBookingsByChannel(from, to) {
+  const { channelLabel, fixChannel } = require('../utils/attribution');
+  const { env } = require('../analytics/analytics.service');
+  let rows;
+  try {
+    rows = await fetchAll(() => supabaseAdmin.from('booking_attribution')
+      .select('payment_id, client_id, first_channel, first_source, first_medium, last_channel, last_source, last_medium')
+      .eq('environment', env()).gte('created_at', from).lte('created_at', to).order('payment_id'));
+  } catch (_) {
+    return []; // tracking tables not set up
+  }
+  const paid = new Map();
+  const ids = rows.map((r) => r.payment_id);
+  for (let i = 0; i < ids.length; i += 150) {
+    const part = await fetchAll(() => supabaseAdmin.from('payments').select('id, amount, status')
+      .in('id', ids.slice(i, i + 150)).in('status', ['success', 'completed', 'captured', 'paid']).order('id'));
+    part.forEach((p) => paid.set(p.id, Number(p.amount) || 0));
+  }
+  const out = {};
+  rows.filter((r) => paid.has(r.payment_id)).forEach((r) => {
+    const ch = fixChannel(r.first_channel || r.last_channel, r.first_source || r.last_source, r.first_medium || r.last_medium);
+    const label = (ch && channelLabel(ch, r.first_source || r.last_source)) || NOT_TRACKED;
+    const o = out[label] || (out[label] = { label, channel: ch || null, bookings: 0, clients: new Set(), revenue: 0 });
+    o.bookings += 1;
+    if (r.client_id) o.clients.add(r.client_id);
+    o.revenue += paid.get(r.payment_id);
+  });
+  return Object.values(out)
+    .map((o) => ({ ...o, clients: o.clients.size, revenue: Math.round(o.revenue) }))
+    .sort((a, b) => (a.label === NOT_TRACKED) - (b.label === NOT_TRACKED) || b.revenue - a.revenue);
 }
 
 /** Public: the website contact form (via the Next /api/contact route). */

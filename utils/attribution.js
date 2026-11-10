@@ -43,16 +43,27 @@ function channelLabel(channel, source) {
 
 const last10 = (p) => String(p || '').replace(/\D/g, '').slice(-10);
 
+/**
+ * The tracker files a utm-tagged search engine (utm_source=google&utm_medium=organic) as a
+ * "referral"; for people that is a search. Paid mediums are already "paid_search".
+ */
+const SEARCH_SOURCE = /^(google|bing|yahoo|duckduckgo|ecosia|yandex|baidu)(\.|$)/i;
+function fixChannel(channel, source, medium) {
+  if (channel === 'referral' && SEARCH_SOURCE.test(String(source || '')) && (!medium || /organic|search|seo/i.test(medium))) return 'organic_search';
+  return channel || null;
+}
+
 function shape(row, from) {
   if (!row) return null;
-  const firstChannel = row.first_channel || row.last_channel || null;
   const firstSource = row.first_source || (row.first_channel === row.last_channel ? row.last_source : null) || null;
+  const firstChannel = fixChannel(row.first_channel || row.last_channel, firstSource || row.last_source, row.first_medium || row.last_medium);
+  const lastChannel = fixChannel(row.last_channel, row.last_source, row.last_medium);
   const out = {
     from, // booking | phone | contact form
     firstChannel, firstSource,
     first: channelLabel(firstChannel, firstSource || row.last_source),
-    lastChannel: row.last_channel || null, lastSource: row.last_source || null,
-    last: channelLabel(row.last_channel, row.last_source),
+    lastChannel, lastSource: row.last_source || null,
+    last: channelLabel(lastChannel, row.last_source),
     medium: row.last_medium || row.first_medium || null,
     campaign: row.last_campaign || row.first_campaign || null,
     landing: row.landing_group || null,
@@ -120,4 +131,4 @@ function fromContext(rawContext) {
   }
 }
 
-module.exports = { channelLabel, attributionsFor, pick, fromContext, last10 };
+module.exports = { channelLabel, fixChannel, attributionsFor, pick, fromContext, last10 };
