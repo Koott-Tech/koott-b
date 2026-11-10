@@ -31,7 +31,12 @@ const safety = express.Router();
 safety.use(authenticateToken, requireStaffMember);
 safety.get('/lead', c.clinicalLead);
 safety.put('/lead', c.setClinicalLead);
-safety.post('/alerts', rateLimit({ windowMs: 10 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false }), c.raiseAlert);
+// Per person, not per IP: therapists sharing an office network must never block each
+// other's URGENT safety alert. 10 in 10 minutes per person only stops a runaway script.
+safety.post('/alerts', rateLimit({
+  windowMs: 10 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
+  keyGenerator: (req) => `safety-${req.user?.role === 'psychologist' ? 'p' : 'u'}:${req.user?.id}`,
+}), c.raiseAlert);
 safety.get('/alerts', c.listAlerts);
 safety.patch('/alerts/:id', c.updateAlert);
 

@@ -2536,6 +2536,14 @@ const createPsychologist = async (req, res) => {
     if (typeof email === 'string') {
       email = email.trim().toLowerCase();
     }
+    // A therapist needs a name and a real email (an empty body used to create a blank login).
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || !String(first_name || '').trim()) {
+      return res.status(400).json(errorResponse('A first name and a valid email are needed.'));
+    }
+    {
+      const [{ data: takenUser }] = await Promise.all([supabaseAdmin.from('users').select('id').eq('email', email).maybeSingle()]);
+      if (takenUser) return res.status(409).json(errorResponse('That email already has a Koott login. One email, one role.'));
+    }
 
     // A random one-time password per new therapist, shown once to whoever created the
     // login (it used to be one fixed password, written in this file, for every therapist).
