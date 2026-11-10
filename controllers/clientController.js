@@ -1480,13 +1480,14 @@ const cancelSession = async (req, res) => {
     const userId = req.user.id;
     const { sessionId } = req.params;
 
-    // Get client ID
-    // Use supabaseAdmin to bypass RLS (backend service, proper auth already handled)
+    // Get client ID. req.user.id is the login (users.id); the client row is
+    // req.user.client_id (set by the auth middleware). Looking the client up by users.id
+    // failed for every current client ("Client profile not found").
     const { data: client } = await supabaseAdmin
       .from('clients')
       .select('id')
-      .eq('id', userId)
-      .single();
+      .eq('id', req.user.client_id || userId)
+      .maybeSingle();
 
     if (!client) {
       return res.status(404).json(
@@ -1637,8 +1638,8 @@ const requestReschedule = async (req, res) => {
     const { data: client } = await supabaseAdmin
       .from('clients')
       .select('id')
-      .eq('id', userId)
-      .single();
+      .eq('id', req.user.client_id || userId) // the client row, not the login id
+      .maybeSingle();
 
     if (!client) {
       return res.status(404).json(
