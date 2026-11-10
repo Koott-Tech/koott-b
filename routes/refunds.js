@@ -18,6 +18,7 @@ const moneyLimiter = rateLimit({
   keyGenerator: (req) => `refund-${req.user?.id}`,
 });
 router.post('/:id/refund', moneyLimiter, c.refund);
+router.post('/:id/cancel-only', c.cancelOnly);
 router.post('/:id/reject', c.reject);
 router.post('/:id/manual', c.manual);
 

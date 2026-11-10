@@ -735,6 +735,18 @@ const getSessions = async (req, res) => {
         ? (upcomingTotalCount || 0) + assessmentSessions.length
         : (sessionsCount + assessmentCount);
 
+      // A cancellation request waiting for Operations (client cancelled within 48 h):
+      // the profile shows "Cancellation requested" on that session.
+      try {
+        const ids = (allSessions || []).map((x) => x.id).filter(Boolean);
+        if (ids.length) {
+          const { data: reqs } = await supabaseAdmin.from('refund_requests').select('session_id, status, created_at, source')
+            .in('session_id', ids).eq('source', 'client_request').in('status', ['pending', 'failed', 'processing']);
+          const byS = new Map((reqs || []).map((r) => [r.session_id, r]));
+          allSessions.forEach((x) => { const r = byS.get(x.id); if (r) x.cancel_request = { status: 'pending', requested_at: r.created_at }; });
+        }
+      } catch (_) { /* table not set up yet: no badges */ }
+
       res.json(
         successResponse({
           sessions: allSessions,
@@ -1475,155 +1487,84 @@ const bookSession = async (req, res) => {
 };
 
 // Cancel a session
+/**
+ * The client cancels a session from their profile.
+ *   48 h or more before it: cancelled now and refunded automatically through Razorpay
+ *     (if that refund cannot go through, Operations gets it as a refund request).
+ *   Less than 48 h before: a cancellation REQUEST goes to Operations; the session stays
+ *     booked until Operations approves (Refund / Cancel without refund / Keep the session).
+ * The 48 can be changed with CANCEL_AUTO_REFUND_HOURS.
+ */
 const cancelSession = async (req, res) => {
   try {
     const userId = req.user.id;
     const { sessionId } = req.params;
+    const { cancelSessionCore, sessionStart, LIVE } = require('../utils/sessionCancel');
+    const { createRefundRequest } = require('../utils/refunds');
+    const reason = req.body?.reason ? String(req.body.reason).slice(0, 300) : null;
 
-    // Get client ID. req.user.id is the login (users.id); the client row is
-    // req.user.client_id (set by the auth middleware). Looking the client up by users.id
-    // failed for every current client ("Client profile not found").
-    const { data: client } = await supabaseAdmin
-      .from('clients')
-      .select('id')
-      .eq('id', req.user.client_id || userId)
-      .maybeSingle();
+    // req.user.id is the login (users.id); the client row is req.user.client_id.
+    const { data: client } = await supabaseAdmin.from('clients').select('id').eq('id', req.user.client_id || userId).maybeSingle();
+    if (!client) return res.status(404).json(errorResponse('Client profile not found'));
 
-    if (!client) {
-      return res.status(404).json(
-        errorResponse('Client profile not found')
-      );
-    }
+    const { data: session } = await supabaseAdmin.from('sessions').select('*').eq('id', sessionId).eq('client_id', client.id).maybeSingle();
+    if (!session) return res.status(404).json(errorResponse('Session not found'));
+    if (!LIVE.includes(session.status)) return res.status(400).json(errorResponse('This session cannot be cancelled.'));
+    const start = sessionStart(session);
+    if (!start || start.getTime() <= Date.now()) return res.status(400).json(errorResponse('This session has already started.'));
 
-    // Check if session exists and belongs to client
-    // Use supabaseAdmin to bypass RLS (backend service, proper auth already handled)
-    const { data: session } = await supabaseAdmin
-      .from('sessions')
-      .select('*')
-      .eq('id', sessionId)
-      .eq('client_id', client.id)
-      .single();
+    const hoursLeft = (start.getTime() - Date.now()) / 3600000;
+    const limit = Number(process.env.CANCEL_AUTO_REFUND_HOURS) || 48;
 
-    if (!session) {
-      return res.status(404).json(
-        errorResponse('Session not found')
-      );
-    }
-
-    // Check if session can be cancelled
-    if (session.status !== 'booked') {
-      return res.status(400).json(
-        errorResponse('Only booked sessions can be cancelled')
-      );
-    }
-
-    // Check if session is in the future
-    const sessionDate = new Date(session.scheduled_date);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    if (sessionDate <= today) {
-      return res.status(400).json(
-        errorResponse('Cannot cancel sessions on or before today')
-      );
-    }
-
-    // Get client and psychologist details for notifications
-    // Use supabaseAdmin to bypass RLS (backend service, proper auth already handled)
-    const { data: clientDetails } = await supabaseAdmin
-      .from('clients')
-      .select('first_name, last_name, child_name, phone_number, email')
-      .eq('id', client.id)
-      .single();
-
-    // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
-    const { data: psychologistDetails } = await supabaseAdmin
-      .from('psychologists')
-      .select('first_name, last_name, phone, email')
-      .eq('id', session.psychologist_id)
-      .single();
-
-    // Update session status
-    // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
-    const { data: updatedSession, error } = await supabaseAdmin
-      .from('sessions')
-      .update({
-        status: 'canceled',
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', sessionId)
-      .select('*')
-      .single();
-
-    if (error) {
-      console.error('Cancel session error:', error);
-      return res.status(500).json(
-        errorResponse('Failed to cancel session')
-      );
-    }
-
-    // A paid session: Operations gets a refund request (header icon → Refund).
-    await require('../utils/refunds').createRefundRequest({
-      sessionId, source: 'client', requestedBy: { type: 'client', id: client.id }, reason: 'Cancelled by the client',
-    });
-
-    // Send email notifications for cancellation
-    try {
-      console.log('📧 Sending cancellation email notifications...');
-      const emailService = require('../utils/emailService');
-      
-      const clientName = getClientDisplayName(clientDetails, 'Client');
-      const psychologistName = `${psychologistDetails?.first_name || ''} ${psychologistDetails?.last_name || ''}`.trim();
-      const sessionDateTime = new Date(`${session.scheduled_date}T${session.scheduled_time}`).toLocaleString('en-IN', { 
-        timeZone: 'Asia/Kolkata',
-        dateStyle: 'long',
-        timeStyle: 'short'
+    if (hoursLeft < limit) {
+      // Within 48 h: Operations decides. A request already sent is just shown again.
+      const { data: open } = await supabaseAdmin.from('refund_requests').select('id, status, created_at')
+        .eq('session_id', session.id).eq('source', 'client_request').in('status', ['pending', 'failed']).maybeSingle();
+      if (open) {
+        return res.json(successResponse({ outcome: 'requested', requestId: open.id, requestedAt: open.created_at },
+          'Your cancellation request is with our team. We will let you know soon.'));
+      }
+      const request = await createRefundRequest({
+        sessionId: session.id, source: 'client_request', requestedBy: { type: 'client', id: client.id },
+        reason: reason || `Asked to cancel ${Math.max(1, Math.round(hoursLeft))} h before the session`,
       });
-
-      // Send cancellation email to client
-      if (clientDetails?.email) {
-        await emailService.sendCancellationNotification({
-          to: clientDetails.email,
-          clientName,
-          psychologistName,
-          sessionDate: session.scheduled_date,
-          sessionTime: session.scheduled_time,
-          sessionId: session.id
-        });
+      if (request) {
+        return res.json(successResponse({ outcome: 'requested', requestId: request.id, requestedAt: request.created_at },
+          `Your session is within ${limit} hours, so your cancellation request has been sent to our team. Your session stays booked until they reply.`));
       }
-
-      // Send cancellation email to psychologist
-      if (psychologistDetails?.email) {
-        await emailService.sendCancellationNotification({
-          to: psychologistDetails.email,
-          clientName,
-          psychologistName,
-          sessionDate: session.scheduled_date,
-          sessionTime: session.scheduled_time,
-          sessionId: session.id,
-          isPsychologist: true
-        });
-      }
-
-      console.log('✅ Cancellation emails sent successfully');
-    } catch (emailError) {
-      console.error('❌ Error sending cancellation emails:', emailError);
-      // Continue even if email fails
+      // Nothing was paid (free / credit session): nothing to decide, cancel it now.
     }
 
-    // Cancellation notification is sent via email to both client + therapist
-    // (no approved Interakt template for cancellation; relying on email is sufficient).
-    // To re-enable WhatsApp for cancellations, create an Interakt template and call interaktService here.
+    const done = await cancelSessionCore(session.id, { status: 'canceled' });
+    if (!done.ok) return res.status(409).json(errorResponse(done.message));
 
-    res.json(
-      successResponse(updatedSession, 'Session cancelled successfully')
-    );
+    // 48 h or more before (or nothing paid): refund automatically.
+    let refund = null;
+    const request = await createRefundRequest({
+      sessionId: session.id, source: 'client', requestedBy: { type: 'client', id: client.id }, reason: reason || 'Cancelled by the client (48 h or more before)',
+    });
+    if (request && request.razorpay_payment_id) {
+      try {
+        const out = await require('./refundsController').executeRefund(request, {
+          amount: request.amount_suggested, note: `Automatic: cancelled ${Math.round(hoursLeft)} h before the session`, approvedBy: 'auto_48h',
+        });
+        refund = out.ok ? { status: 'sent', amount: out.refund.amount } : { status: 'with_team', message: out.message };
+        if (!out.ok) console.warn('auto refund did not go through, left for Operations:', out.message);
+      } catch (e) {
+        refund = { status: 'with_team' };
+        console.warn('auto refund failed, left for Operations:', e.message);
+      }
+    } else if (request) {
+      refund = { status: 'with_team' }; // paid outside Razorpay: Operations refunds by hand
+    }
 
+    const message = !request ? 'Your session is cancelled.'
+      : refund?.status === 'sent' ? `Your session is cancelled and ₹${Number(refund.amount).toLocaleString('en-IN')} is refunded. It usually reaches your account in 5–7 working days.`
+        : 'Your session is cancelled. Our team will process your refund shortly.';
+    return res.json(successResponse({ outcome: 'cancelled', refund, sessionId: session.id }, message));
   } catch (error) {
     console.error('Cancel session error:', error);
-    res.status(500).json(
-      errorResponse('Internal server error while cancelling session')
-    );
+    res.status(500).json(errorResponse('Internal server error while cancelling session'));
   }
 };
 
