@@ -333,7 +333,9 @@ router.get('/public/psychologist/:id/slots', (req, res, next) => (
  * GET /api/availability/public/psychologist/:id
  * Public endpoint to get psychologist availability (no authentication required)
  */
-router.get('/public/psychologist/:id', async (req, res, next) => {
+router.get('/public/psychologist/:id', (req, res, next) => (
+  req.headers.authorization ? next() : slotsCache(req, res, next)
+), async (req, res, next) => {
   try {
     const { id: psychologistId } = req.params;
     const { date } = req.query;

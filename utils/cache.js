@@ -119,9 +119,16 @@ const cachePublic = (ttlMs) => (req, res, next) => {
   next();
 };
 
+/**
+ * Writes that never change what the public pages show. They used to clear the cache too,
+ * and the site sends analytics on every page view, so the cache was almost always empty
+ * and every visitor waited for the database.
+ */
+const NON_CONTENT_WRITES = /^\/api\/(analytics|phone-verification|auth|tasks|notifications|safety|me|contact|consent|leads\/inbound|payment\/(failure|verify-signature))(\/|$|\?)/;
+
 /** A successful POST/PUT/PATCH/DELETE (booking, payment, admin/CMS edit) invalidates the public cache. */
 const clearPublicCacheOnWrite = (req, res, next) => {
-  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !NON_CONTENT_WRITES.test(req.originalUrl || '')) {
     res.on('finish', () => {
       if (res.statusCode < 400) globalCache.clearPrefix(PUBLIC_PREFIX);
     });
