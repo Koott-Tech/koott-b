@@ -172,7 +172,14 @@ async function executeRefund(r, { amount, note = null, decidedBy = null, approve
         notes: { refund_request_id: r.id, session_id: r.session_id || '', approved_by: approvedBy },
       });
     } catch (e) {
-      const why = e?.error?.description || e?.message || 'Razorpay refused the refund.';
+      let why = e?.error?.description || e?.message || 'Razorpay refused the refund.';
+      // Razorpay pays refunds out of the account's Razorpay balance (payments minus its fees, until they
+      // are settled to the bank). A refund larger than that balance comes back as this vague error.
+      if (/invalid request sent/i.test(why)) {
+        why = 'Razorpay refused it, most likely because the Razorpay balance is lower than the refund '
+          + '(refunds are paid from the balance; Razorpay keeps ~2% of each payment and settles the rest to the bank). '
+          + 'Add funds or turn on Refund Credits in the Razorpay dashboard, then press Refund again — or refund a smaller amount.';
+      }
       await supabaseAdmin.from('refund_requests').update({ status: 'failed', failure_reason: String(why).slice(0, 500), updated_at: new Date().toISOString() }).eq('id', r.id);
       return { ok: false, status: 502, message: `Razorpay did not refund: ${why}` };
     }
