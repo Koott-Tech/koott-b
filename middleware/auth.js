@@ -460,7 +460,7 @@ const requirePsychologist = requireRole(['psychologist', 'superadmin']); // Supe
 const requireAdmin = requireRole(['admin', 'superadmin']);
 const requireSuperAdmin = requireRole(['superadmin']);
 const requireFinance = requireRole(['finance', 'admin', 'superadmin']); // Finance can access finance routes, admins can too
-const requireEventOrganizer = requireRole(['event_organizer', 'admin', 'superadmin']); // Event organizer can access event routes
+const requireEventOrganizer = requireRole(['marketing', 'admin', 'superadmin']); // event routes (Marketing runs events)
 const requireMarketing = requireRole(['marketing', 'admin', 'superadmin']); // Marketing dashboard: aggregates only
 
 module.exports = {

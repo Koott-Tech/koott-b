@@ -4,7 +4,7 @@
  *
  *   superadmin      /superadmin        admin            /admin
  *   finance         /finance           marketing        /marketing
- *   event_organizer /event-organizer   operations       /operations
+ *   operations       /operations
  *   hr              /hr                staff            /staff (tasks only)
  *   client (India)  /profile           client (Dubai)   /profile  — emails/WhatsApp in Gulf time
  *   therapist       /psychologist      (demo therapist Rahul Nair)
@@ -40,7 +40,6 @@ const STAFF = [
   { email: `demo.admin${DOMAIN}`, role: 'admin', name: 'Demo Admin', dashboard: '/admin' },
   { email: `demo.finance${DOMAIN}`, role: 'finance', name: 'Demo Finance', dashboard: '/finance' },
   { email: `demo.marketing${DOMAIN}`, role: 'marketing', name: 'Demo Marketing', dashboard: '/marketing' },
-  { email: `demo.events${DOMAIN}`, role: 'event_organizer', name: 'Demo Event Organizer', dashboard: '/event-organizer' },
   { email: `demo.operations${DOMAIN}`, role: 'operations', name: 'Demo Operations', dashboard: '/operations' },
   { email: `demo.hr${DOMAIN}`, role: 'hr', name: 'Demo HR', dashboard: '/hr' },
   { email: `demo.staff${DOMAIN}`, role: 'staff', name: 'Demo Developer', dashboard: '/staff' },

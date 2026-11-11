@@ -906,7 +906,7 @@ app.use('/api/user-sessions', sessionRoutes);
 ['/api/admin', '/api/superadmin', '/api/finance', '/api/marketing', '/api/tasks', '/api/leads', '/api/people', '/api/teams',
   '/api/documents', '/api/safety', '/api/training', '/api/blog-calendar', '/api/careers/admin', '/api/refunds']
   .forEach((p) => app.use(p, require('./utils/helpers').stripSecretsFromResponses));
-app.use('/api/admin/event-registrations', require('./middleware/auth').authenticateToken, require('./utils/staffRoles').allowRoles('event_organizer', 'marketing', 'operations'), eventRegistrationsAdminRoutes);
+app.use('/api/admin/event-registrations', require('./middleware/auth').authenticateToken, require('./utils/staffRoles').allowRoles('marketing', 'operations'), eventRegistrationsAdminRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/superadmin', superadminRoutes);
 // The tag vocabulary the booking filters are built from. Public: topics and

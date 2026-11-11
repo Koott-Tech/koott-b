@@ -60,7 +60,7 @@ const upload = multer({
   }
 });
 
-router.post('/upload/image', require('../utils/staffRoles').allowRoles('event_organizer', 'marketing', 'hr'), upload.single('file'), async (req, res) => {
+router.post('/upload/image', require('../utils/staffRoles').allowRoles('marketing', 'hr'), upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No file uploaded' });
@@ -154,7 +154,7 @@ const uploadDoc = multer({
   }
 });
 
-router.post('/upload/document', require('../utils/staffRoles').allowRoles('event_organizer', 'marketing', 'hr'), uploadDoc.single('file'), async (req, res) => {
+router.post('/upload/document', require('../utils/staffRoles').allowRoles('marketing', 'hr'), uploadDoc.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
 
@@ -210,7 +210,7 @@ router.post('/upload/document', require('../utils/staffRoles').allowRoles('event
 });
 
 // Psychologists accessible by both Admin and Event Organizer (for dropdowns)
-router.get('/psychologists', require('../utils/staffRoles').allowRoles('event_organizer', 'operations', 'hr', 'marketing', 'finance'), adminController.getAllPsychologists);
+router.get('/psychologists', require('../utils/staffRoles').allowRoles('operations', 'hr', 'marketing', 'finance'), adminController.getAllPsychologists);
 
 // Therapist roster with booking activity (replaces the old Wix therapist-discovery screen)
 router.get('/therapists/summary', require('../utils/staffRoles').allowRoles('operations', 'hr', 'marketing'), adminController.getTherapistsSummary);
@@ -238,7 +238,7 @@ router.get('/recent-users', adminController.getRecentUsers);
 router.get('/recent-bookings', adminController.getRecentBookings);
 
 // Workshop / marketing event registrations (Supabase table event_registrations)
-// Moved to eventRegistrationsAdmin.js to allow event_organizer access
+// Moved to eventRegistrationsAdmin.js (Marketing and Operations use it too)
 
 // Psychologist management (GET moved above requireAdmin)
 router.post('/psychologists', adminController.createPsychologist);

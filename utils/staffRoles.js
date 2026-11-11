@@ -8,19 +8,19 @@
 const ADMINS = ['admin', 'superadmin'];
 
 /** Every role that works at Koott (everyone except clients). */
-const STAFF_USER_ROLES = ['superadmin', 'admin', 'operations', 'hr', 'marketing', 'finance', 'event_organizer', 'staff'];
+const STAFF_USER_ROLES = ['superadmin', 'admin', 'operations', 'hr', 'marketing', 'finance', 'staff'];
 
 /** Roles HR may give when onboarding (superadmin is never handed out here). */
-const ONBOARDABLE_ROLES = ['admin', 'operations', 'hr', 'marketing', 'finance', 'event_organizer', 'staff'];
+const ONBOARDABLE_ROLES = ['admin', 'operations', 'hr', 'marketing', 'finance', 'staff'];
 
 const ROLE_LABEL = {
   superadmin: 'Superadmin', admin: 'Admin', operations: 'Operations', hr: 'HR', marketing: 'Marketing',
-  finance: 'Finance', event_organizer: 'Event organizer', staff: 'Staff', psychologist: 'Therapist', client: 'Client',
+  finance: 'Finance', staff: 'Staff', psychologist: 'Therapist', client: 'Client',
 };
 
 const DASHBOARD_BY_ROLE = {
   superadmin: '/superadmin', admin: '/admin', operations: '/operations', hr: '/hr', marketing: '/marketing',
-  finance: '/finance', event_organizer: '/event-organizer', staff: '/staff', psychologist: '/psychologist',
+  finance: '/finance', staff: '/staff', psychologist: '/psychologist',
 };
 
 const isAdmin = (user) => ADMINS.includes(user?.role);

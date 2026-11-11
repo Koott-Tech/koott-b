@@ -5580,6 +5580,13 @@ const createEventRegistration = async (req, res) => {
       return res.status(500).json(errorResponse(msg));
     }
 
+    // Every event registration is also a lead for Operations, tagged with the event
+    // (the website form does the same in routes/events.js).
+    require('../utils/leads').upsertSourceLead({
+      source: 'event', sourceRef: data?.id, sourceDetail: newRegistration.metadata.event_title || event_slug,
+      name, email, phone: data?.phone || null,
+    });
+
     // After successfully registering manually, send the invitation email.
     try {
       const { data: eventPage } = await supabaseAdmin
