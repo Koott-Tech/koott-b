@@ -117,7 +117,15 @@ const handleRazorpayWebhook = async (req, res) => {
       return await handleRefundProcessed(payload, eventId, res);
     } else if (['refund.processed', 'refund.failed', 'refund.created'].includes(event)) {
       // Operations' refund requests (controllers/refundsController.js)
-      await require('./refundsController').refundWebhook(event, payload?.refund?.entity);
+      const outcome = await require('./refundsController').refundWebhook(event, payload?.refund?.entity);
+      // Razorpay has no "payment.refunded" event: a refund made in the Razorpay dashboard
+      // (not through Koott's Refund button) arrives here. When it refunds the whole payment,
+      // mark the payment and its session refunded, as the old payment.refunded handler did.
+      if (outcome === 'unmatched' && event === 'refund.processed') {
+        const p = payload?.payment?.entity;
+        const full = p && Number(p.amount_refunded || 0) >= Number(p.amount || 0) && Number(p.amount || 0) > 0;
+        if (full) return handleRefundProcessed(payload, eventId, res);
+      }
       return res.status(200).json({ success: true, message: `${event} applied` });
     } else {
       console.log('ℹ️ Unhandled webhook event:', event);

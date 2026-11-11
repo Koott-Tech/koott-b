@@ -312,7 +312,7 @@ async function refundWebhook(event, refundEntity) {
     if (!row && refundEntity.notes?.refund_request_id && UUID_RE.test(refundEntity.notes.refund_request_id)) {
       row = (await supabaseAdmin.from('refund_requests').select('*').eq('id', refundEntity.notes.refund_request_id).maybeSingle()).data;
     }
-    if (!row) return; // a refund made in the Razorpay dashboard: the payment.refunded handler covers it
+    if (!row) return 'unmatched'; // a refund made in the Razorpay dashboard (handled by the caller)
     if (event === 'refund.processed') {
       await supabaseAdmin.from('refund_requests').update({
         status: 'refunded', razorpay_refund_id: refundEntity.id, razorpay_status: 'processed',
