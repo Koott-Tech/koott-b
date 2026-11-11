@@ -161,6 +161,14 @@ class EmailService {
 
       this.transporter = nodemailer.createTransport(transporterConfig);
 
+      // EMAILS_OFF=true (local tests only): every email is logged and dropped, none is sent.
+      if (process.env.EMAILS_OFF === 'true') {
+        this.transporter = {
+          verify: async () => true,
+          sendMail: async (m) => { console.log(`📧 [EMAILS_OFF] not sent: "${m?.subject}" to ${String(m?.to || '').replace(/(.).*@/, '$1***@')}`); return { messageId: 'emails-off', accepted: [] }; },
+        };
+      }
+
       // Verify connection
       await this.transporter.verify();
       console.log('✅ Email service initialized successfully');

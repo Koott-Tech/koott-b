@@ -56,6 +56,7 @@ const getBookingStatusByOrderId = async (req, res) => {
     }
 
     // Get payment record first (always check this)
+    const slotLockLookup = getSlotLockByOrderId(orderId); // runs alongside the payment lookup
     const { data: paymentRecord, error: paymentError } = await supabaseAdmin
       .from('payments')
       .select('id, status, amount, session_id, created_at, completed_at, psychologist_id, client_id, razorpay_params')
@@ -80,7 +81,7 @@ const getBookingStatusByOrderId = async (req, res) => {
     }
 
     // Try to get slot lock (may not exist if using old flow or migration not run)
-    const slotLockResult = await getSlotLockByOrderId(orderId);
+    const slotLockResult = await slotLockLookup;
     const slotLock = slotLockResult.success ? slotLockResult.data : null;
 
     // If slot lock exists, use it; otherwise fall back to payment record

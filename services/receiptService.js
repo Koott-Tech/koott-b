@@ -209,11 +209,18 @@ const generateAndStoreReceipt = async (sessionData, paymentData, clientData, psy
     };
     console.log('📄 Storing receipt data - session_id:', receiptData.session_id, 'receipt_number:', receiptData.receipt_number);
 
-    const { data: insertedReceipt, error: receiptError } = await supabaseAdmin
+    let { data: insertedReceipt, error: receiptError } = await supabaseAdmin
       .from('receipts')
       .insert(receiptData)
       .select('id')
       .single();
+
+    // Already made for this session (a retried confirmation): use that receipt.
+    if (receiptError && receiptError.code === '23505') {
+      const { data: existing } = await supabaseAdmin
+        .from('receipts').select('id').eq('session_id', sessionData.id).maybeSingle();
+      if (existing) { insertedReceipt = existing; receiptError = null; }
+    }
 
     if (receiptError) {
       console.error('❌ Error storing receipt details:', receiptError);

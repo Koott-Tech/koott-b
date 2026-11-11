@@ -1067,6 +1067,20 @@ console.log(`🚀 Koott Backend running on port ${PORT}`);
   // Automatic tasks (services/autoTasksService.js): leads, reschedules, renewals, availability…
   require('./services/autoTasksService').startAutoTasks();
 
+  // Booking sweeper (services/sessionCreationService.js): finishes the Meet link /
+  // email / WhatsApp of any website booking whose background work was lost (restart,
+  // crash). Live server only by default: a laptop on the same database would otherwise
+  // send messages for live bookings. BOOKING_SWEEPER=on / off overrides.
+  const sweeperOn = process.env.BOOKING_SWEEPER === 'on'
+    || (process.env.NODE_ENV === 'production' && process.env.BOOKING_SWEEPER !== 'off');
+  if (sweeperOn) {
+    const { sweepUnfinishedBookings } = require('./services/sessionCreationService');
+    const sweep = () => sweepUnfinishedBookings().catch((e) => console.warn('⚠️ Booking sweeper:', e?.message || e));
+    setTimeout(sweep, 30 * 1000);
+    setInterval(sweep, 2 * 60 * 1000);
+    console.log('🧹 Booking sweeper on (every 2 minutes)');
+  }
+
   // Analytics outbox: turns verified payments into funnel events (never on the booking path)
   require('./analytics/analyticsWorker').startAnalyticsWorker();
   

@@ -292,6 +292,16 @@ const processPaymentCapturedUnlocked = async (payload, eventId, skipSignatureChe
       };
     }
 
+    // The payment record and slot lock lookups below start now, alongside this one.
+    const paymentRecordLookup = supabaseAdmin
+      .from('payments')
+      .select('id, amount, razorpay_order_id, razorpay_payment_id, psychologist_id, client_id, package_id, session_id, razorpay_params, status')
+      .eq('razorpay_order_id', orderId)
+      .maybeSingle()
+      .then((r) => r); // .then starts the request now (query builders are lazy)
+    const slotLockLookup = getSlotLockByOrderId(orderId);
+    slotLockLookup.catch(() => {}); // awaited below
+
     // CRITICAL FIX: Webhook idempotency - Check if payment already processed by payment_id
     const { data: existingPaymentByPaymentId } = await supabaseAdmin
       .from('payments')
@@ -321,11 +331,7 @@ const processPaymentCapturedUnlocked = async (payload, eventId, skipSignatureChe
     }
 
     // Get payment record by order ID (always exists)
-    const { data: paymentRecord } = await supabaseAdmin
-      .from('payments')
-      .select('id, amount, razorpay_order_id, razorpay_payment_id, psychologist_id, client_id, package_id, session_id, razorpay_params, status')
-      .eq('razorpay_order_id', orderId)
-      .maybeSingle();
+    const { data: paymentRecord } = await paymentRecordLookup;
 
     if (!paymentRecord) {
       console.error('❌ Payment record not found for order:', orderId);
@@ -337,10 +343,12 @@ const processPaymentCapturedUnlocked = async (payload, eventId, skipSignatureChe
 
     // CRITICAL FIX: Ensure razorpay_payment_id is stored for idempotency
     if (!paymentRecord.razorpay_payment_id && paymentId) {
-      await supabaseAdmin
+      // Not awaited: the payment update below writes it again with the status.
+      supabaseAdmin
         .from('payments')
         .update({ razorpay_payment_id: paymentId })
-        .eq('id', paymentRecord.id);
+        .eq('id', paymentRecord.id)
+        .then(() => {}, () => {});
     }
 
     // Check if session already exists
@@ -362,7 +370,7 @@ const processPaymentCapturedUnlocked = async (payload, eventId, skipSignatureChe
     }
 
     // Get slot lock by order ID (may not exist for legacy payments)
-    const slotLockResult = await getSlotLockByOrderId(orderId);
+    const slotLockResult = await slotLockLookup;
 
     if (!slotLockResult.success || !slotLockResult.data) {
       console.log('⚠️ Slot lock not found - using legacy payment flow');
@@ -436,23 +444,9 @@ const processPaymentCapturedUnlocked = async (payload, eventId, skipSignatureChe
       }
     }
     
-    // Update slot lock to PAYMENT_SUCCESS (if not already updated above)
-    if (!slotLockUpdated) {
-      const updateResult = await updateSlotLockStatus(orderId, 'PAYMENT_SUCCESS', {
-        paymentId,
-        signature: payment.signature || null
-      });
-
-      if (!updateResult.success) {
-        console.error('❌ Failed to update slot lock status');
-        // Don't return error - try to proceed with session creation anyway
-        // The session creation will fail if slot is not available
-        console.warn('⚠️ Continuing with session creation despite slot lock update failure');
-      }
-    }
-
-    // Verify payment amount matches expected amount
+    // Verify payment amount matches expected amount (before the updates below)
     // paymentRecord already fetched above
+    let paymentUpdate = null;
     if (paymentRecord) {
       const expectedAmount = Math.round(paymentRecord.amount * 100); // Convert to paise
       if (amount !== expectedAmount) {
@@ -489,10 +483,26 @@ const processPaymentCapturedUnlocked = async (payload, eventId, skipSignatureChe
         updateData.payment_method = paymentMethod;
       }
       
-      await supabaseAdmin
+      paymentUpdate = supabaseAdmin
         .from('payments')
         .update(updateData)
         .eq('id', paymentRecord.id);
+    }
+
+    // Slot lock to PAYMENT_SUCCESS (if not already updated above) and the payment
+    // record, together.
+    const [lockUpdateResult] = await Promise.all([
+      slotLockUpdated ? null : updateSlotLockStatus(orderId, 'PAYMENT_SUCCESS', {
+        paymentId,
+        signature: payment.signature || null
+      }),
+      paymentUpdate,
+    ]);
+    if (lockUpdateResult && !lockUpdateResult.success) {
+      console.error('❌ Failed to update slot lock status');
+      // Don't return error - try to proceed with session creation anyway
+      // The session creation will fail if slot is not available
+      console.warn('⚠️ Continuing with session creation despite slot lock update failure');
     }
 
     // Create session (idempotent)
@@ -521,8 +531,8 @@ const processPaymentCapturedUnlocked = async (payload, eventId, skipSignatureChe
       alreadyExists: sessionResult.alreadyExists
     });
 
-    // Log successful webhook processing
-    await userInteractionLogger.logInteraction({
+    // Log successful webhook processing (not awaited: the client is waiting)
+    Promise.resolve(userInteractionLogger.logInteraction({
       userId: slotLock.client_id,
       userRole: 'client',
       action: 'razorpay_webhook_session_created',
@@ -533,7 +543,7 @@ const processPaymentCapturedUnlocked = async (payload, eventId, skipSignatureChe
         sessionId: sessionResult.session?.id,
         eventId
       }
-    });
+    })).catch(() => {});
 
     // PRIORITY: Check and send reminder immediately if session is in next 2 hours (async)
     if (sessionResult.session?.id) {
