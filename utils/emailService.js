@@ -10,8 +10,8 @@ const PRODUCTION_SITE_URL = (
 ).replace(/\/+$/, '');
 
 // Hosted email header images — served from Vercel frontend public folder
-const CLIENT_EMAIL_HEADER_URL = process.env.CLIENT_EMAIL_HEADER_URL || 'https://koott-frontend-keth.vercel.app/BookingConfirmationKoott.webp';
-const THERAPIST_EMAIL_HEADER_URL = process.env.THERAPIST_EMAIL_HEADER_URL || 'https://koott-frontend-keth.vercel.app/NewKoottBooking.webp';
+const CLIENT_EMAIL_HEADER_URL = process.env.CLIENT_EMAIL_HEADER_URL || 'https://koott-f.vercel.app/BookingConfirmationKoott.webp';
+const THERAPIST_EMAIL_HEADER_URL = process.env.THERAPIST_EMAIL_HEADER_URL || 'https://koott-f.vercel.app/NewKoottBooking.webp';
 
 // Dark mode styles injected into every session confirmation email <head>
 const DARK_MODE_STYLES = `
