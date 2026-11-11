@@ -247,29 +247,47 @@ const getSessions = async (req, res) => {
       const offset = (page - 1) * limit;
       query = query.range(offset, offset + limit - 1).order('scheduled_date', { ascending: false });
 
-      const { data: sessions, error, count } = await query;
+      // This psychologist's commission settings, fetched alongside the sessions
+      const dcPromise = supabaseAdmin
+        .from('doctor_commissions')
+        .select('commission_amount_individual, commission_amount_package, commission_amounts, doctor_commission_first_session, doctor_commission_followup, doctor_commission_first_session_package, doctor_commission_followup_package, doctor_commission_packages')
+        .eq('psychologist_id', psychologistId)
+        .eq('is_active', true)
+        .limit(1)
+        .then((r) => r, (e) => ({ data: null, error: e }));
+      const [{ data: sessions, error, count }] = await Promise.all([query, dcPromise]);
 
       const enrichedRegular = (sessions || []).map((s) => ({
         ...s,
         booking_created_at: getSessionBookingCreatedAtIso(s),
       }));
 
+      // Commission history for these sessions, fetched while package info loads
+      const regularSessionIdsForCh = enrichedRegular.map(s => s.id).filter(Boolean);
+      const chPromise = regularSessionIdsForCh.length > 0
+        ? supabaseAdmin.from('commission_history')
+          .select('session_id, commission_amount, session_amount')
+          .in('session_id', regularSessionIdsForCh)
+          .then((r) => r, (e) => ({ data: null, error: e }))
+        : Promise.resolve({ data: [] });
+
       // Attach package info and session index (e.g. "2/3") for package sessions
       if (enrichedRegular.length > 0) {
         const packageIds = [...new Set(enrichedRegular.map(s => s.package_id).filter(Boolean))];
         if (packageIds.length > 0) {
-          const { data: packages } = await supabaseAdmin
-            .from('packages')
-            .select('id, package_type, session_count')
-            .in('id', packageIds);
+          const [{ data: packages }, { data: allPackageSessions }] = await Promise.all([
+            supabaseAdmin
+              .from('packages')
+              .select('id, package_type, session_count')
+              .in('id', packageIds),
+            supabaseAdmin
+              .from('sessions')
+              .select('id, client_id, package_id, scheduled_date')
+              .eq('psychologist_id', psychologistId)
+              .in('package_id', packageIds)
+              .order('scheduled_date', { ascending: true, nullsFirst: false }),
+          ]);
           const packagesMap = (packages || []).reduce((acc, p) => { acc[p.id] = p; return acc; }, {});
-
-          const { data: allPackageSessions } = await supabaseAdmin
-            .from('sessions')
-            .select('id, client_id, package_id, scheduled_date')
-            .eq('psychologist_id', psychologistId)
-            .in('package_id', packageIds)
-            .order('scheduled_date', { ascending: true, nullsFirst: false });
 
           const sessionToPackageInfo = {};
           if (allPackageSessions && allPackageSessions.length > 0) {
@@ -317,25 +335,11 @@ const getSessions = async (req, res) => {
       // ── Commission: attach doctor_wallet to each regular session ──────────
       // Priority: 1) commission_history  2) therapist_commission > 0  3) doctor_commissions rates
       try {
-        const regularSessionIds = enrichedRegular.map(s => s.id).filter(Boolean);
-
-        // Fetch commission_history rows for these sessions (batch)
-        let commissionHistoryMap = {};
-        if (regularSessionIds.length > 0) {
-          const { data: chRows } = await supabaseAdmin
-            .from('commission_history')
-            .select('session_id, commission_amount, session_amount')
-            .in('session_id', regularSessionIds);
-          (chRows || []).forEach(r => { commissionHistoryMap[r.session_id] = r; });
-        }
-
-        // Fetch doctor_commissions config for this psychologist
-        const { data: dcRows } = await supabaseAdmin
-          .from('doctor_commissions')
-          .select('commission_amount_individual, commission_amount_package, commission_amounts, doctor_commission_first_session, doctor_commission_followup, doctor_commission_first_session_package, doctor_commission_followup_package, doctor_commission_packages')
-          .eq('psychologist_id', psychologistId)
-          .eq('is_active', true)
-          .limit(1);
+        // commission_history rows (batch) and doctor_commissions were started above
+        const commissionHistoryMap = {};
+        const { data: chRows } = await chPromise;
+        (chRows || []).forEach(r => { commissionHistoryMap[r.session_id] = r; });
+        const { data: dcRows } = await dcPromise;
         const dc = dcRows?.[0] || null;
 
         enrichedRegular.forEach(s => {
@@ -363,15 +367,6 @@ const getSessions = async (req, res) => {
           return new Date(b.scheduled_date) - new Date(a.scheduled_date);
         });
 
-      console.log(`🔍 Total sessions returned: ${allSessions.length} (regular: ${enrichedRegular.length}, assessment: ${assessmentSessions.length})`);
-      console.log(`🔍 Pending assessment sessions in response:`, allSessions.filter(s => 
-        (s.session_type === 'assessment' || s.type === 'assessment') && s.status === 'pending'
-      ).map(s => ({
-        id: s.id,
-        status: s.status,
-        psychologist_id: s.psychologist_id,
-        scheduled_date: s.scheduled_date
-      })));
 
       res.json(
         successResponse({
@@ -516,8 +511,6 @@ const getAvailability = async (req, res) => {
         countQuery = countQuery.gte('date', start_date).lte('date', end_date);
       }
 
-      const { count, error: countError } = await countQuery;
-
       // Build main query with pagination
       let query = supabaseAdmin
         .from('availability')
@@ -539,7 +532,34 @@ const getAvailability = async (req, res) => {
       const offset = (pageNum - 1) * limitNum;
       query = query.range(offset, offset + limitNum - 1);
 
-      const { data: availability, error } = await query;
+      // Booked sessions / assessment sessions (to filter out of availability)
+      let bookedSessionsQuery = supabaseAdmin
+        .from('sessions')
+        .select('scheduled_date, scheduled_time')
+        .eq('psychologist_id', psychologistId)
+        .in('status', ['booked', 'rescheduled', 'confirmed']);
+      let bookedAssessmentSessionsQuery = supabaseAdmin
+        .from('assessment_sessions')
+        .select('scheduled_date, scheduled_time')
+        .eq('psychologist_id', psychologistId)
+        .in('status', ['booked', 'reserved']);
+      if (date) {
+        bookedSessionsQuery = bookedSessionsQuery.eq('scheduled_date', date);
+        bookedAssessmentSessionsQuery = bookedAssessmentSessionsQuery.eq('scheduled_date', date);
+      } else if (start_date && end_date) {
+        bookedSessionsQuery = bookedSessionsQuery.gte('scheduled_date', start_date).lte('scheduled_date', end_date);
+        bookedAssessmentSessionsQuery = bookedAssessmentSessionsQuery.gte('scheduled_date', start_date).lte('scheduled_date', end_date);
+      }
+
+      // All five lookups at once (they were one after another: ~5 database round trips)
+      const [countResult, mainResult, bookedResult, bookedAssessmentResult, recurringBlocks] = await Promise.all([
+        countQuery, query, bookedSessionsQuery, bookedAssessmentSessionsQuery,
+        getRecurringBlocksForPsychologist(psychologistId),
+      ]);
+      const { count } = countResult;
+      const { data: availability, error } = mainResult;
+      const { data: bookedSessions } = bookedResult;
+      const { data: bookedAssessmentSessions } = bookedAssessmentResult;
 
       if (error) {
         // If there's a database relationship error, return empty availability
@@ -566,36 +586,6 @@ const getAvailability = async (req, res) => {
 
       // Calculate pagination info
       const totalPages = count ? Math.ceil(count / limitNum) : 0;
-
-      // Get booked sessions to filter out from availability
-      let bookedSessionsQuery = supabaseAdmin
-        .from('sessions')
-        .select('scheduled_date, scheduled_time')
-        .eq('psychologist_id', psychologistId)
-        .in('status', ['booked', 'rescheduled', 'confirmed']);
-
-      if (date) {
-        bookedSessionsQuery = bookedSessionsQuery.eq('scheduled_date', date);
-      } else if (start_date && end_date) {
-        bookedSessionsQuery = bookedSessionsQuery.gte('scheduled_date', start_date).lte('scheduled_date', end_date);
-      }
-
-      const { data: bookedSessions, error: sessionsError } = await bookedSessionsQuery;
-
-      // Also get booked assessment sessions
-      let bookedAssessmentSessionsQuery = supabaseAdmin
-        .from('assessment_sessions')
-        .select('scheduled_date, scheduled_time')
-        .eq('psychologist_id', psychologistId)
-        .in('status', ['booked', 'reserved']);
-
-      if (date) {
-        bookedAssessmentSessionsQuery = bookedAssessmentSessionsQuery.eq('scheduled_date', date);
-      } else if (start_date && end_date) {
-        bookedAssessmentSessionsQuery = bookedAssessmentSessionsQuery.gte('scheduled_date', start_date).lte('scheduled_date', end_date);
-      }
-
-      const { data: bookedAssessmentSessions, error: assessmentSessionsError } = await bookedAssessmentSessionsQuery;
 
       // Helper function to convert 24-hour time to 12-hour format for comparison
       const convertTo12Hour = (time24) => {
@@ -642,8 +632,7 @@ const getAvailability = async (req, res) => {
         }
       });
 
-      // Fetch recurring blocks (e.g. block every Sunday) for this psychologist
-      const recurringBlocks = await getRecurringBlocksForPsychologist(psychologistId);
+      // Recurring blocks (e.g. block every Sunday) were fetched above
 
       // Filter out booked slots from availability, then apply recurring blocks
       const filteredAvailability = (availability || []).map(dayAvailability => {

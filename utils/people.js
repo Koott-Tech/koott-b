@@ -96,11 +96,21 @@ async function namesFor(refs) {
 }
 
 /** Team ids a person belongs to. */
+// A person's teams are looked up on most task requests; remembered for 20 seconds
+// (a team change shows up within that window).
+const TEAM_IDS_TTL_MS = 20 * 1000;
+const teamIdsCache = new Map();
 async function teamIdsOf(person) {
+  const k = `${person.type}:${person.id}`;
+  const hit = teamIdsCache.get(k);
+  if (hit && hit.at > Date.now() - TEAM_IDS_TTL_MS) return hit.ids;
   const { data, error } = await supabaseAdmin
     .from('team_members').select('team_id').eq('person_type', person.type).eq('person_id', person.id);
   if (error) return [];
-  return (data || []).map((r) => r.team_id);
+  const ids = (data || []).map((r) => r.team_id);
+  if (teamIdsCache.size > 5000) teamIdsCache.clear();
+  teamIdsCache.set(k, { ids, at: Date.now() });
+  return ids;
 }
 
 /** Members of a team as persons. */
@@ -122,4 +132,7 @@ async function teamByName(name) {
   return created;
 }
 
-module.exports = { COMPLETE, key, psychName, listPeople, namesFor, teamIdsOf, teamMembers, teamByName, isMissingTable, NOT_READY };
+/** Forget remembered team lists (call after changing team_members). */
+function forgetTeams() { teamIdsCache.clear(); }
+
+module.exports = { COMPLETE, key, psychName, listPeople, namesFor, teamIdsOf, forgetTeams, teamMembers, teamByName, isMissingTable, NOT_READY };

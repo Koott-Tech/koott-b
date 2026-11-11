@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const { supabaseAdmin } = require('../config/supabase');
 const { hashPassword } = require('../utils/helpers');
 const { isAdmin, personOf, ONBOARDABLE_ROLES, ROLE_LABEL, STAFF_USER_ROLES, UUID_RE } = require('../utils/staffRoles');
-const { key, listPeople, namesFor, teamByName, isMissingTable, NOT_READY, COMPLETE } = require('../utils/people');
+const { key, listPeople, namesFor, teamByName, isMissingTable, NOT_READY, COMPLETE, forgetTeams } = require('../utils/people');
 
 const ok = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
@@ -49,12 +49,14 @@ async function upsertProfile(person, fields) {
 
 async function setTeams(person, teamIds) {
   const ids = [...new Set((teamIds || []).filter(Boolean))];
+  forgetTeams();
   const { error: delErr } = await supabaseAdmin.from('team_members').delete().eq('person_type', person.type).eq('person_id', person.id);
   if (delErr) throw delErr;
   if (ids.length) {
     const { error } = await supabaseAdmin.from('team_members').insert(ids.map((team_id) => ({ team_id, person_type: person.type, person_id: person.id })));
     if (error) throw error;
   }
+  forgetTeams();
 }
 
 async function getPeople(req, res) {
@@ -316,6 +318,7 @@ async function saveTeam(req, res) {
     if (data.lead_person_id) {
       await supabaseAdmin.from('team_members').upsert({ team_id: data.id, person_type: data.lead_person_type, person_id: data.lead_person_id },
         { onConflict: 'team_id,person_type,person_id', ignoreDuplicates: true });
+      forgetTeams();
     }
     return ok(res, { team: data }, req.params.id ? 200 : 201);
   } catch (e) {
@@ -343,6 +346,7 @@ async function addMember(req, res) {
     const { error } = await supabaseAdmin.from('team_members').upsert({ team_id: req.params.id, person_type: t, person_id: id },
       { onConflict: 'team_id,person_type,person_id', ignoreDuplicates: true });
     if (error) return handle(res, error, 'add the member');
+    forgetTeams();
     return ok(res, { added: true }, 201);
   } catch (e) {
     return handle(res, e, 'add the member');
@@ -355,6 +359,7 @@ async function removeMember(req, res) {
     if (!parsePerson(t, id)) return fail(res, 400, 'Unknown person.');
     const { error } = await supabaseAdmin.from('team_members').delete().eq('team_id', req.params.id).eq('person_type', t).eq('person_id', id);
     if (error) return handle(res, error, 'remove the member');
+    forgetTeams();
     const { data: team } = await supabaseAdmin.from('teams').select('lead_person_type, lead_person_id').eq('id', req.params.id).maybeSingle();
     if (team && team.lead_person_type === t && team.lead_person_id === id) {
       await supabaseAdmin.from('teams').update({ lead_person_type: null, lead_person_id: null }).eq('id', req.params.id);

@@ -3767,7 +3767,7 @@ const deleteUser = async (req, res) => {
       supabaseAdmin.from('team_members').delete().eq('person_type', 'user').eq('person_id', userId),
       supabaseAdmin.from('staff_profiles').delete().eq('person_type', 'user').eq('person_id', userId),
       supabaseAdmin.from('task_notifications').delete().eq('recipient_type', 'user').eq('recipient_id', userId),
-    ]).catch(() => {});
+    ]).catch(() => {}); require('../utils/people').forgetTeams();
 
     // Delete user account
     const { error: deleteUserError } = await supabaseAdmin
