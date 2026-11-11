@@ -19,7 +19,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
-const { sendCode, verifyCode, phoneFromToken } = require('../utils/phoneVerification');
+const { sendCode, verifyCode, phoneFromToken, isDummyToken } = require('../utils/phoneVerification');
 const { afterVerified, createAccount } = require('../utils/bookingAccounts');
 const { recordLeadAttribution } = require('../analytics/analytics.service');
 
@@ -74,7 +74,8 @@ router.post('/verify', limiter(20), async (req, res) => {
 
     const account = await afterVerified(result.phone, {
       signedInUserId: signedInClientUserId(req),
-      psychologistId: uuidOrNull(req.body?.psychologistId)
+      psychologistId: uuidOrNull(req.body?.psychologistId),
+      trusted: !result.dummy,
     });
     if (account.ok === false) return reply(res, account);
     // A verified number is a lead: remember which visit it came from (not awaited).
@@ -107,8 +108,16 @@ router.post('/create-account', limiter(10), async (req, res) => {
       email,
       age: req.body?.age,
       emergency: req.body?.emergency,
-      psychologistId: uuidOrNull(req.body?.psychologistId)
+      psychologistId: uuidOrNull(req.body?.psychologistId),
+      trusted: !isDummyToken(req.body?.phoneToken),
     });
+    if (result.signInRequired) {
+      return res.status(409).json({
+        success: false,
+        code: 'SIGN_IN_REQUIRED',
+        message: 'This number already has a Koott account. Please log in to continue.'
+      });
+    }
     if (result.conflict === 'email') {
       return res.status(409).json({
         success: false,

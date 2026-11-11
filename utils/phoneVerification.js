@@ -19,6 +19,12 @@
  * the client straight into the account holding it, so a blanket code would let
  * anyone type someone else's number and land inside their account. Unset the
  * variable and the bypass does not exist.
+ *
+ * TESTING PHASE — PHONE_OTP_ANY_NUMBER=true: every number skips WhatsApp and takes
+ * PHONE_OTP_TEST_CODE, so testers can book with their own numbers. Because anyone
+ * could type anyone's number, a number verified this way is marked "dummy" and is
+ * never used to sign into an account that already holds it (the verify and
+ * create-account steps ask for a password sign-in instead). Turn it off before launch.
  */
 
 const crypto = require('crypto');
@@ -51,6 +57,7 @@ const testNumbers = () => String(process.env.PHONE_OTP_TEST_NUMBERS || '')
   .split(',').map((n) => normalizePhone(n)).filter(Boolean);
 const testCode = () => String(process.env.PHONE_OTP_TEST_CODE || '1234').trim();
 const isTestNumber = (phone) => testNumbers().includes(phone);
+const anyNumber = () => process.env.PHONE_OTP_ANY_NUMBER === 'true';
 
 const hashCode = (phone, code) => crypto.createHmac('sha256', secret()).update(`${phone}:${code}`).digest('hex');
 
@@ -64,6 +71,17 @@ async function sendCode(rawPhone) {
   // fixed code is what verifyCode will accept.
   if (isTestNumber(phone)) {
     console.warn(`⚠️  OTP bypass used for test number ${phone} — clear PHONE_OTP_TEST_NUMBERS before launch`);
+    return {
+      ok: true,
+      phone,
+      expiresAt: new Date(Date.now() + CODE_TTL_MINUTES * 60 * 1000).toISOString(),
+      resendAfter: 0,
+      devCode: testCode(),
+      testNumber: true,
+    };
+  }
+  // Testing phase: any number, the fixed code, nothing sent.
+  if (anyNumber()) {
     return {
       ok: true,
       phone,
@@ -136,6 +154,11 @@ async function verifyCode(rawPhone, rawCode) {
     console.warn(`⚠️  OTP bypass accepted for test number ${phone}`);
     return { ok: true, phone, token: jwt.sign({ purpose: TOKEN_PURPOSE, phone }, secret(), { expiresIn: TOKEN_TTL }) };
   }
+  if (anyNumber()) {
+    if (code !== testCode()) return fail(400, 'That code is not right.');
+    // Not proof the person holds the number: marked so it never signs into an account.
+    return { ok: true, phone, dummy: true, token: jwt.sign({ purpose: TOKEN_PURPOSE, phone, dummy: true }, secret(), { expiresIn: TOKEN_TTL }) };
+  }
 
   if (code.length !== 6) return fail(400, 'Please enter the 6-digit code.');
 
@@ -173,6 +196,11 @@ async function verifyCode(rawPhone, rawCode) {
   return { ok: true, phone, token };
 }
 
+/** Was this token's number "verified" with the testing-phase dummy code? */
+function isDummyToken(token) {
+  try { return jwt.verify(token, secret())?.dummy === true; } catch (_) { return false; }
+}
+
 /** The verified E.164 number inside a token from verifyCode, or null. */
 function phoneFromToken(token) {
   if (!token) return null;
@@ -184,4 +212,4 @@ function phoneFromToken(token) {
   }
 }
 
-module.exports = { normalizePhone, sendCode, verifyCode, phoneFromToken };
+module.exports = { normalizePhone, sendCode, verifyCode, phoneFromToken, isDummyToken };

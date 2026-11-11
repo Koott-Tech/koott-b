@@ -116,7 +116,7 @@ async function updateClient(clientId, fields) {
  *   { found: false }              — new visitor, kept as a lead
  *   { ok: false, status, message } on a conflict
  */
-async function afterVerified(phone, { signedInUserId = null, psychologistId = null } = {}) {
+async function afterVerified(phone, { signedInUserId = null, psychologistId = null, trusted = true } = {}) {
   if (signedInUserId) {
     const { data: me } = await supabaseAdmin
       .from('clients').select('id, first_name, last_name').eq('user_id', signedInUserId).maybeSingle();
@@ -140,6 +140,9 @@ async function afterVerified(phone, { signedInUserId = null, psychologistId = nu
   }
 
   const client = await findClientByPhone(phone);
+  // Testing-phase dummy code: not proof of the number, so no sign-in to the account
+  // holding it (and no name back) — they sign in with their password instead.
+  if (client && !trusted) return { found: true, signInRequired: true };
   if (client) {
     updateClient(client.id, { phone_verified_at: now() });
     const name = displayName(client);
@@ -158,7 +161,7 @@ async function afterVerified(phone, { signedInUserId = null, psychologistId = nu
  * Create the client account for a verified number from "About yourself" and sign
  * them in. Returns { auth, created } or { conflict: 'email' }.
  */
-async function createAccount({ phone, name, email, age, emergency, psychologistId }) {
+async function createAccount({ phone, name, email, age, emergency, psychologistId, trusted = true }) {
   const cleanEmail = String(email).trim().toLowerCase();
   const cleanName = String(name).trim().slice(0, 120);
   const ageNum = Number.isInteger(Number(age)) && Number(age) > 0 && Number(age) < 130 ? Number(age) : null;
@@ -170,6 +173,7 @@ async function createAccount({ phone, name, email, age, emergency, psychologistI
 
   // Someone may have created the account for this number meanwhile — just sign in.
   const holder = await findClientByPhone(phone);
+  if (holder && !trusted) return { signInRequired: true };
   if (holder) {
     saveLead(phone, { ...leadDetails, status: 'account', client_id: holder.id, existing_account: true });
     return { auth: signIn(holder), created: false };
