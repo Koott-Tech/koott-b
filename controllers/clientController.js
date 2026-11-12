@@ -399,6 +399,7 @@ const getSessions = async (req, res) => {
             first_name,
             last_name,
             area_of_expertise,
+            designation,
             profile_picture_url
           )
         `)
