@@ -85,7 +85,9 @@ async function serveImage(req, res) {
     const ct = contentTypeForFilename(normalized);
 
     res.setHeader('Content-Type', ct);
-    res.setHeader('Cache-Control', 'public, max-age=86400, s-maxage=86400');
+    // Uploaded files get unique names (timestamp / id), so the CDN can keep them a week
+    // and refresh in the background: each photo then skips the trip to this server.
+    res.setHeader('Cache-Control', 'public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400');
     res.setHeader('Content-Length', String(buf.length));
 
     if (req.method === 'HEAD') {
