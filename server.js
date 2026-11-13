@@ -1033,8 +1033,15 @@ console.log(`🚀 Koott Backend running on port ${PORT}`);
   // Start Google Calendar sync service
   calendarSyncService.start();
   
+  // Jobs that message clients or change live sessions. A laptop in development shares the
+  // live database, so there they are off (it once tried to WhatsApp a real client a
+  // reminder). Anywhere else they run as before. LIVE_JOBS=on / off overrides.
+  const liveJobs = process.env.LIVE_JOBS === 'on'
+    || (process.env.LIVE_JOBS !== 'off' && process.env.NODE_ENV !== 'development');
+  if (!liveJobs) console.log('⏸️  Live jobs off here (session reminders, booking recovery, missing-links crawler). Set LIVE_JOBS=on to run them.');
+
   // Start Session Reminder service (2-hour WhatsApp reminders)
-  sessionReminderService.start();
+  if (liveJobs) sessionReminderService.start();
   
   // Start Daily Availability service (adds next day at 12 AM)
   dailyAvailabilityService.start();
@@ -1051,7 +1058,7 @@ console.log(`🚀 Koott Backend running on port ${PORT}`);
   
   // Start Recovery Job (recovers failed session creations, runs every 5 minutes)
   const { startRecoveryScheduler } = require('./jobs/recoveryJob');
-  startRecoveryScheduler(5); // Run every 5 minutes
+  if (liveJobs) startRecoveryScheduler(5); // Run every 5 minutes
   
   // Start Security Logs Cleanup Job (deletes logs older than 1 week, runs weekly)
   const { startSecurityLogsCleanupScheduler } = require('./jobs/securityLogsCleanupJob');
@@ -1062,7 +1069,7 @@ console.log(`🚀 Koott Backend running on port ${PORT}`);
   startAuditLogsCleanupScheduler(7); // Run every 7 days (weekly)
 
   const { startDailyCrawlerScheduler } = require('./jobs/dailyCrawlerJob');
-  startDailyCrawlerScheduler();
+  if (liveJobs) startDailyCrawlerScheduler();
 
   // Automatic tasks (services/autoTasksService.js): leads, reschedules, renewals, availability…
   require('./services/autoTasksService').startAutoTasks();
