@@ -2,7 +2,10 @@ const { supabaseAdmin } = require('../config/supabase');
 const {
   deriveSessionCount,
   ensureClientPackageRecord,
-  assertClientPackageHasAvailableSlot
+  assertClientPackageHasAvailableSlot,
+  purchaseHasRoom,
+  assignSessionToPurchase,
+  comparePurchases
 } = require('../services/packageService');
 const { 
   successResponse, 
@@ -1148,14 +1151,18 @@ const bookSession = async (req, res) => {
         };
 
         // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
-        const { error: clientPackageError } = await supabaseAdmin
+        const { data: newPurchase, error: clientPackageError } = await supabaseAdmin
           .from('client_packages')
-          .insert([clientPackageData]);
+          .insert([clientPackageData])
+          .select('*')
+          .single();
 
         if (clientPackageError) {
           console.error('❌ Client package creation failed:', clientPackageError);
           // Continue even if client package creation fails
         } else {
+          // First session of this purchase: its group id is the purchase id.
+          await assignSessionToPurchase(session.id, newPurchase);
           console.log('✅ Client package record created successfully');
           console.log('   - Remaining sessions:', packageData.session_count - 1);
         }
@@ -3367,35 +3374,42 @@ const getClientPackages = async (req, res) => {
     // Fetch all package sessions to calculate completed_sessions accurately
     const { data: allPackageSessionsForCount, error: packageSessionsCountError } = await supabaseAdmin
       .from('sessions')
-      .select('id, package_id, status')
+      .select('id, package_id, package_group_id, status')
       .eq('client_id', clientId)
       .not('package_id', 'is', null);
 
-    // Group sessions by package_id and count completed and booked ones
-    const completedCountsByPackage = {};
-    const bookedCountsByPackage = {};
+    // Count per PURCHASE (sessions.package_group_id = client_packages.id), so two purchases of
+    // the same plan don't show each other's sessions. Sessions not grouped yet (booked before
+    // grouping existed) still count against the oldest purchase of their plan.
+    const tally = (map, key, status) => {
+      map[key] = map[key] || { completed: 0, booked: 0 };
+      if (status === 'completed') map[key].completed += 1;
+      else if (!['cancelled', 'canceled', 'no_show', 'noshow'].includes(status)) map[key].booked += 1;
+    };
+    const byPurchase = {};
+    const ungroupedByPlan = {};
     if (!packageSessionsCountError && allPackageSessionsForCount) {
-      allPackageSessionsForCount.forEach(session => {
-        if (session.package_id) {
-          if (session.status === 'completed') {
-            completedCountsByPackage[session.package_id] = (completedCountsByPackage[session.package_id] || 0) + 1;
-          } else if (session.status !== 'cancelled' && session.status !== 'no_show' && session.status !== 'noshow') {
-            // Count booked/scheduled/rescheduled sessions (not completed, not cancelled, not no-show)
-            bookedCountsByPackage[session.package_id] = (bookedCountsByPackage[session.package_id] || 0) + 1;
-          }
-        }
+      allPackageSessionsForCount.forEach((session) => {
+        if (session.package_group_id) tally(byPurchase, session.package_group_id, session.status);
+        else if (session.package_id) tally(ungroupedByPlan, session.package_id, session.status);
       });
     }
+    const oldestPurchaseOfPlan = {};
+    [...(clientPackages || [])]
+      .sort(comparePurchases)
+      .forEach((pkg) => { if (!oldestPurchaseOfPlan[pkg.package_id]) oldestPurchaseOfPlan[pkg.package_id] = pkg.id; });
 
     const normalizedPackages = (clientPackages || []).map(pkg => {
       const totalSessions = deriveSessionCount(pkg);
-      
+      const own = byPurchase[pkg.id] || { completed: 0, booked: 0 };
+      const legacy = oldestPurchaseOfPlan[pkg.package_id] === pkg.id ? (ungroupedByPlan[pkg.package_id] || { completed: 0, booked: 0 }) : { completed: 0, booked: 0 };
+
       // Calculate completed_sessions by counting actual completed sessions
-      const completedSessions = completedCountsByPackage[pkg.package_id] || 0;
-      
+      const completedSessions = own.completed + legacy.completed;
+
       // Calculate booked (but not completed) sessions
-      const bookedSessions = bookedCountsByPackage[pkg.package_id] || 0;
-      
+      const bookedSessions = own.booked + legacy.booked;
+
       // Calculate remaining_sessions for display: total - completed (sessions left to complete)
       // This is different from the database remaining_sessions which tracks sessions left to book
       const remainingSessionsForDisplay = Math.max(totalSessions - completedSessions, 0);
@@ -3519,6 +3533,13 @@ const bookRemainingSession = async (req, res) => {
     if (!quotaCheck.ok) {
       return res.status(quotaCheck.httpStatus || 400).json(
         errorResponse(quotaCheck.message || 'No remaining sessions in this package')
+      );
+    }
+    // …and THIS purchase must have a free slot (two purchases of one plan are counted apart).
+    const roomCheck = await purchaseHasRoom({ ...clientPackage, session_count: clientPackage.session_count ?? clientPackage.package?.session_count });
+    if (!roomCheck.ok) {
+      return res.status(roomCheck.httpStatus || 400).json(
+        errorResponse(roomCheck.message || 'No remaining sessions in this package')
       );
     }
 
@@ -3659,6 +3680,10 @@ const bookRemainingSession = async (req, res) => {
       );
     }
 
+    // The session joins the purchase it was booked from (group id = purchase id).
+    const grouped = await assignSessionToPurchase(session.id, { ...clientPackage, session_count: clientPackage.session_count ?? clientPackage.package?.session_count });
+    if (!grouped.ok) console.error('bookRemainingSession: could not group session', session.id, grouped.error?.message);
+
     const totalSessions = deriveSessionCount(clientPackage);
     const currentRemaining = Number.isFinite(clientPackage.remaining_sessions)
       ? clientPackage.remaining_sessions
@@ -3670,8 +3695,7 @@ const bookRemainingSession = async (req, res) => {
     const { data: packageSessions, error: sessionsError } = await supabaseAdmin
       .from('sessions')
       .select('id, status')
-      .eq('package_id', clientPackage.package.id)
-      .eq('client_id', clientId);
+      .eq('package_group_id', clientPackage.id); // this purchase only, not every purchase of the plan
 
     const completedSessions = (!sessionsError && packageSessions)
       ? packageSessions.filter(s => s.status === 'completed').length

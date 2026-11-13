@@ -12,7 +12,7 @@
 
 const { supabaseAdmin } = require('../config/supabase');
 const { recordSlotBooking } = require('../utils/slotEvents');
-const { assertClientPackageHasAvailableSlot } = require('./packageService');
+const { assertClientPackageHasAvailableSlot, ensureClientPackageRecord } = require('./packageService');
 const { updateSlotLockStatus } = require('./slotLockService');
 const meetLinkService = require('../utils/meetLinkService');
 const { getMeetEventDurationMinutes } = require('../utils/sessionMeetDuration');
@@ -308,6 +308,29 @@ const createSessionFromSlotLock = async (slotLock) => {
       console.log('✅ Payment record updated with session_id:', session.id);
     }
 
+    // A paid package booking is a new purchase: record it, with this as its first session
+    // (its group id is the purchase id). The browser's /payment/success call does the same;
+    // this covers the webhook / recovery path when the browser never came back. Duplicate-safe
+    // (keyed on the first session).
+    if (sessionData.package_id) {
+      try {
+        const { data: pkgRow } = await supabaseAdmin.from('packages').select('*').eq('id', sessionData.package_id).maybeSingle();
+        if (pkgRow && Number(pkgRow.session_count) > 1) {
+          const { error: cpErr } = await ensureClientPackageRecord({
+            clientId: slotLock.client_id,
+            psychologistId: slotLock.psychologist_id,
+            packageId: sessionData.package_id,
+            sessionId: session.id,
+            packageData: pkgRow,
+            consumedSessions: 1,
+          });
+          if (cpErr) console.error('⚠️ Package purchase record not created:', cpErr.message || cpErr);
+        }
+      } catch (cpEx) {
+        console.error('⚠️ Package purchase record failed:', cpEx.message);
+      }
+    }
+
     // Their booking-flow lead (if any) is now a booking
     require('../utils/bookingAccounts').markLeadBooked(slotLock.client_id).catch(() => {});
 
@@ -494,11 +517,13 @@ class MeetLinkCreationQueue {
         if (!packageError && packageData) {
           meetDurationMinutes = getMeetEventDurationMinutes(packageData.package_type);
           // Calculate package progress: count completed sessions for this package
-          const { data: packageSessions, error: sessionsError } = await supabaseAdmin
-            .from('sessions')
-            .select('id, status')
-            .eq('package_id', paymentRecord.package_id)
-            .eq('client_id', slotLock.client_id);
+          // This purchase only (group id = purchase id); every purchase of the plan otherwise.
+          const { data: grp } = await supabaseAdmin.from('sessions').select('package_group_id').eq('id', session.id).maybeSingle();
+          let progressQuery = supabaseAdmin.from('sessions').select('id, status');
+          progressQuery = grp?.package_group_id
+            ? progressQuery.eq('package_group_id', grp.package_group_id)
+            : progressQuery.eq('package_id', paymentRecord.package_id).eq('client_id', slotLock.client_id);
+          const { data: packageSessions, error: sessionsError } = await progressQuery;
           
           if (!sessionsError && packageSessions) {
             const totalSessions = packageData.session_count || 0;

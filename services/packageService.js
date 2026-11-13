@@ -165,7 +165,7 @@ const ensureClientPackageRecord = async ({
     // Avoid duplicate rows for the same first session
     const { data: existing, error: existingError } = await supabaseAdmin
       .from('client_packages')
-      .select('id, client_id, package_id, first_session_id')
+      .select('id, client_id, package_id, first_session_id, session_count, total_sessions, package_type')
       .eq('client_id', clientId)
       .eq('package_id', packageId)
       .eq('first_session_id', sessionId || null)
@@ -180,6 +180,8 @@ const ensureClientPackageRecord = async ({
     }
 
     if (existing) {
+      // Older rows may predate grouping: make sure the first session is in this purchase.
+      if (sessionId) await assignSessionToPurchase(sessionId, existing);
       return {
         created: false,
         data: existing,
@@ -240,6 +242,9 @@ const ensureClientPackageRecord = async ({
       };
     }
 
+    // The first session belongs to this purchase (its group id is the purchase id).
+    if (sessionId) await assignSessionToPurchase(sessionId, inserted);
+
     return {
       created: true,
       data: inserted,
@@ -254,9 +259,108 @@ const ensureClientPackageRecord = async ({
   }
 };
 
+/* ------------------------------------------------------------------------------------
+ * Package grouping
+ *
+ * Every purchase (a client_packages row) is its own group, and its id is the group id on
+ * each of its sessions (sessions.package_group_id). Two purchases of the same plan with the
+ * same therapist therefore stay apart: labels (A, B, … Z, A1 …) follow purchase order, and
+ * "book next session" always adds to the purchase it was booked from. Grouping used to key
+ * on the catalog plan (sessions.package_id), which is the same for both purchases, so their
+ * sessions merged into one group.
+ * ---------------------------------------------------------------------------------- */
+
+const COUNTS_TOWARD_PACKAGE = (status) => !['cancelled', 'canceled', 'no_show', 'noshow'].includes(status);
+
+/** Sessions in this purchase that use up one of its slots (booked, done, rescheduled…). */
+const countSessionsInPurchase = async (clientPackageId, { excludeSessionId = null } = {}) => {
+  let q = supabaseAdmin.from('sessions').select('id, status').eq('package_group_id', clientPackageId);
+  if (excludeSessionId) q = q.neq('id', excludeSessionId);
+  const { data, error } = await q;
+  if (error) return { error, used: 0 };
+  return { error: null, used: (data || []).filter((s) => COUNTS_TOWARD_PACKAGE(s.status)).length };
+};
+
+/** ok: false when every session of this purchase is already booked or done. */
+const purchaseHasRoom = async (clientPackage) => {
+  const total = deriveSessionCount(clientPackage, 0);
+  if (!clientPackage?.id || total < 1) return { ok: true };
+  const { error, used } = await countSessionsInPurchase(clientPackage.id);
+  if (error) return { ok: false, httpStatus: 500, message: 'Failed to verify package session quota' };
+  if (used >= total) {
+    return {
+      ok: false, httpStatus: 400, used, limit: total,
+      message: 'This package has no remaining sessions. All sessions for this package have already been booked or completed.',
+    };
+  }
+  return { ok: true, used, limit: total };
+};
+
+/**
+ * Put a session into its purchase's group: package_group_id = the purchase id,
+ * package_session_number = its place among the purchase's live sessions, session_count = the
+ * package size. Safe to call twice for the same session.
+ */
+const assignSessionToPurchase = async (sessionId, clientPackage) => {
+  if (!sessionId || !clientPackage?.id) return { ok: false, error: new Error('session and purchase are required') };
+  const total = deriveSessionCount(clientPackage, 0);
+  // A single-session purchase is not a package: no group (the admin list shows any grouped
+  // session as "Package n/total").
+  if (total <= 1) return { ok: true, skipped: true, number: 1, total };
+  const { error, used } = await countSessionsInPurchase(clientPackage.id, { excludeSessionId: sessionId });
+  if (error) return { ok: false, error };
+  const patch = { package_group_id: clientPackage.id, package_session_number: used + 1 };
+  if (total > 1) patch.session_count = total;
+  const { error: updErr } = await supabaseAdmin.from('sessions').update(patch).eq('id', sessionId);
+  if (updErr) return { ok: false, error: updErr };
+  return { ok: true, number: used + 1, total };
+};
+
+/**
+ * Purchase order: the purchase DAY first (admin enters a date, the website a full time, so
+ * comparing full timestamps would put an admin entry made later that day first), then when
+ * the record was created. A back-dated purchase still sorts on its real day.
+ */
+const purchaseSortKey = (p) => [
+  String(p?.purchased_at || p?.created_at || '').slice(0, 10),
+  String(p?.created_at || p?.purchased_at || ''),
+];
+const comparePurchases = (a, b) => {
+  const [ad, at] = purchaseSortKey(a); const [bd, bt] = purchaseSortKey(b);
+  return ad.localeCompare(bd) || at.localeCompare(bt) || String(a?.id || '').localeCompare(String(b?.id || ''));
+};
+
+/** The client's oldest active purchase of this plan that still has a free slot (or null). */
+const findOpenPurchase = async (clientId, catalogPackageId) => {
+  const { data, error } = await supabaseAdmin
+    .from('client_packages')
+    .select('*')
+    .eq('client_id', clientId)
+    .eq('package_id', catalogPackageId)
+    .eq('status', 'active');
+  if (error) return { error, purchase: null };
+  for (const p of [...(data || [])].sort(comparePurchases)) {
+    if ((await purchaseHasRoom(p)).ok) return { error: null, purchase: p };
+  }
+  return { error: null, purchase: null };
+};
+
+/** A, B, … Z, then A1 … Z1, A2 … — never runs out. */
+const packageLabel = (index) => {
+  const letter = String.fromCharCode(65 + (index % 26));
+  const round = Math.floor(index / 26);
+  return round === 0 ? letter : `${letter}${round}`;
+};
+
 module.exports = {
   deriveSessionCount,
   ensureClientPackageRecord,
+  countSessionsInPurchase,
+  purchaseHasRoom,
+  assignSessionToPurchase,
+  findOpenPurchase,
+  comparePurchases,
+  packageLabel,
   countSessionsTowardClientPackageQuota,
   assertClientPackageHasAvailableSlot
 };

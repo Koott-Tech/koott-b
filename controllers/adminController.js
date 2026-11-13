@@ -8,7 +8,7 @@ const {
   addMinutesToTime
 } = require('../utils/helpers');
 const { validatePassword } = require('../utils/passwordPolicy');
-const { deriveSessionCount } = require('../services/packageService');
+const { deriveSessionCount, assignSessionToPurchase, findOpenPurchase, purchaseHasRoom, packageLabel, comparePurchases } = require('../services/packageService');
 const availabilityService = require('../utils/availabilityCalendarService');
 const { getMeetEventDurationMinutes } = require('../utils/sessionMeetDuration');
 const { getBookingTimeColumnKey } = require('../utils/sessionsBookingTimeColumn');
@@ -420,6 +420,28 @@ const createManualPackageBooking = async (req, res) => {
     }
 
     await supabaseAdmin.from('payments').update({ session_id: created[0]?.id }).eq('id', payment.id);
+
+    // The purchase record, with the group id as its id: the group then points at a real
+    // purchase (A/B labels follow purchase order; "Book Next" and the client's package list
+    // see it). Not fatal if it fails — the sessions are booked.
+    {
+      const remaining = Math.max(sessionCount - created.length, 0);
+      const { error: cpErr } = await supabaseAdmin.from('client_packages').insert([{
+        id: packageGroupId,
+        client_id: client.id,
+        psychologist_id,
+        package_id: resolvedPackageId || null,
+        package_type: session_type || selection.sessionType || null,
+        total_sessions: sessionCount,
+        remaining_sessions: remaining,
+        total_amount: parseFloat(amount) || null,
+        amount_paid: parseFloat(amount) || null,
+        status: 'active',
+        purchased_at: payment_received_date || new Date().toISOString(),
+        first_session_id: created[0]?.id || null,
+      }]);
+      if (cpErr) console.warn('[createManualPackageBooking] purchase record not created:', cpErr.message);
+    }
     console.log(`✅ [createManualPackageBooking] booked ${created.length} sessions (group ${packageGroupId})`);
     return res.json(successResponse({ sessions: created, package_group_id: packageGroupId, count: created.length }, `Booked ${created.length} package sessions with calendar + notifications`));
   } catch (e) {
@@ -590,11 +612,17 @@ const createRecordOnlyPackage = async (req, res) => {
 
     // client_packages: remaining = total − recorded, so "Book Next Session" continues from here.
     const remaining = Math.max(totalSessions - records.length, 0);
+    // The purchase record uses the group id as its id, so the recorded sessions and any
+    // later "Book Next" sessions share one group (and one A/B label).
     await supabaseAdmin.from('client_packages').insert([{
+      id: groupId,
       client_id: client.id, package_id: packageId,
+      psychologist_id: psychologist.id,
+      total_sessions: totalSessions,
       remaining_sessions: remaining,
       status: remaining > 0 ? 'active' : 'completed',
-    }]).select('id').maybeSingle().then(() => {}).catch(() => {});
+      first_session_id: created[0]?.id || null,
+    }]).select('id').maybeSingle().then(({ error }) => { if (error) console.warn('[createRecordOnlyPackage] purchase record not created:', error.message); }).catch(() => {});
 
     return res.json(successResponse({
       package_id: packageId, package_group_id: groupId,
@@ -1150,35 +1178,30 @@ const createManualBooking = async (req, res) => {
     // ============================================
     if (package_id && packageData) {
       try {
-        const { data: existingClientPackage } = await supabaseAdmin
-          .from('client_packages')
-          .select('*')
-          .eq('client_id', client.id)
-          .eq('package_id', package_id)
-          .eq('status', 'active')
-          .maybeSingle();
+        // The oldest active purchase of this plan that still has a free slot. (It was a
+        // .maybeSingle() on status=active, which errors when the client has two active
+        // purchases of the plan — and then a third purchase got created.)
+        const { purchase: existingClientPackage } = await findOpenPurchase(client.id, package_id);
 
-        const currentRemaining = existingClientPackage?.remaining_sessions ?? 0;
-        const hasRemaining = currentRemaining > 0;
+        const hasRemaining = Boolean(existingClientPackage); // findOpenPurchase only returns one with a free slot
 
         if (existingClientPackage && hasRemaining) {
-          // Atomic conditional update: decrement remaining_sessions only if > 0
-          const { data: updatedPackage, error: updateError } = await supabaseAdmin
-            .from('client_packages')
-            .update({ remaining_sessions: currentRemaining - 1 })
-            .eq('id', existingClientPackage.id)
-            .gt('remaining_sessions', 0)
-            .select('remaining_sessions')
-            .single();
-
-          if (updateError || !updatedPackage) {
+          // Join the purchase, then recount from its sessions (the source of truth). If a
+          // booking made at the same moment took the last slot, roll this one back.
+          const grouped = await assignSessionToPurchase(session.id, existingClientPackage);
+          const total = deriveSessionCount(existingClientPackage);
+          if (!grouped.ok || grouped.number > total) {
             if (session) await supabaseAdmin.from('sessions').delete().eq('id', session.id);
             if (paymentRecord) await supabaseAdmin.from('payments').delete().eq('id', paymentRecord.id);
             return res.status(400).json(
               errorResponse('Package has no remaining sessions (race condition detected). Session and payment have been rolled back.')
             );
           }
-          console.log('✅ [MANUAL BOOKING] Updated existing client package (atomic update successful)');
+          await supabaseAdmin
+            .from('client_packages')
+            .update({ remaining_sessions: Math.max(total - grouped.number, 0), updated_at: new Date().toISOString() })
+            .eq('id', existingClientPackage.id);
+          console.log('✅ [MANUAL BOOKING] Added to existing client package', existingClientPackage.id, `(session ${grouped.number} of ${total})`);
         } else {
           // No active package, or existing package exhausted: create new client_packages (new purchase)
           if (existingClientPackage && !hasRemaining) {
@@ -1198,9 +1221,13 @@ const createManualBooking = async (req, res) => {
             first_session_id: session.id
           };
 
-          await supabaseAdmin
+          const { data: newPurchase, error: newPurchaseErr } = await supabaseAdmin
             .from('client_packages')
-            .insert([clientPackageData]);
+            .insert([clientPackageData])
+            .select('*')
+            .single();
+          if (newPurchaseErr) throw newPurchaseErr;
+          await assignSessionToPurchase(session.id, newPurchase);
           console.log('✅ [MANUAL BOOKING] Created new client package');
         }
       } catch (packageError) {
@@ -1642,23 +1669,16 @@ const createRecordOnlyBooking = async (req, res) => {
 
     // Update client_packages if package booking (keep counts correct)
     if (package_id && packageData) {
-      const { data: existingClientPackage } = await supabaseAdmin
-        .from('client_packages')
-        .select('*')
-        .eq('client_id', client.id)
-        .eq('package_id', package_id)
-        .eq('status', 'active')
-        .maybeSingle();
+      // Oldest active purchase of this plan with a free slot (see createManualBooking).
+      const { purchase: existingClientPackage } = await findOpenPurchase(client.id, package_id);
 
-      const currentRemaining = existingClientPackage?.remaining_sessions ?? 0;
-      const hasRemaining = currentRemaining > 0;
-
-      if (existingClientPackage && hasRemaining) {
+      if (existingClientPackage) {
+        const grouped = await assignSessionToPurchase(session.id, existingClientPackage);
+        const total = deriveSessionCount(existingClientPackage);
         await supabaseAdmin
           .from('client_packages')
-          .update({ remaining_sessions: currentRemaining - 1 })
-          .eq('id', existingClientPackage.id)
-          .gt('remaining_sessions', 0);
+          .update({ remaining_sessions: Math.max(total - (grouped.number || 0), 0), updated_at: new Date().toISOString() })
+          .eq('id', existingClientPackage.id);
       } else {
         const clientPackageData = {
           client_id: client.id,
@@ -1673,9 +1693,12 @@ const createRecordOnlyBooking = async (req, res) => {
           purchased_at: paymentReceivedDate,
           first_session_id: session.id
         };
-        await supabaseAdmin
+        const { data: newPurchase } = await supabaseAdmin
           .from('client_packages')
-          .insert([clientPackageData]);
+          .insert([clientPackageData])
+          .select('*')
+          .single();
+        if (newPurchase) await assignSessionToPurchase(session.id, newPurchase);
       }
     }
 
@@ -4816,7 +4839,7 @@ const getPsychologistCalendarEvents = async (req, res) => {
 // Book next package session (admin only) - for clients who prefer admin to book remaining sessions
 const bookPackageNextSession = async (req, res) => {
   try {
-    const { client_id, package_id, scheduled_date, scheduled_time } = req.body;
+    const { client_id, package_id, package_group_id, scheduled_date, scheduled_time } = req.body;
 
     if (!client_id || !package_id || !scheduled_date || !scheduled_time) {
       return res.status(400).json(
@@ -4824,36 +4847,42 @@ const bookPackageNextSession = async (req, res) => {
       );
     }
 
-    // Look up client_packages by client_id and package_id (packages.id)
-    let { data: clientPackage, error: packageError } = await supabaseAdmin
-      .from('client_packages')
-      .select(`
+    // Which purchase? The one the clicked session belongs to (package_group_id = purchase id);
+    // otherwise the client's oldest purchase of this plan that still has a free slot. (A
+    // .maybeSingle() on client + plan errored as soon as a client bought the plan twice.)
+    const PURCHASE_FIELDS = `
         id,
         client_id,
         package_id,
         remaining_sessions,
+        purchased_at,
+        created_at,
         package:packages(id, package_type, session_count, psychologist_id)
-      `)
-      .eq('client_id', client_id)
-      .eq('package_id', package_id)
-      .eq('status', 'active')
-      .maybeSingle();
+      `;
+    let clientPackage = null;
+    if (package_group_id) {
+      const { data } = await supabaseAdmin.from('client_packages').select(PURCHASE_FIELDS)
+        .eq('id', package_group_id).eq('client_id', client_id).maybeSingle();
+      clientPackage = data || null;
+    }
+    if (!clientPackage) {
+      const { purchase } = await findOpenPurchase(client_id, package_id);
+      if (purchase) {
+        const { data } = await supabaseAdmin.from('client_packages').select(PURCHASE_FIELDS).eq('id', purchase.id).maybeSingle();
+        clientPackage = data || null;
+      }
+    }
 
-    // Fallback: if no active client_packages, try without status filter (legacy/inconsistent data)
+    // Fallback: a purchase not marked active (legacy/inconsistent data) — oldest first.
     if (!clientPackage) {
       const { data: fallback } = await supabaseAdmin
         .from('client_packages')
-        .select(`
-          id,
-          client_id,
-          package_id,
-          remaining_sessions,
-          package:packages(id, package_type, session_count, psychologist_id)
-        `)
+        .select(PURCHASE_FIELDS)
         .eq('client_id', client_id)
         .eq('package_id', package_id)
-        .maybeSingle();
-      if (fallback) clientPackage = fallback;
+        .order('created_at', { ascending: true })
+        .limit(1);
+      if (fallback && fallback[0]) clientPackage = fallback[0];
     }
 
     // Fallback: if still no client_packages, derive from packages + sessions and create record
@@ -4944,29 +4973,31 @@ const bookPackageNextSession = async (req, res) => {
       return res.status(400).json(errorResponse('Package has no psychologist'));
     }
 
-    // Compute remaining sessions to book (same logic as client bookRemainingSession).
-    // Also read package_group_id so the new session joins the SAME group as its siblings —
-    // otherwise "Book Next" gating (which keys on the group) breaks and the option keeps
-    // showing on earlier sessions of the package.
-    const { data: packageSessions } = await supabaseAdmin
+    // This purchase's sessions (group id = purchase id). Sessions booked before grouping
+    // existed have no group: if this purchase has none yet, it adopts the client's ungrouped
+    // sessions of the plan (never another purchase's grouped sessions — merging every session
+    // of the plan into one group is what put two packages under one label).
+    const purchaseGroupId = clientPackage.id;
+    let { data: packageSessions } = await supabaseAdmin
       .from('sessions')
-      .select('id, status, package_group_id')
-      .eq('package_id', clientPackage.package.id)
-      .eq('client_id', client_id);
-
-    // Inherit the package group id from any existing session in this package.
-    let inheritedGroupId = (packageSessions || []).find(s => s.package_group_id)?.package_group_id || null;
-    // Legacy/admin-created packages may have NO group id on any session. Establish one now
-    // (anchored on an existing session's id) and backfill every session in the package, so the
-    // new session joins a real group instead of falling back to a colliding group key — which
-    // would break "Book Next" gating on the package.
-    if (!inheritedGroupId && Array.isArray(packageSessions) && packageSessions.length > 0) {
-      inheritedGroupId = packageSessions[0].id;
-      await supabaseAdmin
+      .select('id, status, package_group_id, scheduled_date, scheduled_time')
+      .eq('package_group_id', purchaseGroupId);
+    if (!packageSessions || packageSessions.length === 0) {
+      const { data: ungrouped } = await supabaseAdmin
         .from('sessions')
-        .update({ package_group_id: inheritedGroupId })
-        .in('id', packageSessions.map(s => s.id))
-        .is('package_group_id', null);
+        .select('id, status, package_group_id, scheduled_date, scheduled_time')
+        .eq('package_id', clientPackage.package.id)
+        .eq('client_id', client_id)
+        .is('package_group_id', null)
+        .order('scheduled_date', { ascending: true })
+        .order('scheduled_time', { ascending: true });
+      const adopt = (ungrouped || []).slice(0, totalSessionsCount);
+      for (const [i, s] of adopt.entries()) {
+        await supabaseAdmin.from('sessions')
+          .update({ package_group_id: purchaseGroupId, package_session_number: i + 1, session_count: totalSessionsCount })
+          .eq('id', s.id).is('package_group_id', null);
+      }
+      packageSessions = adopt;
     }
 
     let completedCount = 0;
@@ -4974,7 +5005,7 @@ const bookPackageNextSession = async (req, res) => {
     if (Array.isArray(packageSessions)) {
       packageSessions.forEach(s => {
         if (s.status === 'completed') completedCount++;
-        else if (s.status !== 'cancelled' && s.status !== 'no_show' && s.status !== 'noshow') bookedCount++;
+        else if (!['cancelled', 'canceled', 'no_show', 'noshow'].includes(s.status)) bookedCount++;
       });
     }
     const remainingToBook = Math.max(totalSessionsCount - completedCount - bookedCount, 0);
@@ -5033,9 +5064,9 @@ const bookPackageNextSession = async (req, res) => {
       session_type: sessionTypeForPackage,
       session_count: totalSessionsCount,
       package_session_number: nextSessionNumber,
-      // Join the same group as the package's other sessions so "Book Next" only shows on
-      // the latest one (not on every earlier session).
-      package_group_id: inheritedGroupId,
+      // This purchase's group, so "Book Next" only shows on its latest session and the
+      // A/B label stays with the right purchase.
+      package_group_id: purchaseGroupId,
       google_calendar_event_id: null,
       google_meet_link: fallbackMeetLink,
       google_calendar_link: null,
@@ -5064,10 +5095,8 @@ const bookPackageNextSession = async (req, res) => {
     }
 
     const totalSessions = deriveSessionCount(clientPackage);
-    const currentRemaining = Number.isFinite(clientPackage.remaining_sessions)
-      ? clientPackage.remaining_sessions
-      : Math.max(totalSessions - 1, 0);
-    const updatedRemaining = Math.max(currentRemaining - 1, 0);
+    // Remaining = package size − this purchase's live sessions (now including the new one).
+    const updatedRemaining = Math.max(totalSessions - nextSessionNumber, 0);
 
     await supabaseAdmin
       .from('client_packages')
@@ -5391,7 +5420,10 @@ const getPackagesWithRemainingSessions = async (req, res) => {
  * Response shape:
  *   { labels: { "<clientId>|<psychId>": { "<package_group_id>": "A", "<group2>": "B" } } }
  * Only pairs with >1 distinct package group are included (a lone package needs no label).
- * Ordering is by each group's earliest session date, then group id as a deterministic tie-break.
+ * Each group is one purchase (package_group_id = client_packages.id). Ordered by purchase
+ * date, so a label never moves when a session is rescheduled or a newer package's first
+ * session is booked earlier; groups with no purchase record fall back to their earliest
+ * session date. Labels run A … Z, then A1 … Z1, A2 … (services/packageService packageLabel).
  */
 const getPackageLabels = async (req, res) => {
   try {
@@ -5425,17 +5457,29 @@ const getPackageLabels = async (req, res) => {
       }
     }
 
+    // Purchase date per group (the group id is the purchase id).
+    const multi = Object.keys(pairs).filter((pair) => Object.keys(pairs[pair]).length > 1);
+    const groupIds = [...new Set(multi.flatMap((pair) => Object.keys(pairs[pair])))];
+    const purchaseById = {};
+    for (let i = 0; i < groupIds.length; i += 200) {
+      const { data: purchases } = await supabaseAdmin
+        .from('client_packages')
+        .select('id, purchased_at, created_at')
+        .in('id', groupIds.slice(i, i + 200));
+      (purchases || []).forEach((p) => { purchaseById[p.id] = p; });
+    }
+
     const labels = {};
-    for (const pair of Object.keys(pairs)) {
-      const groups = Object.entries(pairs[pair]).sort(
-        (a, b) => a[1].localeCompare(b[1]) || a[0].localeCompare(b[0])
-      );
-      if (groups.length > 1) {
-        labels[pair] = {};
-        groups.forEach(([gid], i) => {
-          labels[pair][gid] = String.fromCharCode(65 + i); // A, B, C, …
-        });
-      }
+    for (const pair of multi) {
+      // Same order as "oldest purchase first" everywhere else (purchase day, then created).
+      // A group with no purchase record uses its first session date in place of both.
+      const groups = Object.entries(pairs[pair])
+        .map(([gid, firstSession]) => purchaseById[gid] || { id: gid, purchased_at: firstSession, created_at: firstSession })
+        .sort(comparePurchases);
+      labels[pair] = {};
+      groups.forEach((g, i) => {
+        labels[pair][g.id] = packageLabel(i); // A … Z, A1 … Z1, A2 …
+      });
     }
 
     return res.json(successResponse({ labels }));
