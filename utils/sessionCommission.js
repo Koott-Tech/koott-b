@@ -30,12 +30,11 @@ function computeSessionDoctorWallet(session, dc, ch, opts) {
   const isCoupleSession = sessionTypeText.includes('couple') ||
     sessionTypeText.includes('cpl');
 
-  const isPackage = !!(
-    (s.package_id && s.package_id !== 'null' && s.package_id !== 'undefined') ||
-    totalSessions > 1 ||
-    sessionTypeText === 'package' ||
-    sessionTypeText.includes('package')
-  );
+  // A package is a session of a multi-session purchase. A catalog plan id alone is NOT enough:
+  // website individual and couple bookings carry the therapist's 1-session "individual" /
+  // "couple" plan in package_id, and treating them as packages fell through to
+  // "price − company package commission" (usually ₹0) — crediting the therapist 100% of the price.
+  const isPackage = isPackageSessionLike(s);
 
   // ── 1. commission_history (already settled — most authoritative) ─────────
   // commission_history stores per-session amounts (not totals), so no further
@@ -177,4 +176,116 @@ function computeSessionDoctorWallet(session, dc, ch, opts) {
   return Math.max(0, sessionAmt - companyInd);
 }
 
-module.exports = { computeSessionDoctorWallet };
+/* ------------------------------------------------------------------------------------
+ * First-session rate: who gets it (one rule for every finance screen and for payouts)
+ *
+ *   · A client's FIRST session is their earliest session at Koott (any therapist, any
+ *     date) that wasn't cancelled — read from their whole history, never from the date
+ *     range or therapist a screen happens to have loaded (a range-filtered list made a
+ *     long-standing client's first session "of the month" look like their first ever).
+ *   · Clients imported from past contact lists (created before PRE_EXISTING_CLIENT_CUTOFF)
+ *     are past clients: none of their sessions is a first session.
+ *   · For packages, the first package is the PURCHASE that contains that first session
+ *     (sessions.package_group_id = client_packages.id). It used to be the catalog plan id,
+ *     which is shared by every client of the therapist — so once any client started on a
+ *     therapist's 3-pack, every client's 3-pack (and every repeat 3-pack) got the first rate.
+ *     computeSessionDoctorWallet then applies the first rate to position 1 only.
+ * ---------------------------------------------------------------------------------- */
+
+const PRE_EXISTING_CLIENT_CUTOFF = '2025-06-01';
+const HISTORY_STATUSES = ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded'];
+
+/** client_ids imported from past contact lists (they never get the first-session rate). */
+async function getPreExistingClientIds(supabaseAdmin, clientIds) {
+  const ids = Array.from(new Set((clientIds || []).filter(Boolean)));
+  const result = new Set();
+  for (let i = 0; i < ids.length; i += 500) {
+    const { data } = await supabaseAdmin
+      .from('clients')
+      .select('id, created_at')
+      .in('id', ids.slice(i, i + 500))
+      .lt('created_at', PRE_EXISTING_CLIENT_CUTOFF);
+    (data || []).forEach((c) => result.add(c.id));
+  }
+  return result;
+}
+
+/** Which purchase a package session belongs to (the plan, per client, for ungrouped legacy rows). */
+function purchaseKeyOf(s) {
+  if (!s) return null;
+  if (s.package_group_id) return `g:${s.package_group_id}`;
+  if (s.package_id && s.client_id) return `p:${s.client_id}|${s.package_id}`;
+  return null;
+}
+
+function isPackageSessionLike(s) {
+  if (!s) return false;
+  const type = String(s.session_type || '').toLowerCase();
+  if ((parseInt(s.session_count, 10) || 1) > 1 || type.includes('package')) return true;
+  // Old rows with no session type: a plan id still marks a package (previous behaviour).
+  const hasPlan = !!(s.package_id && s.package_id !== 'null' && s.package_id !== 'undefined');
+  return hasPlan && !type;
+}
+
+/**
+ * For the given sessions, load their clients' full history and work out first sessions.
+ * Returns { firstSessionIds, firstPurchaseKeys, isFirstSession(session) } where
+ * isFirstSession is the hint to pass to computeSessionDoctorWallet({ isFirstSession }).
+ */
+async function resolveFirstSessionFlags(supabaseAdmin, sessions) {
+  const clientIds = Array.from(new Set((sessions || []).map((s) => s && s.client_id).filter(Boolean)));
+  const firstSessionIds = new Set();
+  const firstPurchaseKeys = new Set();
+  if (clientIds.length) {
+    const history = [];
+    for (let i = 0; i < clientIds.length; i += 100) {
+      let from = 0;
+      for (;;) {
+        const { data, error } = await supabaseAdmin
+          .from('sessions')
+          .select('id, client_id, created_at, scheduled_date, status, session_type, package_id, package_group_id, session_count')
+          .in('client_id', clientIds.slice(i, i + 100))
+          .in('status', HISTORY_STATUSES)
+          .neq('session_type', 'free_assessment')
+          .range(from, from + 999);
+        if (error) throw error;
+        history.push(...(data || []));
+        if (!data || data.length < 1000) break;
+        from += 1000;
+      }
+    }
+    const byClient = {};
+    history.forEach((s) => { (byClient[s.client_id] = byClient[s.client_id] || []).push(s); });
+    const preExisting = await getPreExistingClientIds(supabaseAdmin, Object.keys(byClient));
+    Object.entries(byClient).forEach(([clientId, list]) => {
+      if (preExisting.has(clientId)) return;
+      const first = list.sort((a, b) =>
+        String(a.created_at || a.scheduled_date || '').localeCompare(String(b.created_at || b.scheduled_date || ''))
+        || String(a.id).localeCompare(String(b.id)))[0];
+      if (!first) return;
+      firstSessionIds.add(first.id);
+      if (isPackageSessionLike(first)) {
+        const key = purchaseKeyOf(first);
+        if (key) firstPurchaseKeys.add(key);
+      }
+    });
+  }
+  const isFirstSession = (s) => {
+    if (!s) return false;
+    if (isPackageSessionLike(s)) {
+      const key = purchaseKeyOf(s);
+      return key ? firstPurchaseKeys.has(key) : firstSessionIds.has(s.id);
+    }
+    return firstSessionIds.has(s.id);
+  };
+  return { firstSessionIds, firstPurchaseKeys, isFirstSession };
+}
+
+module.exports = {
+  computeSessionDoctorWallet,
+  resolveFirstSessionFlags,
+  getPreExistingClientIds,
+  purchaseKeyOf,
+  isPackageSessionLike,
+  PRE_EXISTING_CLIENT_CUTOFF,
+};

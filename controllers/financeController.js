@@ -1,6 +1,6 @@
 const { supabaseAdmin } = require('../config/supabase');
 const { successResponse, errorResponse } = require('../utils/helpers');
-const { computeSessionDoctorWallet } = require('../utils/sessionCommission');
+const { computeSessionDoctorWallet, resolveFirstSessionFlags, isPackageSessionLike } = require('../utils/sessionCommission');
 const auditLogger = require('../utils/auditLogger');
 const {
   getSessionBookingCreatedAtIso,
@@ -332,32 +332,8 @@ function subtractMonthsFromIstCalendarYmd(ymdStr, months) {
   return parsed.subtract(months, 'month').format('YYYY-MM-DD');
 }
 
-/**
- * Clients imported from past contact lists (backdated to 2024-12-31, no password_hash/google_id)
- * are pre-existing/past clients even though they have no session history in our system. Their
- * first booking here must NOT be treated as a "first session" for commission purposes — they
- * should get the follow-up rate. Cutoff is safely before any real signup (earliest real signup
- * seen is 2026+).
- */
-const PRE_EXISTING_CLIENT_CUTOFF = '2025-06-01';
-
-/** Returns a Set of client_ids that are pre-existing (imported) clients, given a list of client_ids to check. */
-async function getPreExistingClientIds(clientIds) {
-  const ids = Array.from(new Set((clientIds || []).filter(Boolean)));
-  if (!ids.length) return new Set();
-  const result = new Set();
-  const CHUNK = 500;
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const chunk = ids.slice(i, i + CHUNK);
-    const { data } = await supabaseAdmin
-      .from('clients')
-      .select('id, created_at')
-      .in('id', chunk)
-      .lt('created_at', PRE_EXISTING_CLIENT_CUTOFF);
-    (data || []).forEach((c) => result.add(c.id));
-  }
-  return result;
-}
+// Imported past clients and the first-session rule: utils/sessionCommission.js
+// (getPreExistingClientIds, resolveFirstSessionFlags).
 
 /**
  * Store monthly finance dashboard snapshot
@@ -428,6 +404,41 @@ const storeMonthlySnapshot = async (snapshotData, forceUpdate = false) => {
  * Get Finance Dashboard Data
  * GET /api/finance/dashboard
  */
+/**
+ * Package profit, the same way as the therapist finance profile: the session that collected
+ * the package price carries price − the therapist's share of EVERY session in that purchase,
+ * and its ₹0 follow-ups carry ₹0. (Per-session "price − share, floored at 0" counted the
+ * follow-ups' therapist cost as company money.) Siblings are fetched by purchase
+ * (package_group_id), so a package split across months or years still nets correctly.
+ * Returns (session, price, fallback) => company share; fallback for non-grouped sessions.
+ */
+async function packageCompanyShareFor(sessions, commissionRecordsMap, commissionHistoryMap, firstFlags) {
+  const totals = new Map();
+  const groupIds = [...new Set((sessions || []).map((x) => x.package_group_id).filter(Boolean))];
+  const UNPAID = ['cancelled', 'canceled', 'refunded'];
+  for (let i = 0; i < groupIds.length; i += 100) {
+    const { data: sibs } = await supabaseAdmin
+      .from('sessions')
+      .select('id, client_id, psychologist_id, status, session_type, session_count, package_id, package_group_id, package_session_number, price, therapist_commission')
+      .in('package_group_id', groupIds.slice(i, i + 100));
+    for (const sib of sibs || []) {
+      if (UNPAID.includes(String(sib.status || '').toLowerCase())) continue;
+      const d = computeSessionDoctorWallet(
+        sib,
+        (commissionRecordsMap && commissionRecordsMap[sib.psychologist_id]) || null,
+        (commissionHistoryMap && commissionHistoryMap[sib.id]) || null,
+        { isFirstSession: firstFlags.isFirstSession(sib) }
+      ) || 0;
+      totals.set(sib.package_group_id, (totals.get(sib.package_group_id) || 0) + d);
+    }
+  }
+  return (sess, price, fallback) => (
+    sess && sess.package_group_id && totals.has(sess.package_group_id)
+      ? (price > 0 ? price - totals.get(sess.package_group_id) : 0)
+      : fallback
+  );
+}
+
 const getDashboard = async (req, res) => {
   try {
     console.log('Finance dashboard request received:', { dateFrom: req.query.dateFrom, dateTo: req.query.dateTo });
@@ -1168,7 +1179,7 @@ const getDashboard = async (req, res) => {
         // We'll filter in the processing loop based on different criteria for each metric
         let allSessionsQuery = supabaseAdmin
           .from('sessions')
-          .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, payment_id, created_at, updated_at, completion_date, package_session_number, session_count, booking_created_at, source')
+          .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, payment_id, created_at, updated_at, completion_date, package_session_number, session_count, package_group_id, booking_created_at, source')
           .not('psychologist_id', 'is', null)
           .neq('session_type', 'free_assessment')
           .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
@@ -1189,7 +1200,7 @@ const getDashboard = async (req, res) => {
         if (allSessionsError && String(allSessionsError.message || '').includes('payment_id')) {
           allSessionsQuery = supabaseAdmin
             .from('sessions')
-            .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, created_at, updated_at, completion_date, package_session_number, session_count, booking_created_at, source')
+            .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, created_at, updated_at, completion_date, package_session_number, session_count, package_group_id, booking_created_at, source')
             .not('psychologist_id', 'is', null)
             .neq('session_type', 'free_assessment')
             .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
@@ -1202,7 +1213,7 @@ const getDashboard = async (req, res) => {
         if (allSessionsError && /booking_created_at/i.test(String(allSessionsError.message || ''))) {
           allSessionsQuery = supabaseAdmin
             .from('sessions')
-            .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, payment_id, created_at, updated_at, completion_date, package_session_number, session_count, source')
+            .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, payment_id, created_at, updated_at, completion_date, package_session_number, session_count, package_group_id, source')
             .not('psychologist_id', 'is', null)
             .neq('session_type', 'free_assessment')
             .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
@@ -1214,7 +1225,7 @@ const getDashboard = async (req, res) => {
           if (allSessionsError && String(allSessionsError.message || '').includes('payment_id')) {
             allSessionsQuery = supabaseAdmin
               .from('sessions')
-              .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, created_at, updated_at, completion_date, package_session_number, session_count, source')
+              .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, created_at, updated_at, completion_date, package_session_number, session_count, package_group_id, source')
               .not('psychologist_id', 'is', null)
               .neq('session_type', 'free_assessment')
               .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
@@ -1300,52 +1311,13 @@ const getDashboard = async (req, res) => {
           }
         });
         
-        // Determine first sessions for each client (sorted by created_at)
-        const clientFirstSessions = new Set();
-        if (allSessions && allSessions.length > 0) {
-          const sessionsByClient = {};
-          allSessions.forEach(s => {
-            if (!s.client_id) return;
-            if (!sessionsByClient[s.client_id]) {
-              sessionsByClient[s.client_id] = [];
-            }
-            sessionsByClient[s.client_id].push(s);
-          });
-          
-          // For each client, mark the first paid session as first session
-          Object.values(sessionsByClient).forEach(clientSessions => {
-            // Sort by created_at to find the earliest session
-            const sortedSessions = clientSessions.sort((a, b) => {
-              const dateA = new Date(a.created_at || a.scheduled_date || 0);
-              const dateB = new Date(b.created_at || b.scheduled_date || 0);
-              return dateA - dateB;
-            });
-            
-            // Mark the first session as first session
-            if (sortedSessions.length > 0 && sortedSessions[0].id) {
-              clientFirstSessions.add(sortedSessions[0].id);
-            }
-          });
+        // First session / first package: one rule for all finance screens and payouts
+        // (utils/sessionCommission resolveFirstSessionFlags — whole client history, purchase-level).
+        const firstFlags = await resolveFirstSessionFlags(supabaseAdmin, allSessions || []);
+        const clientFirstSessions = firstFlags.firstSessionIds;
 
-          // Pre-existing (imported) clients don't get the first-session rate even
-          // though this is their first session in our system — they're past clients.
-          const preExistingIds = await getPreExistingClientIds(Object.keys(sessionsByClient));
-          if (preExistingIds.size) {
-            Object.entries(sessionsByClient).forEach(([clientId, clientSessions]) => {
-              if (!preExistingIds.has(clientId)) return;
-              clientSessions.forEach(s => clientFirstSessions.delete(s.id));
-            });
-          }
-        }
-
-        // Build a set of package_ids whose package is the client's first engagement.
-        // All sessions in such a package use the first-session commission rate.
-        const firstPackages = new Set();
-        (allSessions || []).forEach(s => {
-          if (s.package_id && clientFirstSessions.has(s.id)) {
-            firstPackages.add(s.package_id);
-          }
-        });
+        // Package profit nets per purchase (see packageCompanyShareFor).
+        const packageCompanyShare = await packageCompanyShareFor(allSessions || [], commissionRecordsMap, commissionHistoryMap, firstFlags);
 
         // Calculate totals - separate completed vs pending
         // Apply different date filters for pending vs completed payouts
@@ -1507,8 +1479,8 @@ const getDashboard = async (req, res) => {
             // Completed session — use shared utility for consistent per-session split
             const dc = commissionRecordsMap[s.psychologist_id] || null;
             const ch = historyRecord || null;
-            toDoctorWallet = computeSessionDoctorWallet(s, dc, ch);
-            commissionToCompany = Math.max(0, sessionPrice - toDoctorWallet);
+            toDoctorWallet = computeSessionDoctorWallet(s, dc, ch, { isFirstSession: firstFlags.isFirstSession(s) });
+            commissionToCompany = packageCompanyShare(s, sessionPrice, Math.max(0, sessionPrice - toDoctorWallet));
 
             if (shouldIncludeForCompleted) {
               totalCompanyCommissionCompleted += commissionToCompany;
@@ -1520,8 +1492,8 @@ const getDashboard = async (req, res) => {
           } else {
             // Booked/Non-completed — pending payout, use shared utility for consistent split
             const dc = commissionRecordsMap[s.psychologist_id] || null;
-            toDoctorWallet = computeSessionDoctorWallet(s, dc, null);
-            commissionToCompany = Math.max(0, sessionPrice - toDoctorWallet);
+            toDoctorWallet = computeSessionDoctorWallet(s, dc, null, { isFirstSession: firstFlags.isFirstSession(s) });
+            commissionToCompany = packageCompanyShare(s, sessionPrice, Math.max(0, sessionPrice - toDoctorWallet));
           }
           
           // Add to commission totals based on different criteria:
@@ -2122,7 +2094,7 @@ const getDoctorPayouts = async (req, res) => {
     // Get only sessions that can appear for the requested payout status.
     let allSessionsQuery = supabaseAdmin
       .from('sessions')
-      .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, payment_id, created_at, updated_at, completion_date, package_session_number, session_count')
+      .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, payment_id, created_at, updated_at, completion_date, package_session_number, session_count, package_group_id')
       .not('psychologist_id', 'is', null)
       .neq('session_type', 'free_assessment')
       .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow'])
@@ -2259,47 +2231,12 @@ const getDoctorPayouts = async (req, res) => {
       }
     });
     
-    // Determine first sessions for each client
-    const clientFirstSessions = new Set();
-    if (allSessions && allSessions.length > 0) {
-      const sessionsByClient = {};
-      allSessions.forEach(s => {
-        if (!s.client_id) return;
-        if (!sessionsByClient[s.client_id]) {
-          sessionsByClient[s.client_id] = [];
-        }
-        sessionsByClient[s.client_id].push(s);
-      });
-      
-      Object.values(sessionsByClient).forEach(clientSessions => {
-        const sortedSessions = clientSessions.sort((a, b) => {
-          const dateA = new Date(a.created_at || a.scheduled_date || 0);
-          const dateB = new Date(b.created_at || b.scheduled_date || 0);
-          return dateA - dateB;
-        });
-        
-        if (sortedSessions.length > 0 && sortedSessions[0].id) {
-          clientFirstSessions.add(sortedSessions[0].id);
-        }
-      });
-
-      // Pre-existing (imported) clients don't get the first-session rate even
-      // though this is their first session in our system — they're past clients.
-      const preExistingIds = await getPreExistingClientIds(Object.keys(sessionsByClient));
-      if (preExistingIds.size) {
-        Object.entries(sessionsByClient).forEach(([clientId, clientSessions]) => {
-          if (!preExistingIds.has(clientId)) return;
-          clientSessions.forEach(s => clientFirstSessions.delete(s.id));
-        });
-      }
-    }
-
-    const firstPackages = new Set();
-    (allSessions || []).forEach(s => {
-      if (s.package_id && clientFirstSessions.has(s.id)) {
-        firstPackages.add(s.package_id);
-      }
-    });
+    // First session / first package: one rule for all finance screens and payouts
+    // (utils/sessionCommission resolveFirstSessionFlags — whole client history, purchase-level).
+    const firstFlags = await resolveFirstSessionFlags(supabaseAdmin, allSessions || []);
+    const clientFirstSessions = firstFlags.firstSessionIds;
+    // Package profit nets per purchase (see packageCompanyShareFor).
+    const packageCompanyShare = await packageCompanyShareFor(allSessions || [], commissionRecordsMap, commissionHistoryMap, firstFlags);
 
     // Helper function to check if a date falls within the date range
     const isInDateRange = (dateStr) => {
@@ -2318,8 +2255,8 @@ const getDoctorPayouts = async (req, res) => {
       const historyRecord = commissionHistoryMap[s.id];
       const isCompleted = s.status === 'completed';
       const isFirstSession = clientFirstSessions.has(s.id);
-      const isPackage = !!s.package_id || (parseInt(s.session_count, 10) || 1) > 1 || String(s.session_type || '').toLowerCase().includes('package');
-      const isPackageFirstForClient = isPackage ? (s.package_id ? firstPackages.has(s.package_id) : isFirstSession) : false;
+      const isPackage = isPackageSessionLike(s);
+      const isPackageFirstForClient = isPackage ? firstFlags.isFirstSession(s) : false;
       const rateIsFirstSession = isPackage ? isPackageFirstForClient : isFirstSession;
       const sessionSequence = rateIsFirstSession ? 'first' : 'followup';
       const sessionSequenceLabel = rateIsFirstSession ? 'First' : 'Follow-up';
@@ -2359,7 +2296,7 @@ const getDoctorPayouts = async (req, res) => {
         const dc = commissionRecordsMap[s.psychologist_id] || null;
         const ch = historyRecord || null;
         toDoctorWallet = computeSessionDoctorWallet(s, dc, ch, { isFirstSession: rateIsFirstSession });
-        commissionToCompany = Math.max(0, sessionPrice - toDoctorWallet);
+        commissionToCompany = packageCompanyShare(s, sessionPrice, Math.max(0, sessionPrice - toDoctorWallet));
       }
       
       // Initialize doctor payout if not exists
@@ -2819,51 +2756,10 @@ const buildDoctorFinanceProfilePayload = async (psychologistId, { dateFrom, date
 
     // Determine first-vs-follow-up using the same client-history idea used elsewhere in finance.
     // This is exposed so receipt auto-fill can show separate first/follow-up rows instead of guessing.
-    const clientFirstSessions = new Set();
-    const historyBySessionId = new Map();
-    if (clientIds.length) {
-      const historyRows = [];
-      for (let i = 0; i < clientIds.length; i += 100) {
-        const { data: hist } = await supabaseAdmin
-          .from('sessions')
-          .select('id, client_id, created_at, scheduled_date, status, session_type, package_id')
-          .in('client_id', clientIds.slice(i, i + 100))
-          .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded'])
-          .neq('session_type', 'free_assessment');
-        historyRows.push(...(hist || []));
-      }
-      historyRows.forEach((s) => historyBySessionId.set(s.id, s));
-
-      const sessionsByClient = {};
-      historyRows.forEach((s) => {
-        if (!s.client_id) return;
-        if (!sessionsByClient[s.client_id]) sessionsByClient[s.client_id] = [];
-        sessionsByClient[s.client_id].push(s);
-      });
-
-      Object.values(sessionsByClient).forEach((clientSessions) => {
-        const sorted = clientSessions.sort((a, b) => {
-          const dateA = new Date(a.created_at || a.scheduled_date || 0);
-          const dateB = new Date(b.created_at || b.scheduled_date || 0);
-          return dateA - dateB;
-        });
-        if (sorted[0]?.id) clientFirstSessions.add(sorted[0].id);
-      });
-
-      const preExistingIds = await getPreExistingClientIds(Object.keys(sessionsByClient));
-      if (preExistingIds.size) {
-        Object.entries(sessionsByClient).forEach(([clientId, clientSessions]) => {
-          if (!preExistingIds.has(clientId)) return;
-          clientSessions.forEach((s) => clientFirstSessions.delete(s.id));
-        });
-      }
-    }
-
-    const firstPackages = new Set();
-    [...clientFirstSessions].forEach((sessionId) => {
-      const firstSession = historyBySessionId.get(sessionId);
-      if (firstSession?.package_id) firstPackages.add(firstSession.package_id);
-    });
+    // First session / first package: one rule for all finance screens and payouts
+    // (utils/sessionCommission resolveFirstSessionFlags — whole client history, purchase-level).
+    const firstFlags = await resolveFirstSessionFlags(supabaseAdmin, clientIds.map((client_id) => ({ client_id })));
+    const clientFirstSessions = firstFlags.firstSessionIds;
 
     // Settled commission rows (authoritative for paid/pending)
     const sessionIds = (sessions || []).map((s) => s.id);
@@ -2922,11 +2818,9 @@ const buildDoctorFinanceProfilePayload = async (psychologistId, { dateFrom, date
       }
       for (const sib of siblings) {
         if (TERMINAL_UNPAID.includes(String(sib.status || '').toLowerCase())) continue;
-        const sibIsPackage = !!sib.package_id ||
-          (parseInt(sib.session_count, 10) || 1) > 1 ||
-          String(sib.session_type || '').toLowerCase().includes('package');
+        const sibIsPackage = isPackageSessionLike(sib);
         const sibIsFirst = sibIsPackage
-          ? (sib.package_id ? firstPackages.has(sib.package_id) : clientFirstSessions.has(sib.id))
+          ? firstFlags.isFirstSession(sib)
           : clientFirstSessions.has(sib.id);
         const d = computeSessionDoctorWallet(sib, dc, chBySession.get(sib.id) || null, { isFirstSession: sibIsFirst }) || 0;
         groupDoctorTotal.set(sib.package_group_id, (groupDoctorTotal.get(sib.package_group_id) || 0) + d);
@@ -2937,10 +2831,10 @@ const buildDoctorFinanceProfilePayload = async (psychologistId, { dateFrom, date
       const ch = chBySession.get(s.id) || null;
       const status = String(s.status || '').toLowerCase();
       const counts = !TERMINAL_UNPAID.includes(status);
-      const isPackage = !!s.package_id || (parseInt(s.session_count, 10) || 1) > 1 || String(s.session_type || '').toLowerCase().includes('package');
+      const isPackage = isPackageSessionLike(s);
       const isCouple = isCoupleSessionLike(s);
       const isFirstSession = clientFirstSessions.has(s.id);
-      const isPackageFirstForClient = isPackage ? (s.package_id ? firstPackages.has(s.package_id) : isFirstSession) : false;
+      const isPackageFirstForClient = isPackage ? firstFlags.isFirstSession(s) : false;
       const rateIsFirstSession = isPackage ? isPackageFirstForClient : isFirstSession;
       const sessionSequence = rateIsFirstSession ? 'first' : 'followup';
       const sessionSequenceLabel = rateIsFirstSession ? 'First' : 'Follow-up';
@@ -3318,24 +3212,12 @@ const getSessionDetails = async (req, res) => {
       .eq('session_id', sessionId)
       .single();
 
-    // Determine first vs follow-up by checking if client has any earlier session
+    // First vs follow-up: the same rule as every other finance screen and payouts
+    // (utils/sessionCommission resolveFirstSessionFlags: whole history, free assessments and
+    // cancellations don't count, imported past clients never first, purchase-level packages).
     let isFirstSession = false;
     if (session.client_id) {
-      const { data: earlierSessions } = await supabaseAdmin
-        .from('sessions')
-        .select('id, created_at')
-        .eq('client_id', session.client_id)
-        .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded'])
-        .lt('created_at', session.created_at)
-        .limit(1);
-      isFirstSession = !earlierSessions?.length;
-
-      // Pre-existing (imported) clients don't get the first-session rate even
-      // though this may be their first session in our system — they're past clients.
-      if (isFirstSession) {
-        const preExistingIds = await getPreExistingClientIds([session.client_id]);
-        if (preExistingIds.has(session.client_id)) isFirstSession = false;
-      }
+      isFirstSession = (await resolveFirstSessionFlags(supabaseAdmin, [session])).isFirstSession(session);
     }
 
     const sessionAmount = parseFloat(
@@ -4798,7 +4680,7 @@ const getCommissions = async (req, res) => {
     // This ensures: Completed + Pending = Total (always consistent)
     // ─────────────────────────────────────────────────────────────────────────
 
-    const sessionSelectFields = `id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, status, created_at, completion_date, ${commSessionsBcf} source, package_session_number, session_count`;
+    const sessionSelectFields = `id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, status, created_at, completion_date, ${commSessionsBcf} source, package_session_number, session_count, package_group_id`;
 
     // Derive view-month IST date boundaries
     let viewMonthStart = null;
@@ -4861,50 +4743,12 @@ const getCommissions = async (req, res) => {
       }
     });
 
-    // Determine first sessions for each client (sorted by created_at) - SAME LOGIC AS getDashboard
-    const clientFirstSessions = new Set();
-    if (allSessions && allSessions.length > 0) {
-      const sessionsByClient = {};
-      allSessions.forEach(s => {
-        if (!s.client_id) return;
-        if (!sessionsByClient[s.client_id]) {
-          sessionsByClient[s.client_id] = [];
-        }
-        sessionsByClient[s.client_id].push(s);
-      });
-      
-      // For each client, mark the first paid session as first session
-      Object.values(sessionsByClient).forEach(clientSessions => {
-        // Sort by client booking instant, then scheduled date.
-        const sortedSessions = clientSessions.sort((a, b) => {
-          const dateA = new Date(getSessionBookingCreatedAtIso(a) || a.scheduled_date || 0);
-          const dateB = new Date(getSessionBookingCreatedAtIso(b) || b.scheduled_date || 0);
-          return dateA - dateB;
-        });
-        
-        // Mark the first session as first session
-        if (sortedSessions.length > 0 && sortedSessions[0].id) {
-          clientFirstSessions.add(sortedSessions[0].id);
-        }
-      });
-
-      // Pre-existing (imported) clients don't get the first-session rate even
-      // though this is their first session in our system — they're past clients.
-      const preExistingIds = await getPreExistingClientIds(Object.keys(sessionsByClient));
-      if (preExistingIds.size) {
-        Object.entries(sessionsByClient).forEach(([clientId, clientSessions]) => {
-          if (!preExistingIds.has(clientId)) return;
-          clientSessions.forEach(s => clientFirstSessions.delete(s.id));
-        });
-      }
-    }
-
-    const firstPackages = new Set();
-    (allSessions || []).forEach(s => {
-      if (s.package_id && clientFirstSessions.has(s.id)) {
-        firstPackages.add(s.package_id);
-      }
-    });
+    // First session / first package: one rule for all finance screens and payouts
+    // (utils/sessionCommission resolveFirstSessionFlags — whole client history, purchase-level).
+    const firstFlags = await resolveFirstSessionFlags(supabaseAdmin, allSessions || []);
+    const clientFirstSessions = firstFlags.firstSessionIds;
+    // Package profit nets per purchase (see packageCompanyShareFor).
+    const packageCompanyShare = await packageCompanyShareFor(allSessions || [], commissionRecordsMap, commissionHistoryMap, firstFlags);
 
     // Calculate average prices from actual sessions
     const averagePricesByPsych = {};
@@ -4918,9 +4762,7 @@ const getCommissions = async (req, res) => {
         };
       }
 
-      const isPackage = s.package_id && s.package_id !== 'null' && s.package_id !== 'undefined' && s.package_id !== 'individual' ||
-                       s.session_type === 'Package Session' || 
-                       (s.session_type && s.session_type.toLowerCase().includes('package'));
+      const isPackage = isPackageSessionLike(s);
       
       const sessionPrice = parseFloat(s.price) || 0;
       if (isPackage) {
@@ -4955,9 +4797,7 @@ const getCommissions = async (req, res) => {
         };
       }
 
-      const isPackage = s.package_id && s.package_id !== 'null' && s.package_id !== 'undefined' && s.package_id !== 'individual' ||
-                       s.session_type === 'Package Session' || 
-                       (s.session_type && s.session_type.toLowerCase().includes('package'));
+      const isPackage = isPackageSessionLike(s);
       
       // Count all sessions (booked, completed, etc.) for session counts
       if (isPackage) {
@@ -5012,9 +4852,9 @@ const getCommissions = async (req, res) => {
           const doctorCommissionPackages = commissionRecord?.doctor_commission_packages || {};
           let totalDoctorPackageCommission = 0;
 
-          // Use firstPackages (not isFirstSession) so all sessions in the same package
+          // Purchase-level first-package flag (firstFlags) so all sessions in the same package
           // share the same first/followup designation.
-          const isPackageFirstForClient = s.package_id ? firstPackages.has(s.package_id) : isFirstSession;
+          const isPackageFirstForClient = firstFlags.isFirstSession(s);
 
           if (isPackageFirstForClient) {
             const packageFirstSessionKey = `${packageType}_first_session`;
@@ -5040,9 +4880,12 @@ const getCommissions = async (req, res) => {
           // package type here can make a 9-session package calculate as package_3.
           const divisor = resolvedSessionCount;
 
-          // Split doctor commission evenly across all sessions in the package.
-          // Follow-up sessions have price=0 but still earn their share.
-          toDoctorWallet = Math.round(totalDoctorPackageCommission / divisor);
+          // Therapist share: the shared calculator (first-session rate on session 1 of the
+          // client's first package only, follow-up rate on the rest — the rate sheet's own
+          // split), so this page matches payouts. An equal split paid 933/933/933 on a
+          // 1000+900+900 package. The even split stays as the fallback when nothing applies.
+          toDoctorWallet = computeSessionDoctorWallet(s, commissionRecord, null, { isFirstSession: isPackageFirstForClient })
+            || Math.round(totalDoctorPackageCommission / divisor);
 
           // Company commission: use the configured total package commission and split it.
           // Do NOT derive from sessionPrice — follow-up sessions have price=0 which would
@@ -5054,7 +4897,9 @@ const getCommissions = async (req, res) => {
             commissionAmounts?.package ||
             0
           );
-          commissionToCompany = Math.round(totalCompanyPackageCommission / divisor);
+          // Grouped packages net per purchase (price − therapist's share of every session on the
+          // paying session, ₹0 on follow-ups); the configured split is the fallback.
+          commissionToCompany = packageCompanyShare(s, sessionPrice, Math.round(totalCompanyPackageCommission / divisor));
         } else {
           // Individual/couple session
           const isCoupleSession = String(s.session_type || '').toLowerCase().includes('couple') || String(s.session_type || '').toLowerCase().includes('cpl');
@@ -5816,6 +5661,8 @@ const getPendingPayouts = async (req, res) => {
         payment_id,
         price,
         session_count,
+        package_group_id,
+        therapist_commission,
         psychologist:psychologists!sessions_psychologist_id_fkey(id, first_name, last_name, email, phone, cover_image_url)
       `;
     const completedSessionFallbackSelect = listOnly
@@ -5841,6 +5688,8 @@ const getPendingPayouts = async (req, res) => {
         payment_id,
         price,
         session_count,
+        package_group_id,
+        therapist_commission,
         psychologist:psychologists!sessions_psychologist_id_fkey(id, first_name, last_name, email, phone)
       `;
     const completedScheduledFallbackSelect = listOnly
@@ -5865,6 +5714,8 @@ const getPendingPayouts = async (req, res) => {
         payment_id,
         price,
         session_count,
+        package_group_id,
+        therapist_commission,
         psychologist:psychologists!sessions_psychologist_id_fkey(id, first_name, last_name, email, phone)
       `;
     const notDueSessionSelect = listOnly
@@ -6233,51 +6084,10 @@ const getPendingPayouts = async (req, res) => {
       });
     }
 
-    const pendingClientFirstSessions = new Set();
-    const pendingFirstPackages = new Set();
-    if (pendingClientIds.length) {
-      const historyRows = [];
-      for (let i = 0; i < pendingClientIds.length; i += 100) {
-        const { data: hist } = await supabaseAdmin
-          .from('sessions')
-          .select('id, client_id, created_at, scheduled_date, status, session_type, package_id')
-          .in('client_id', pendingClientIds.slice(i, i + 100))
-          .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded'])
-          .neq('session_type', 'free_assessment');
-        historyRows.push(...(hist || []));
-      }
-
-      const historyBySessionId = new Map();
-      const sessionsByClient = {};
-      historyRows.forEach((s) => {
-        historyBySessionId.set(s.id, s);
-        if (!s.client_id) return;
-        if (!sessionsByClient[s.client_id]) sessionsByClient[s.client_id] = [];
-        sessionsByClient[s.client_id].push(s);
-      });
-
-      Object.values(sessionsByClient).forEach((clientSessions) => {
-        const sorted = clientSessions.sort((a, b) => {
-          const dateA = new Date(a.created_at || a.scheduled_date || 0);
-          const dateB = new Date(b.created_at || b.scheduled_date || 0);
-          return dateA - dateB;
-        });
-        if (sorted[0]?.id) pendingClientFirstSessions.add(sorted[0].id);
-      });
-
-      const preExistingIds = await getPreExistingClientIds(Object.keys(sessionsByClient));
-      if (preExistingIds.size) {
-        Object.entries(sessionsByClient).forEach(([clientId, clientSessions]) => {
-          if (!preExistingIds.has(clientId)) return;
-          clientSessions.forEach((s) => pendingClientFirstSessions.delete(s.id));
-        });
-      }
-
-      [...pendingClientFirstSessions].forEach((sessionId) => {
-        const firstSession = historyBySessionId.get(sessionId);
-        if (firstSession?.package_id) pendingFirstPackages.add(firstSession.package_id);
-      });
-    }
+    // First session / first package: one rule for all finance screens and payouts
+    // (utils/sessionCommission resolveFirstSessionFlags — whole client history, purchase-level).
+    const firstFlags = await resolveFirstSessionFlags(supabaseAdmin, pendingClientIds.map((client_id) => ({ client_id })));
+    const pendingClientFirstSessions = firstFlags.firstSessionIds;
 
     // Get package types for package sessions
     const packageIds = [...new Set(pendingScopeSessions.map(s => s.package_id).filter(Boolean))];
@@ -6345,6 +6155,10 @@ const getPendingPayouts = async (req, res) => {
       });
     }
 
+    // Package profit nets per purchase (see packageCompanyShareFor), for sessions with no
+    // ledger row yet; a settled or hand-edited commission_history row stays authoritative.
+    const packageCompanyShare = await packageCompanyShareFor(pendingScopeSessions, commissionConfigMap, commissionMap, firstFlags);
+
     // Group by psychologist
     const payoutsByDoctor = {};
 
@@ -6370,10 +6184,7 @@ const getPendingPayouts = async (req, res) => {
 
     const getPendingSessionFinance = (session, commission, rateIsFirstSession, psychId) => {
       const cfg = commissionConfigMap[psychId] || null;
-      const isPackageSession =
-        !!session.package_id ||
-        (parseInt(session.session_count, 10) || 1) > 1 ||
-        String(session.session_type || '').toLowerCase().includes('package');
+      const isPackageSession = isPackageSessionLike(session);
       const packageMeta = isPackageSession ? packagesMap[session.package_id] : null;
       const resolvedSessionCount = Math.max(
         1,
@@ -6431,10 +6242,25 @@ const getPendingPayouts = async (req, res) => {
           ? doctorWallet
           : (isCoupleSession
             ? getConfiguredCoupleDoctorShare(cfg)
-            : computeSessionDoctorWallet(session, cfg, commission || null));
+            : computeSessionDoctorWallet(session, cfg, commission || null, { isFirstSession: rateIsFirstSession }));
         commissionAmount = sessionAmount > 0
           ? commissionAmount
           : Math.max(0, sessionAmount - doctorWallet);
+      }
+
+      // A package with no ledger row: the paying session carries price − the therapist's share
+      // of the whole purchase; its ₹0 follow-ups carry no company share (their therapist cost
+      // is already netted), so their amount is just what the therapist earns.
+      // (The loop builds a stand-in commission object for sessions without a ledger row; a real
+      // commission_history row is the one with a database id.)
+      if (isPackageSession && session.package_group_id && !(commission && commission.id)) {
+        const paid = parseFloat(session.price || 0) || 0;
+        if (paid > 0) {
+          commissionAmount = packageCompanyShare(session, paid, commissionAmount);
+        } else {
+          commissionAmount = 0;
+          sessionAmount = doctorWallet;
+        }
       }
 
       return { sessionAmount, doctorWallet, commissionAmount };
@@ -6443,7 +6269,7 @@ const getPendingPayouts = async (req, res) => {
     const getSessionTypeMeta = (session) => {
       let sessionTypeForCount = 'individual';
       const sessionCountForType = parseInt(session.session_count, 10) || 1;
-      if (session.package_id || sessionCountForType > 1 || String(session.session_type || '').toLowerCase().includes('package')) {
+      if (isPackageSessionLike(session)) {
         const pkg = packagesMap[session.package_id];
         sessionTypeForCount = getFinancePackageType(session, pkg);
       }
@@ -6465,13 +6291,10 @@ const getPendingPayouts = async (req, res) => {
     for (const session of unpaidSessions) {
       const psychId = session.psychologist_id;
       let commission = commissionMap[session.id];
-      const isPackageForRate =
-        !!session.package_id ||
-        (parseInt(session.session_count, 10) || 1) > 1 ||
-        String(session.session_type || '').toLowerCase().includes('package');
+      const isPackageForRate = isPackageSessionLike(session);
       const isClientFirstSession = pendingClientFirstSessions.has(session.id);
       const isPackageFirstForClient = isPackageForRate
-        ? (session.package_id ? pendingFirstPackages.has(session.package_id) : isClientFirstSession)
+        ? firstFlags.isFirstSession(session)
         : false;
       // A hand-set First/Follow-up (stored as |SEQ:… on the ledger row) wins over the
       // derived value, so the label matches what finance chose in the payout UI.
@@ -6593,13 +6416,10 @@ const getPendingPayouts = async (req, res) => {
     for (const session of unpaidNotDueSessions) {
       const psychId = session.psychologist_id;
       const doctorPayout = ensureDoctorPayout(session);
-      const isPackageForRate =
-        !!session.package_id ||
-        (parseInt(session.session_count, 10) || 1) > 1 ||
-        String(session.session_type || '').toLowerCase().includes('package');
+      const isPackageForRate = isPackageSessionLike(session);
       const isClientFirstSession = pendingClientFirstSessions.has(session.id);
       const isPackageFirstForClient = isPackageForRate
-        ? (session.package_id ? pendingFirstPackages.has(session.package_id) : isClientFirstSession)
+        ? firstFlags.isFirstSession(session)
         : false;
       // A hand-set First/Follow-up (stored as |SEQ:… on the ledger row) wins over the
       // derived value, so the label matches what finance chose in the payout UI.
@@ -6884,6 +6704,7 @@ const markPayoutAsPaid = async (req, res) => {
       .select(`
         id,
         psychologist_id,
+        client_id,
         scheduled_date,
         completion_date,
         updated_at,
@@ -6917,6 +6738,7 @@ const markPayoutAsPaid = async (req, res) => {
         .select(`
           id,
           psychologist_id,
+          client_id,
           scheduled_date,
           completion_date,
           updated_at,
@@ -6951,6 +6773,9 @@ const markPayoutAsPaid = async (req, res) => {
     }
 
     const completedSessionsInRange = completedSessions || [];
+    // Same first/follow-up rule as the payout screens, so what gets settled here matches
+    // what finance was shown (it used to fall back to the follow-up rate for everything).
+    const firstFlags = await resolveFirstSessionFlags(supabaseAdmin, completedSessionsInRange);
 
     if (completedSessionsInRange.length === 0) {
       return res.status(404).json(
@@ -6999,7 +6824,7 @@ const markPayoutAsPaid = async (req, res) => {
       
       if (!commission) {
         const sessionAmount = parseFloat(session.price ?? session.amount ?? 0) || 0;
-        const doctorWallet = computeSessionDoctorWallet(session, activeDc, null) || 0;
+        const doctorWallet = computeSessionDoctorWallet(session, activeDc, null, { isFirstSession: firstFlags.isFirstSession(session) }) || 0;
         commission = {
           session_amount: sessionAmount,
           commission_amount: sessionAmount - doctorWallet
@@ -7072,7 +6897,7 @@ const markPayoutAsPaid = async (req, res) => {
       .filter((session) => !existingCommissionSessionIds.has(session.id))
       .map((session) => {
         const sessionAmount = parseFloat(session.price ?? session.amount ?? 0) || 0;
-        const doctorWallet = computeSessionDoctorWallet(session, activeDc, null) || 0;
+        const doctorWallet = computeSessionDoctorWallet(session, activeDc, null, { isFirstSession: firstFlags.isFirstSession(session) }) || 0;
         return {
           psychologist_id,
           session_id: session.id,

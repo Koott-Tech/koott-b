@@ -1,5 +1,5 @@
 const { supabaseAdmin } = require('../config/supabase');
-const { computeSessionDoctorWallet } = require('../utils/sessionCommission');
+const { computeSessionDoctorWallet, resolveFirstSessionFlags } = require('../utils/sessionCommission');
 const { getClientDisplayName } = require('../utils/sessionTitleFormatter');
 const { 
   successResponse, 
@@ -342,8 +342,10 @@ const getSessions = async (req, res) => {
         const { data: dcRows } = await dcPromise;
         const dc = dcRows?.[0] || null;
 
+        // Same first/follow-up rule as finance, so the therapist sees what finance will pay.
+        const firstFlags = await resolveFirstSessionFlags(supabaseAdmin, enrichedRegular);
         enrichedRegular.forEach(s => {
-          s.doctor_wallet = computeSessionDoctorWallet(s, dc, commissionHistoryMap[s.id] || null);
+          s.doctor_wallet = computeSessionDoctorWallet(s, dc, commissionHistoryMap[s.id] || null, { isFirstSession: firstFlags.isFirstSession(s) });
         });
       } catch (commErr) {
         console.warn('[psychologist/sessions] commission calc error (non-fatal):', commErr.message);
