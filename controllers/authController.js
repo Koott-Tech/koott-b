@@ -645,8 +645,14 @@ const login = async (req, res) => {
       email = email.trim().toLowerCase();
     }
 
+    // Lockout status and the account lookups run together: one database round trip instead
+    // of three in a row (each ~0.3 s from far-off regions, so login took 2-5 s).
+    const [lockoutStatus, psychologistLookup, usersLookup] = await Promise.all([
+      accountLockoutService.isAccountLocked(email),
+      findUserWithFlexibleEmail('psychologists', email),
+      findUserWithFlexibleEmail('users', email),
+    ]);
     // Check if account is locked (before attempting login)
-    const lockoutStatus = await accountLockoutService.isAccountLocked(email);
     if (lockoutStatus.locked) {
       const minutesRemaining = Math.ceil((lockoutStatus.lockoutUntil.getTime() - Date.now()) / 60000);
       return res.status(429).json(
@@ -659,7 +665,7 @@ const login = async (req, res) => {
     }
 
     // First check if it's a psychologist with flexible email matching
-    const { data: psychologist, error: psychologistError } = await findUserWithFlexibleEmail('psychologists', email);
+    const { data: psychologist, error: psychologistError } = psychologistLookup;
 
     if (psychologist && !psychologistError) {
       // Verify password for psychologist
@@ -696,7 +702,7 @@ const login = async (req, res) => {
 
       // Log successful login
       const ip = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
-      await auditLogger.logAction({
+      auditLogger.logAction({
         userId: psychologist.id,
         userEmail: email,
         userRole: 'psychologist',
@@ -711,16 +717,21 @@ const login = async (req, res) => {
       }).catch(err => console.error('Error logging successful login:', err));
 
       // Clear failed attempts on successful login
-      await accountLockoutService.clearFailedAttempts(email);
+      accountLockoutService.clearFailedAttempts(email).catch((err) => console.error('Error clearing failed attempts:', err)); // not awaited: bookkeeping
 
       // Generate JWT token for psychologist
       const token = generateToken(psychologist.id, 'psychologist');
+      // Same req.user shape authenticateToken builds for a therapist.
+      require('../middleware/auth').rememberSignedIn(token, {
+        id: psychologist.id, email: psychologist.email, role: 'psychologist',
+        created_at: psychologist.created_at, updated_at: psychologist.updated_at,
+      });
 
       // Create session (reuse ip variable from above)
-      try {
-        await sessionManager.createSession(psychologist.id, token, ip, req.headers['user-agent'] || 'Unknown');
-      } catch (sessionError) {
-        await auditLogger.logAction({
+      // Session record in the background: no request needs it to exist (the auth middleware
+    // checks token revocation), so the reply doesn't wait for it.
+    sessionManager.createSession(psychologist.id, token, ip, req.headers['user-agent'] || 'Unknown').catch((sessionError) => {
+        auditLogger.logAction({
           userId: psychologist.id,
           userEmail: email,
           userRole: 'psychologist',
@@ -737,8 +748,7 @@ const login = async (req, res) => {
           ip: ip,
           userAgent: req.headers['user-agent'] || 'Unknown'
         }).catch(err => console.error('Error logging session creation failure:', err));
-        // Continue with login flow even if session creation fails
-      }
+    });
 
       res.json(
         successResponse({
@@ -762,7 +772,7 @@ const login = async (req, res) => {
     // First check users table for new system clients (with user_id reference)
     // This handles clients created via email/password or Google sign-in
     let clientData = null;
-    const { data: userFromUsers, error: userFromUsersError } = await findUserWithFlexibleEmail('users', email);
+    const { data: userFromUsers, error: userFromUsersError } = usersLookup;
 
     if (userFromUsers && !userFromUsersError && userFromUsers.role === 'client') {
       // Found a client in users table (new system)
@@ -771,7 +781,7 @@ const login = async (req, res) => {
       
       if (isValidPassword) {
         // Clear failed attempts on successful login
-        await accountLockoutService.clearFailedAttempts(email);
+        accountLockoutService.clearFailedAttempts(email).catch((err) => console.error('Error clearing failed attempts:', err)); // not awaited: bookkeeping
         
         // Now fetch the client profile
         // Use supabaseAdmin to bypass RLS (backend service, proper auth already handled)
@@ -825,7 +835,7 @@ const login = async (req, res) => {
         
         if (isValidPassword) {
           // Clear failed attempts on successful login
-          await accountLockoutService.clearFailedAttempts(email);
+          accountLockoutService.clearFailedAttempts(email).catch((err) => console.error('Error clearing failed attempts:', err)); // not awaited: bookkeeping
           
           user = oldClient;
           userRole = 'client';
@@ -856,14 +866,14 @@ const login = async (req, res) => {
         }
       } else {
         // Check users table for admin roles with flexible email matching
-        const { data: adminUser, error: userError } = await findUserWithFlexibleEmail('users', email);
+        const { data: adminUser, error: userError } = usersLookup;
 
         if (adminUser && !userError) {
           const isValidPassword = await comparePassword(password, adminUser.password_hash);
           
           if (isValidPassword) {
             // Clear failed attempts on successful login
-            await accountLockoutService.clearFailedAttempts(email);
+            accountLockoutService.clearFailedAttempts(email).catch((err) => console.error('Error clearing failed attempts:', err)); // not awaited: bookkeeping
             
             user = adminUser;
             userRole = adminUser.role;
@@ -920,7 +930,7 @@ const login = async (req, res) => {
 
     // Log successful login
     const ip = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
-    await auditLogger.logAction({
+    auditLogger.logAction({
       userId: user.id,
       userEmail: email,
       userRole: userRole,
@@ -957,12 +967,14 @@ const login = async (req, res) => {
 
     // Generate JWT token - use user.id (from users table for new clients, or client.id for old clients)
     const token = generateToken(user.id, userRole);
+    // Staff: authenticateToken's req.user is the users row itself.
+    if (userRole !== 'client') require('../middleware/auth').rememberSignedIn(token, user);
 
     // Create session (reuse ip variable from above)
-    try {
-      await sessionManager.createSession(user.id, token, ip, req.headers['user-agent'] || 'Unknown');
-    } catch (sessionError) {
-      await auditLogger.logAction({
+    // Session record in the background: no request needs it to exist (the auth middleware
+    // checks token revocation), so the reply doesn't wait for it.
+    sessionManager.createSession(user.id, token, ip, req.headers['user-agent'] || 'Unknown').catch((sessionError) => {
+      auditLogger.logAction({
         userId: user.id,
         userEmail: email,
         userRole: userRole,
@@ -979,8 +991,7 @@ const login = async (req, res) => {
         ip: ip,
         userAgent: req.headers['user-agent'] || 'Unknown'
       }).catch(err => console.error('Error logging session creation failure:', err));
-      // Continue with login flow even if session creation fails
-    }
+    });
 
     res.json(
       successResponse({

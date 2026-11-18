@@ -463,7 +463,26 @@ const requireFinance = requireRole(['finance', 'admin', 'superadmin']); // Finan
 const requireEventOrganizer = requireRole(['marketing', 'admin', 'superadmin']); // event routes (Marketing runs events)
 const requireMarketing = requireRole(['marketing', 'admin', 'superadmin']); // Marketing dashboard: aggregates only
 
+/**
+ * Called by login with a token it has just issued: fill the caches authenticateToken would
+ * fill on the first request (token not revoked, account not revoked, the signed-in user), so
+ * a dashboard's first requests skip ~3 database round trips each. A brand-new token cannot be
+ * revoked, and login has just checked the account is active. revokeUserTokens / offboarding
+ * clear these entries. Only staff and therapists: a client's req.user is assembled from
+ * several tables, so it is left to the middleware.
+ */
+const rememberSignedIn = (token, reqUser) => {
+  try {
+    if (!token || !reqUser?.id || reqUser.role === 'client') return;
+    const tokenHash = tokenRevocationService.hashToken(token);
+    globalCache.set(`token_ok:${tokenHash}`, true, AUTH_USER_TTL_MS);
+    globalCache.set(`user_ok:${reqUser.id}`, true, AUTH_USER_TTL_MS);
+    globalCache.set(`auth_user:${reqUser.id}`, reqUser, AUTH_USER_TTL_MS);
+  } catch (_) { /* a cache miss just means the normal first-request lookup */ }
+};
+
 module.exports = {
+  rememberSignedIn,
   authenticateToken,
   requireRole,
   requireClient,
