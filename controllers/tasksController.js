@@ -11,7 +11,7 @@
  */
 const { supabaseAdmin } = require('../config/supabase');
 const { isAdmin, personOf, UUID_RE } = require('../utils/staffRoles');
-const { key, namesFor, teamIdsOf, teamMembers, listPeople, teamByName, isMissingTable, NOT_READY } = require('../utils/people');
+const { key, namesFor, teamIdsOf, teamMembers, listPeople, teamByName, isMissingTable, NOT_READY, assigneeProblem } = require('../utils/people');
 
 const STATUSES = ['todo', 'in_progress', 'waiting', 'done', 'cancelled'];
 const PRIORITIES = ['urgent', 'high', 'normal', 'low'];
@@ -423,6 +423,8 @@ async function createTaskHandler(req, res) {
     const me = personOf(req.user);
     const assignee = parseAssignee(req.body, me);
     if (!assignee) return fail(res, 400, 'Pick who the task is for.');
+    const assigneeError = await assigneeProblem(assignee);
+    if (assigneeError) return fail(res, 400, assigneeError);
     // Only what a person may set: never auto_key (reserved for automatic tasks), creator,
     // pick-up or a template the API does not offer.
     const b = req.body || {};
@@ -476,6 +478,8 @@ async function updateTask(req, res) {
     if (patch.assignee_type !== undefined || patch.assignee_id !== undefined) {
       const a = { type: patch.assignee_type || task.assignee_type, id: patch.assignee_id || task.assignee_id };
       if (!ASSIGNEE_TYPES.includes(a.type) || !isUuid(a.id)) return fail(res, 400, 'Pick who the task is for.');
+      const assigneeError = await assigneeProblem(a);
+      if (assigneeError) return fail(res, 400, assigneeError);
       patch.assignee_type = a.type; patch.assignee_id = a.id;
       patch.claimed_by_type = null; patch.claimed_by_id = null;
     }

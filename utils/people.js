@@ -135,4 +135,30 @@ async function teamByName(name) {
 /** Forget remembered team lists (call after changing team_members). */
 function forgetTeams() { teamIdsCache.clear(); }
 
-module.exports = { COMPLETE, key, psychName, listPeople, namesFor, teamIdsOf, forgetTeams, teamMembers, teamByName, isMissingTable, NOT_READY };
+/**
+ * Who a task may be given to: an existing team, an active staff login (a STAFF_USER_ROLES
+ * role) or an active therapist. Returns null when fine, else the message to show. The task
+ * screen only offers these, but the API used to accept any id of the right shape — a task
+ * given to a client or a switched-off account was then seen by nobody.
+ */
+async function assigneeProblem(assignee) {
+  const { type, id } = assignee || {};
+  if (!id) return 'Pick who the task is for.';
+  if (type === 'team') {
+    const { data } = await supabaseAdmin.from('teams').select('id').eq('id', id).maybeSingle();
+    return data ? null : 'That team does not exist.';
+  }
+  if (type === 'user') {
+    const { data } = await supabaseAdmin.from('users').select('id, role, is_active').eq('id', id).maybeSingle();
+    if (!data || !STAFF_USER_ROLES.includes(data.role)) return 'Tasks can only be given to Koott staff, therapists or teams.';
+    return data.is_active === false ? 'That account is switched off.' : null;
+  }
+  if (type === 'psychologist') {
+    const { data } = await supabaseAdmin.from('psychologists').select('id, is_active').eq('id', id).maybeSingle();
+    if (!data) return 'Tasks can only be given to Koott staff, therapists or teams.';
+    return data.is_active === false ? 'That therapist is switched off.' : null;
+  }
+  return 'Pick who the task is for.';
+}
+
+module.exports = { COMPLETE, key, psychName, listPeople, namesFor, teamIdsOf, forgetTeams, teamMembers, teamByName, isMissingTable, NOT_READY, assigneeProblem };
