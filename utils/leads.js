@@ -68,19 +68,51 @@ const last10 = (p) => String(p || '').replace(/\D/g, '').slice(-10);
 async function convertLeadsForClient(clientId, { reason = 'Booked a session' } = {}) {
   if (!clientId) return 0;
   try {
-    const { data: c } = await supabaseAdmin.from('clients').select('id, phone_number, email, user_id').eq('id', clientId).maybeSingle();
-    if (!c) return 0;
-    let email = c.email ? String(c.email).trim().toLowerCase() : null;
-    if (!email && c.user_id) {
-      const { data: u } = await supabaseAdmin.from('users').select('email').eq('id', c.user_id).maybeSingle();
-      email = u?.email ? String(u.email).trim().toLowerCase() : null;
-    }
-    const tail = last10(c.phone_number);
-    const parts = [`client_id.eq.${c.id}`];
-    if (tail.length === 10) parts.push(`phone.like.*${tail}`);
-    if (email && /^[^@\s,()]+@[^@\s,()]+$/.test(email)) parts.push(`email.eq.${email}`);
-    const { data: open } = await supabaseAdmin.from('leads').select('id, meta, phone, email').in('stage', OPEN_STAGES).or(parts.join(',')).limit(50);
-    const mine = open || [];
+    const found = await findOpenLeadsForClient(clientId);
+    if (!found) return 0;
+    return await convertFoundLeads(found.c, found.mine, reason);
+  } catch (_) {
+    return 0; /* table not there yet */
+  }
+}
+
+/** The reading half of convertLeadsForClient: the client and their open leads (or null). */
+async function findOpenLeadsForClient(clientId) {
+  const { data: c } = await supabaseAdmin.from('clients').select('id, phone_number, email, user_id').eq('id', clientId).maybeSingle();
+  if (!c) return null;
+  let email = c.email ? String(c.email).trim().toLowerCase() : null;
+  if (!email && c.user_id) {
+    const { data: u } = await supabaseAdmin.from('users').select('email').eq('id', c.user_id).maybeSingle();
+    email = u?.email ? String(u.email).trim().toLowerCase() : null;
+  }
+  const tail = last10(c.phone_number);
+  const parts = [`client_id.eq.${c.id}`];
+  if (tail.length === 10) parts.push(`phone.like.*${tail}`);
+  if (email && /^[^@\s,()]+@[^@\s,()]+$/.test(email)) parts.push(`email.eq.${email}`);
+  const { data: open } = await supabaseAdmin.from('leads').select('id, meta, phone, email').in('stage', OPEN_STAGES).or(parts.join(',')).limit(50);
+  return { c, mine: open || [] };
+}
+
+/**
+ * convertLeadsForClient for many clients: their leads are READ all at once, then converted
+ * one client after another in the given order. Each update only applies while the lead is
+ * still open, so a lead that an earlier client already converted is left alone exactly as if
+ * it had been read afterwards: same leads converted, same tasks closed, same count.
+ */
+async function convertLeadsForClients(clientIds, { reason = 'Booked a session' } = {}) {
+  const ids = clientIds.filter(Boolean);
+  const found = await Promise.all(ids.map((id) => findOpenLeadsForClient(id).then((f) => ({ f }), () => ({ failed: true }))));
+  let total = 0;
+  for (const r of found) {
+    if (r.failed || !r.f) continue;
+    try { total += await convertFoundLeads(r.f.c, r.f.mine, reason); } catch (_) { /* as convertLeadsForClient: 0 */ }
+  }
+  return total;
+}
+
+/** The writing half: convert these open leads to the client, closing their call tasks. */
+async function convertFoundLeads(c, mine, reason) {
+  {
     let n = 0;
     const now = new Date().toISOString();
     for (const l of mine) {
@@ -95,8 +127,6 @@ async function convertLeadsForClient(clientId, { reason = 'Booked a session' } =
       }
     }
     return n;
-  } catch (_) {
-    return 0; /* table not there yet */
   }
 }
 
@@ -105,4 +135,4 @@ async function markClientConverted(clientId) {
   return convertLeadsForClient(clientId, { reason: 'Paid for a session' });
 }
 
-module.exports = { STAGES, SOURCES, upsertSourceLead, markClientConverted, convertLeadsForClient, cleanPhone };
+module.exports = { STAGES, SOURCES, upsertSourceLead, markClientConverted, convertLeadsForClient, convertLeadsForClients, cleanPhone };

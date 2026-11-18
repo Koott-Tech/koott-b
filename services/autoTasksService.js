@@ -131,11 +131,22 @@ async function quietClients(ops) {
   const day = addDays(istDay(), -30);
   const { data: done } = await supabaseAdmin.from('sessions').select('client_id').eq('status', 'completed').eq('scheduled_date', day).limit(200);
   const ids = [...new Set((done || []).map((s) => s.client_id).filter(Boolean))];
+  // Which of these clients have any session after that day: one read for all of them
+  // (was a count per client; "any row" is the same test as count > 0).
+  const bookedSince = new Set();
+  for (let i = 0; i < ids.length; i += 100) {
+    for (let from = 0; ; from += 1000) {
+      const { data: rows, error } = await supabaseAdmin.from('sessions').select('id, client_id')
+        .in('client_id', ids.slice(i, i + 100)).gt('scheduled_date', day)
+        .order('id', { ascending: true }).range(from, from + 999);
+      if (error) break; // as before: a failed lookup counts as "no later session"
+      (rows || []).forEach((r) => bookedSince.add(r.client_id));
+      if (!rows || rows.length < 1000) break;
+    }
+  }
   let n = 0;
   for (const clientId of ids) {
-    const { count } = await supabaseAdmin.from('sessions').select('id', { count: 'exact', head: true })
-      .eq('client_id', clientId).gt('scheduled_date', day);
-    if (count) continue;
+    if (bookedSince.has(clientId)) continue;
     if (await make({
       title: `Follow-up call: client ${clientRef(clientId)} hasn't booked for 30 days`,
       assignee_type: 'team', assignee_id: ops.id, priority: 'normal', deadline: inHours(72),
@@ -199,15 +210,20 @@ async function sessionsNotCompleted() {
 }
 
 async function therapistAvailability() {
-  const { getBookableSlots } = require('../utils/sessionSlots');
+  const { getBookableSlotsMany } = require('../utils/sessionSlots');
   const { data } = await supabaseAdmin.from('psychologists').select('id, designation, is_active').neq('is_active', false);
   const from = istDay();
   const to = addDays(from, 14);
   const week = `${istNow().getUTCFullYear()}-w${Math.ceil(((istNow() - new Date(Date.UTC(istNow().getUTCFullYear(), 0, 1))) / 864e5 + 1) / 7)}`;
+  // Every therapist's slots from one read per table (same calculation as getBookableSlots);
+  // a therapist whose slots can't be worked out is skipped, as before.
+  const list = data || [];
+  const kindById = new Map(list.map((p) => [p.id, /psychiatr/i.test(p.designation || '') ? 'psychiatry_15' : 'individual']));
+  const slotsById = await getBookableSlotsMany(list.map((p) => p.id), from, to, kindById).catch(() => new Map());
   let n = 0;
-  for (const p of data || []) {
-    const kind = /psychiatr/i.test(p.designation || '') ? 'psychiatry_15' : 'individual';
-    const days = await getBookableSlots(p.id, from, to, kind).catch(() => null);
+  for (const p of list) {
+    const got = slotsById.get(p.id);
+    const days = got instanceof Error ? null : (got || null);
     if (!days || days.some((d) => d.slots.length)) continue;
     if (await make({
       title: 'Update your availability — no open slots for the next 2 weeks',
@@ -401,12 +417,10 @@ async function leadsThatBooked(hours) {
     .gte('created_at', new Date(Date.now() - hours * 3600e3).toISOString())
     .not('status', 'in', '(cancelled,canceled,refunded)').not('client_id', 'is', null).limit(500);
   if (error) throw error;
-  const { convertLeadsForClient } = require('../utils/leads');
-  let n = 0;
-  for (const clientId of [...new Set((data || []).map((s) => s.client_id))]) {
-    n += await convertLeadsForClient(clientId, { reason: 'Booked a session' });
-  }
-  return n;
+  // Reads every client's open leads at once, then converts client by client in this order
+  // (utils/leads convertLeadsForClients: same result as converting one at a time).
+  const { convertLeadsForClients } = require('../utils/leads');
+  return convertLeadsForClients([...new Set((data || []).map((s) => s.client_id))], { reason: 'Booked a session' });
 }
 
 /* ------------------------------------------------------------------ runner */
@@ -417,27 +431,39 @@ async function runAutoTasks({ daily = null } = {}) {
   const out = {};
   try {
     const [ops, finance, mkt] = await Promise.all([teamByName('Operations'), teamByName('Finance'), teamByName('Marketing')]);
-    out.leads = await safe('leads', () => uncontactedLeads(ops));
-    out.cancelled = await safe('cancelled', () => cancelledSessions(ops));
-    out.renewals = await safe('renewals', () => renewals(ops));
-    out.missed = await safe('missed', () => missedSessions(ops));
-    out.payments = await safe('payments', () => failedPayments(ops));
-    out.complete = await safe('complete', () => sessionsNotCompleted());
-    out.unavailable = await safe('unavailable', () => unavailableOverBookings(ops));
-    out.refunds = await safe('refunds', () => refundRequests(finance));
+    // The task-creating rules read different things and each dedupes on its own auto_key,
+    // so they run together. Deadline reminders and "leads that booked" still run after them
+    // (reminders must see the tasks this run created, as before), and the daily rules after
+    // those, in the same order of stages as before. Each rule's own steps are unchanged.
+    const together = async (rules) => {
+      const counts = await Promise.all(rules.map(([, name, fn]) => safe(name, fn)));
+      rules.forEach(([key], i) => { out[key] = counts[i]; });
+    };
+    await together([
+      ['leads', 'leads', () => uncontactedLeads(ops)],
+      ['cancelled', 'cancelled', () => cancelledSessions(ops)],
+      ['renewals', 'renewals', () => renewals(ops)],
+      ['missed', 'missed', () => missedSessions(ops)],
+      ['payments', 'payments', () => failedPayments(ops)],
+      ['complete', 'complete', () => sessionsNotCompleted()],
+      ['unavailable', 'unavailable', () => unavailableOverBookings(ops)],
+      ['refunds', 'refunds', () => refundRequests(finance)],
+    ]);
     out.reminders = await safe('reminders', () => reminders());
     out.leadsBooked = await safe('leads that booked', () => leadsThatBooked(1));
     const today = istDay();
     const runDaily = daily === true || (daily === null && lastDaily !== today && istNow().getUTCHours() >= 9);
     if (runDaily) {
       lastDaily = today;
-      out.quiet = await safe('quiet clients', () => quietClients(ops));
-      out.availability = await safe('availability', () => therapistAvailability());
-      out.calendar = await safe('calendar', () => calendarReconnect());
-      out.blog = await safe('blog', () => staleBlogPosts(mkt));
-      out.events = await safe('events', () => eventsSoon(mkt, ops));
-      out.documents = await safe('documents', async () => expiringDocuments(await teamByName('HR')));
-      out.monthEnd = await safe('month end', () => monthEnd(finance));
+      await together([
+        ['quiet', 'quiet clients', () => quietClients(ops)],
+        ['availability', 'availability', () => therapistAvailability()],
+        ['calendar', 'calendar', () => calendarReconnect()],
+        ['blog', 'blog', () => staleBlogPosts(mkt)],
+        ['events', 'events', () => eventsSoon(mkt, ops)],
+        ['documents', 'documents', async () => expiringDocuments(await teamByName('HR'))],
+        ['monthEnd', 'month end', () => monthEnd(finance)],
+      ]);
       out.leadsBookedDaily = await safe('leads that booked (3 days)', () => leadsThatBooked(72));
     }
     const made = Object.values(out).reduce((a, b) => a + (Number(b) || 0), 0);
