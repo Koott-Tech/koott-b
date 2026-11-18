@@ -199,14 +199,14 @@ const HISTORY_STATUSES = ['booked', 'pending', 'completed', 'rescheduled', 'resc
 async function getPreExistingClientIds(supabaseAdmin, clientIds) {
   const ids = Array.from(new Set((clientIds || []).filter(Boolean)));
   const result = new Set();
-  for (let i = 0; i < ids.length; i += 500) {
-    const { data } = await supabaseAdmin
-      .from('clients')
-      .select('id, created_at')
-      .in('id', ids.slice(i, i + 500))
-      .lt('created_at', PRE_EXISTING_CLIENT_CUTOFF);
-    (data || []).forEach((c) => result.add(c.id));
-  }
+  const chunks = [];
+  for (let i = 0; i < ids.length; i += 500) chunks.push(ids.slice(i, i + 500));
+  const pages = await Promise.all(chunks.map((chunk) => supabaseAdmin
+    .from('clients')
+    .select('id, created_at')
+    .in('id', chunk)
+    .lt('created_at', PRE_EXISTING_CLIENT_CUTOFF)));
+  pages.forEach(({ data }) => (data || []).forEach((c) => result.add(c.id)));
   return result;
 }
 
@@ -237,26 +237,36 @@ async function resolveFirstSessionFlags(supabaseAdmin, sessions) {
   const firstSessionIds = new Set();
   const firstPurchaseKeys = new Set();
   if (clientIds.length) {
-    const history = [];
-    for (let i = 0; i < clientIds.length; i += 100) {
+    // The id-chunks are read at the same time (each chunk still pages in order), and the
+    // imported-client check runs alongside: it is only ever asked about these clients, so
+    // checking all of them instead of just those with history gives the same answers.
+    const readChunk = async (ids) => {
+      const rows = [];
       let from = 0;
       for (;;) {
         const { data, error } = await supabaseAdmin
           .from('sessions')
           .select('id, client_id, created_at, scheduled_date, status, session_type, package_id, package_group_id, session_count')
-          .in('client_id', clientIds.slice(i, i + 100))
+          .in('client_id', ids)
           .in('status', HISTORY_STATUSES)
           .neq('session_type', 'free_assessment')
           .range(from, from + 999);
         if (error) throw error;
-        history.push(...(data || []));
+        rows.push(...(data || []));
         if (!data || data.length < 1000) break;
         from += 1000;
       }
-    }
+      return rows;
+    };
+    const chunks = [];
+    for (let i = 0; i < clientIds.length; i += 100) chunks.push(clientIds.slice(i, i + 100));
+    const preExistingP = getPreExistingClientIds(supabaseAdmin, clientIds).then((ok) => ({ ok }), (err) => ({ err }));
+    const history = (await Promise.all(chunks.map(readChunk))).flat();
     const byClient = {};
     history.forEach((s) => { (byClient[s.client_id] = byClient[s.client_id] || []).push(s); });
-    const preExisting = await getPreExistingClientIds(supabaseAdmin, Object.keys(byClient));
+    const pre = await preExistingP;
+    if ('err' in pre) throw pre.err;
+    const preExisting = pre.ok;
     Object.entries(byClient).forEach(([clientId, list]) => {
       if (preExisting.has(clientId)) return;
       const first = list.sort((a, b) =>

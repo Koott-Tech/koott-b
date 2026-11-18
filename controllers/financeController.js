@@ -412,15 +412,32 @@ const storeMonthlySnapshot = async (snapshotData, forceUpdate = false) => {
  * (package_group_id), so a package split across months or years still nets correctly.
  * Returns (session, price, fallback) => company share; fallback for non-grouped sessions.
  */
-async function packageCompanyShareFor(sessions, commissionRecordsMap, commissionHistoryMap, firstFlags) {
-  const totals = new Map();
+/**
+ * Start a query now and read it later, so independent lookups overlap instead of
+ * queueing: early(q) sends it at once; late(p) gives back exactly what `await q` would
+ * have (its { data, error }), or rethrows what it threw, at the line that used it.
+ */
+const early = (q) => Promise.resolve(q).then((ok) => ({ ok }), (err) => ({ err }));
+const late = async (p) => { const r = await p; if ('err' in r) throw r.err; return r.ok; };
+
+/** The package-sibling rows packageCompanyShareFor reads (one array per 100 purchases, in order). */
+function fetchPackageSiblings(sessions) {
   const groupIds = [...new Set((sessions || []).map((x) => x.package_group_id).filter(Boolean))];
+  const chunks = [];
+  for (let i = 0; i < groupIds.length; i += 100) chunks.push(groupIds.slice(i, i + 100));
+  return Promise.all(chunks.map((ids) => supabaseAdmin
+    .from('sessions')
+    .select('id, client_id, psychologist_id, status, session_type, session_count, package_id, package_group_id, package_session_number, price, therapist_commission')
+    .in('package_group_id', ids)
+    .then(({ data }) => data)));
+}
+
+async function packageCompanyShareFor(sessions, commissionRecordsMap, commissionHistoryMap, firstFlags, siblingsPromise = null) {
+  const totals = new Map();
   const UNPAID = ['cancelled', 'canceled', 'refunded'];
-  for (let i = 0; i < groupIds.length; i += 100) {
-    const { data: sibs } = await supabaseAdmin
-      .from('sessions')
-      .select('id, client_id, psychologist_id, status, session_type, session_count, package_id, package_group_id, package_session_number, price, therapist_commission')
-      .in('package_group_id', groupIds.slice(i, i + 100));
+  // Siblings may already be on their way (fetched alongside the other lookups).
+  const pages = await (siblingsPromise || fetchPackageSiblings(sessions));
+  for (const sibs of pages) {
     for (const sib of sibs || []) {
       if (UNPAID.includes(String(sib.status || '').toLowerCase())) continue;
       const d = computeSessionDoctorWallet(
@@ -519,16 +536,93 @@ const getDashboard = async (req, res) => {
       }
     }
     
+    const qtdFrom = startOfQuarter.toISOString().split('T')[0];
+    const qtdTo = today.toISOString().split('T')[0];
+    const ytdFrom = startOfYear.toISOString().split('T')[0];
+    const ytdTo = today.toISOString().split('T')[0];
+
+    // ── Speed: every lookup below that needs only the dates is sent now, together, and read
+    // (late) exactly where the code used to await it. Same queries, same results. ──
+    const snapshotP = (monthStartDate && monthEndDate)
+      ? early(supabaseAdmin
+        .from('monthly_finance_dashboard')
+        .select(FINANCE_SNAPSHOT_SELECT)
+        .eq('year', filterYear)
+        .eq('month', filterMonth)
+        .maybeSingle())
+      : null;
+    const dashBcf = appendBookingTimeSelectFragment(dashBookingTimeCol);
+    // Built fresh per page: a PostgREST builder cannot be safely re-ranged after execution.
+    //
+    // This used to end in `.limit(5000)`, which does NOT do what it looks like — PostgREST
+    // caps a response at 1000 rows regardless. The dashboard therefore aggregated only the
+    // newest 1000 of 3000 matching sessions, so every revenue and session total silently
+    // excluded everything booked before ~12 Jul 2026. Paging covers the full range.
+    const buildDashSessionsQuery = () => {
+      let q = supabaseAdmin
+        .from('sessions')
+        .select(`id, scheduled_date, original_scheduled_date, price, psychologist_id, client_id, status, payment_id, session_type, created_at, booking_created_at, ${dashBcf} package_id, source, package_session_number, session_count`)
+        .in('status', ['completed', 'booked', 'pending', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
+        .neq('session_type', 'free_assessment');
+      // Not all-time: from the start of the year, enough for the MTD/QTD/YTD cards.
+      if (!allTimeMode) q = q.gte('created_at', `${ytdFrom}T00:00:00+05:30`);
+      return q.order('created_at', { ascending: false });
+    };
+    const dashSessionsP = early(fetchAllPagesOf(buildDashSessionsQuery));
+    const assessmentPsychIdForFinance = process.env.ASSESSMENT_PSYCHOLOGIST_ID || '00000000-0000-0000-0000-000000000000';
+    const financePsychRowsP = early(supabaseAdmin
+      .from('psychologists')
+      .select('id')
+      .neq('id', assessmentPsychIdForFinance));
+    const expensesP = early(supabaseAdmin
+      .from('expenses')
+      .select(FINANCE_EXPENSE_SELECT)
+      .eq('approval_status', 'approved')
+      .gte('date', ytdFrom));
+    const incomeP = early(supabaseAdmin
+      .from('income_entries')
+      .select(FINANCE_INCOME_SELECT)
+      .gte('date', ytdFrom));
+    const pendingPaymentsP = early(supabaseAdmin
+      .from('payments')
+      .select('amount')
+      .eq('status', 'pending'));
+    const activeSessionsP = early(supabaseAdmin
+      .from('sessions')
+      .select('id')
+      .in('status', ['booked'])
+      .gte('scheduled_date', today.toISOString().split('T')[0]));
+    const activeDoctorsP = early(supabaseAdmin
+      .from('sessions')
+      .select('psychologist_id')
+      .not('psychologist_id', 'is', null)
+      .neq('session_type', 'free_assessment'));
+    const commissionPaidP = early(supabaseAdmin
+      .from('commission_history')
+      .select('commission_amount')
+      .eq('payment_status', 'paid'));
+    // Chart months (same 12 ranges as the chart loop below).
+    const monthCommissionsP = [];
+    if (shouldIncludeCharts) {
+      for (let i = 11; i >= 0; i--) {
+        const date = new Date(today.getFullYear(), today.getMonth() - i, 1);
+        const monthNum = date.getMonth() + 1;
+        const monthKey = `${date.getFullYear()}-${monthNum < 10 ? '0' : ''}${monthNum}`;
+        const monthStart = `${monthKey}-01`;
+        const monthEnd = new Date(Date.UTC(date.getFullYear(), date.getMonth() + 1, 0)).toISOString().split('T')[0];
+        monthCommissionsP.push(early(supabaseAdmin
+          .from('commission_history')
+          .select('commission_amount, session_amount')
+          .gte('session_date', monthStart)
+          .lte('session_date', monthEnd)));
+      }
+    }
+
     // Try to retrieve stored monthly snapshot if it's a full month filter
     let storedSnapshot = null;
     if (monthStartDate && monthEndDate) {
       try {
-        const { data: snapshot, error: snapshotError } = await supabaseAdmin
-          .from('monthly_finance_dashboard')
-          .select(FINANCE_SNAPSHOT_SELECT)
-          .eq('year', filterYear)
-          .eq('month', filterMonth)
-          .maybeSingle();
+        const { data: snapshot, error: snapshotError } = await late(snapshotP);
         
         if (!snapshotError && snapshot && snapshot.snapshot_locked) {
           // Use stored snapshot if it's locked (preserved historical data)
@@ -549,11 +643,6 @@ const getDashboard = async (req, res) => {
       startOfMonth: startOfMonth.toISOString().split('T')[0],
       today: today.toISOString().split('T')[0]
     });
-    const qtdFrom = startOfQuarter.toISOString().split('T')[0];
-    const qtdTo = today.toISOString().split('T')[0];
-    const ytdFrom = startOfYear.toISOString().split('T')[0];
-    const ytdTo = today.toISOString().split('T')[0];
-
     // Get revenue data - include all sessions where payment was made (exclude free assessments)
     // Statuses where payment exists: booked, completed, rescheduled, reschedule_requested, no_show, cancelled
     // Fetch all sessions (no date filter) - filter in calculation function
@@ -561,25 +650,8 @@ const getDashboard = async (req, res) => {
     try {
       let sessions = null;
       let sessionsError = null;
-      const dashBcf = appendBookingTimeSelectFragment(dashBookingTimeCol);
-      // Built fresh per page: a PostgREST builder cannot be safely re-ranged after execution.
-      //
-      // This used to end in `.limit(5000)`, which does NOT do what it looks like — PostgREST
-      // caps a response at 1000 rows regardless. The dashboard therefore aggregated only the
-      // newest 1000 of 3000 matching sessions, so every revenue and session total silently
-      // excluded everything booked before ~12 Jul 2026. Paging covers the full range.
-      const buildDashSessionsQuery = () => {
-        let q = supabaseAdmin
-          .from('sessions')
-          .select(`id, scheduled_date, original_scheduled_date, price, psychologist_id, client_id, status, payment_id, session_type, created_at, booking_created_at, ${dashBcf} package_id, source, package_session_number, session_count`)
-          .in('status', ['completed', 'booked', 'pending', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
-          .neq('session_type', 'free_assessment');
-        // Not all-time: from the start of the year, enough for the MTD/QTD/YTD cards.
-        if (!allTimeMode) q = q.gte('created_at', `${ytdFrom}T00:00:00+05:30`);
-        return q.order('created_at', { ascending: false });
-      };
 
-      ({ data: sessions, error: sessionsError } = await fetchAllPagesOf(buildDashSessionsQuery));
+      ({ data: sessions, error: sessionsError } = await late(dashSessionsP));
 
       // Legacy schema fallback: sessions.payment_id not present
       if (sessionsError && String(sessionsError.message || '').includes('payment_id')) {
@@ -631,20 +703,172 @@ const getDashboard = async (req, res) => {
       sessionsData = [];
     }
 
-    const assessmentPsychIdForFinance = process.env.ASSESSMENT_PSYCHOLOGIST_ID || '00000000-0000-0000-0000-000000000000';
     let financeDashboardPsychIds = [];
     let financePsychIdSet = null;
     try {
-      const { data: financePsychRows } = await supabaseAdmin
-        .from('psychologists')
-        .select('id')
-        .neq('id', assessmentPsychIdForFinance);
+      const { data: financePsychRows } = await late(financePsychRowsP);
       financeDashboardPsychIds = financePsychRows?.map((p) => p.id).filter(Boolean) || [];
       if (financeDashboardPsychIds.length > 0) {
         financePsychIdSet = new Set(financeDashboardPsychIds);
       }
     } catch (psychErr) {
       console.error('Error fetching psychologists for finance dashboard:', psychErr);
+    }
+
+    // Helper function to check if session should be included in revenue
+    // Include all statuses where payment was made (sessions exist only after successful payment)
+    const shouldIncludeInRevenue = (s) => {
+      if (!s) return false;
+      const paidStatuses = ['completed', 'booked', 'pending', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow'];
+      return paidStatuses.includes(s.status);
+    };
+
+    // Filter sessions for picker range: bookings created on an IST calendar day within range
+    // If no date filter (all time), keep prior behavior (any session with scheduled_date)
+    const filteredSessionsForDisplay = sessionsData.filter(s => {
+      if (!s) return false;
+
+      if (!mtdFrom || !mtdTo) {
+        return !!(s.scheduled_date);
+      }
+
+      const bookedYmd = getSessionBookingCreatedIstDateString(s);
+      return !!(bookedYmd && bookedYmd >= mtdFrom && bookedYmd <= mtdTo);
+    });
+
+    // Get revenue by session type (only if charts are needed)
+    let revenueByType = { individual: 0, package: 0 };
+    if (shouldIncludeCharts) {
+      const revenueSessions = filteredSessionsForDisplay.filter(shouldIncludeInRevenue);
+      revenueByType = {
+        individual: revenueSessions
+          .filter(s => s.session_type !== 'package')
+          .reduce((sum, s) => sum + (parseFloat(s.price) || 0), 0),
+        package: revenueSessions
+          .filter(s => s.session_type === 'package')
+          .reduce((sum, s) => sum + (parseFloat(s.price) || 0), 0),
+      };
+    }
+
+    // Get top 3 doctors by revenue (filtered by date range)
+    const doctorRevenue = {};
+    filteredSessionsForDisplay.filter(shouldIncludeInRevenue).forEach(s => {
+      if (s.psychologist_id) {
+        if (!doctorRevenue[s.psychologist_id]) {
+          doctorRevenue[s.psychologist_id] = { revenue: 0, session_count: 0 };
+        }
+        doctorRevenue[s.psychologist_id].revenue += parseFloat(s.price) || 0;
+        doctorRevenue[s.psychologist_id].session_count += 1;
+      }
+    });
+
+    const topDoctors = Object.entries(doctorRevenue)
+      .sort((a, b) => b[1].revenue - a[1].revenue)
+      .slice(0, 3)
+      .map(([id, data]) => ({ psychologist_id: id, total_commission: data.revenue, session_count: data.session_count }));
+
+    // Get recent bookings: latest 3 by client booking instant
+    const recentSessionsFiltered = filteredSessionsForDisplay
+      .filter(shouldIncludeInRevenue)
+      .sort((a, b) => {
+        const createdA = new Date(getSessionBookingCreatedAtIso(a) || a.created_at || 0).getTime();
+        const createdB = new Date(getSessionBookingCreatedAtIso(b) || b.created_at || 0).getTime();
+        return createdB - createdA; // Latest booked first
+      })
+      .slice(0, 3);
+
+    // Get all unique psychologist IDs for both top doctors and recent sessions
+    const allPsychologistIds = [...new Set([
+      ...topDoctors.map(d => d.psychologist_id),
+      ...recentSessionsFiltered.map(s => s?.psychologist_id).filter(Boolean)
+    ])];
+    
+    // Get all unique client IDs for recent sessions
+    const allClientIds = [...new Set(recentSessionsFiltered.map(s => s?.client_id).filter(Boolean))];
+
+    // ── Round two (speed): every lookup that needs only the session list or the therapist
+    // ids is sent now, together, and read (late) where the code used to await it. ──
+    let pendingSessionsInRangeEarly = null;
+    let pendingCommissionPrepErr = null;
+    let pendingCommissionP = null;
+    try {
+      pendingSessionsInRangeEarly =
+        mtdFrom && mtdTo
+          ? sessionsData.filter((s) => {
+              if (!s || s.status !== 'booked') return false;
+              const ymd = getSessionBookingCreatedIstDateString(s);
+              return !!(ymd && ymd >= mtdFrom && ymd <= mtdTo);
+            })
+          : sessionsData.filter((s) => s && s.status === 'booked');
+      if (pendingSessionsInRangeEarly.length > 0) {
+        pendingCommissionP = early(supabaseAdmin
+          .from('commission_history')
+          .select('commission_amount')
+          .in('session_id', pendingSessionsInRangeEarly.map((s) => s.id))
+          .eq('payment_status', 'pending'));
+      }
+    } catch (prepErr) {
+      pendingCommissionPrepErr = prepErr;
+    }
+    const recentPsychP = allPsychologistIds.length > 0
+      ? early(supabaseAdmin.from('psychologists').select('id, first_name, last_name').in('id', allPsychologistIds))
+      : null;
+    const recentClientsP = allClientIds.length > 0
+      ? early(supabaseAdmin.from('clients').select('id, first_name, last_name').in('id', allClientIds))
+      : null;
+    const recentPackageIdsEarly = [...new Set(recentSessionsFiltered.map(s => s?.package_id).filter(Boolean))];
+    const recentPackagesP = recentPackageIdsEarly.length > 0
+      ? early(supabaseAdmin.from('packages').select('id, session_count').in('id', recentPackageIdsEarly))
+      : null;
+    const recentPkgSessionsP = recentPackageIdsEarly.length > 0
+      ? early(supabaseAdmin
+        .from('sessions')
+        .select(`id, client_id, package_id, created_at, ${appendBookingTimeSelectFragment(dashBookingTimeCol)} source`)
+        .in('package_id', recentPackageIdsEarly)
+        .order(dashBookingTimeCol, { ascending: true }))
+      : null;
+    let allSessionsMainP = null;
+    let allSessionsDerivedP = null;
+    let dashCommissionsP = null;
+    let dashPackagesP = null;
+    if (financeDashboardPsychIds.length > 0) {
+      let q = supabaseAdmin
+        .from('sessions')
+        .select('id, psychologist_id, client_id, session_type, package_id, price, scheduled_date, original_scheduled_date, status, payment_id, created_at, updated_at, completion_date, package_session_number, session_count, package_group_id, booking_created_at, source')
+        .not('psychologist_id', 'is', null)
+        .neq('session_type', 'free_assessment')
+        .in('status', ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'])
+        .in('psychologist_id', financeDashboardPsychIds);
+      if (!allTimeMode) q = q.gte('created_at', `${ytdFrom}T00:00:00+05:30`);
+      q = q.order('created_at', { ascending: true }).limit(5000);
+      allSessionsMainP = early(q.order('created_at', { ascending: true }));
+      // As soon as the sessions arrive: their commission history, first-session flags and
+      // package siblings, all at once (each exactly as the code below would request it).
+      allSessionsDerivedP = allSessionsMainP.then((r) => {
+        if ('err' in r || !r.ok || r.ok.error) return null;
+        const list = r.ok.data || [];
+        const ids = list.map((x) => x.id).filter(Boolean);
+        return {
+          historyP: ids.length > 0
+            ? early(supabaseAdmin
+              .from('commission_history')
+              .select('session_id, commission_amount, session_amount, payment_status')
+              .in('session_id', ids))
+            : null,
+          flagsP: early(resolveFirstSessionFlags(supabaseAdmin, list)),
+          sibsP: early(fetchPackageSiblings(list)),
+        };
+      });
+      dashCommissionsP = early(supabaseAdmin
+        .from('doctor_commissions')
+        .select('psychologist_id, commission_amounts, commission_amount_individual, commission_amount_package, doctor_commission_first_session, doctor_commission_followup, doctor_commission_individual, doctor_commission_first_session_package, doctor_commission_followup_package, doctor_commission_packages')
+        .eq('is_active', true)
+        .in('psychologist_id', financeDashboardPsychIds)
+        .order('effective_from', { ascending: false }));
+      dashPackagesP = early(supabaseAdmin
+        .from('packages')
+        .select('id, psychologist_id, package_type, name, price, session_count')
+        .in('psychologist_id', financeDashboardPsychIds));
     }
 
     // Calculate revenue metrics
@@ -702,11 +926,7 @@ const getDashboard = async (req, res) => {
     try {
       let expenses = null;
       let expensesError = null;
-      ({ data: expenses, error: expensesError } = await supabaseAdmin
-        .from('expenses')
-        .select(FINANCE_EXPENSE_SELECT)
-        .eq('approval_status', 'approved')
-        .gte('date', ytdFrom));
+      ({ data: expenses, error: expensesError } = await late(expensesP));
 
       // Legacy schema fallback: approval_status/date may be missing
       if (expensesError && String(expensesError.message || '').includes('approval_status')) {
@@ -743,10 +963,7 @@ const getDashboard = async (req, res) => {
     try {
       let income = null;
       let incomeError = null;
-      ({ data: income, error: incomeError } = await supabaseAdmin
-        .from('income_entries')
-        .select(FINANCE_INCOME_SELECT)
-        .gte('date', ytdFrom));
+      ({ data: income, error: incomeError } = await late(incomeP));
 
       // Legacy fallback where table is named `income`.
       if (incomeError && (incomeError.code === '42P01' || incomeError.code === 'PGRST205')) {
@@ -844,10 +1061,7 @@ const getDashboard = async (req, res) => {
     // Get pending payments (check payments table instead)
     let pendingPayments = 0;
     try {
-      const { data: pendingPaymentsData } = await supabaseAdmin
-        .from('payments')
-        .select('amount')
-        .eq('status', 'pending');
+      const { data: pendingPaymentsData } = await late(pendingPaymentsP);
 
       pendingPayments = pendingPaymentsData?.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0) || 0;
     } catch (err) {
@@ -858,24 +1072,14 @@ const getDashboard = async (req, res) => {
     // Get pending commission — sessions booked (status) whose customer booking falls in picker range (IST)
     let totalPendingCommission = 0;
     try {
-      const pendingSessionsInRange =
-        mtdFrom && mtdTo
-          ? sessionsData.filter((s) => {
-              if (!s || s.status !== 'booked') return false;
-              const ymd = getSessionBookingCreatedIstDateString(s);
-              return !!(ymd && ymd >= mtdFrom && ymd <= mtdTo);
-            })
-          : sessionsData.filter((s) => s && s.status === 'booked');
+      if (pendingCommissionPrepErr) throw pendingCommissionPrepErr;
+      const pendingSessionsInRange = pendingSessionsInRangeEarly;
 
       if (pendingSessionsInRange.length > 0) {
         const sessionIds = pendingSessionsInRange.map((s) => s.id);
         
         // Get commission_history for these sessions with pending status
-        const { data: pendingCommission, error: commissionError } = await supabaseAdmin
-          .from('commission_history')
-          .select('commission_amount')
-          .in('session_id', sessionIds)
-          .eq('payment_status', 'pending');
+        const { data: pendingCommission, error: commissionError } = await late(pendingCommissionP);
 
         if (!commissionError && pendingCommission) {
           totalPendingCommission = pendingCommission.reduce((sum, c) => sum + (parseFloat(c.commission_amount) || 0), 0);
@@ -887,11 +1091,7 @@ const getDashboard = async (req, res) => {
     }
 
     // Get active sessions count
-    const { data: activeSessions } = await supabaseAdmin
-      .from('sessions')
-      .select('id')
-      .in('status', ['booked'])
-      .gte('scheduled_date', today.toISOString().split('T')[0]);
+    const { data: activeSessions } = await late(activeSessionsP);
 
     // Total sessions card: distinct bookings (a package's sessions share one payment_id). IST booking day; same psych roster as doctors.
     let totalSessions = 0;
@@ -913,11 +1113,7 @@ const getDashboard = async (req, res) => {
     // Get active doctors count (psychologists with at least one session) - exclude free assessments
     let activeDoctors = 0;
     try {
-      const { data: activeDoctorsData } = await supabaseAdmin
-        .from('sessions')
-        .select('psychologist_id')
-        .not('psychologist_id', 'is', null)
-        .neq('session_type', 'free_assessment');
+      const { data: activeDoctorsData } = await late(activeDoctorsP);
       
       if (activeDoctorsData && activeDoctorsData.length > 0) {
         const uniqueDoctors = new Set(activeDoctorsData.map(s => s.psychologist_id).filter(Boolean));
@@ -931,10 +1127,7 @@ const getDashboard = async (req, res) => {
     // Get total commission paid
     let commissionPaid = 0;
     try {
-      const { data: commissionData } = await supabaseAdmin
-        .from('commission_history')
-        .select('commission_amount')
-        .eq('payment_status', 'paid');
+      const { data: commissionData } = await late(commissionPaidP);
       
       if (commissionData) {
         commissionPaid = commissionData.reduce((sum, c) => sum + (parseFloat(c.commission_amount) || 0), 0);
@@ -959,93 +1152,17 @@ const getDashboard = async (req, res) => {
       ? ((ytdRevenue.total - lastYearRevenue.total) / lastYearRevenue.total * 100).toFixed(2)
       : 0;
 
-    // Helper function to check if session should be included in revenue
-    // Include all statuses where payment was made (sessions exist only after successful payment)
-    const shouldIncludeInRevenue = (s) => {
-      if (!s) return false;
-      const paidStatuses = ['completed', 'booked', 'pending', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow'];
-      return paidStatuses.includes(s.status);
-    };
-
-    // Filter sessions for picker range: bookings created on an IST calendar day within range
-    // If no date filter (all time), keep prior behavior (any session with scheduled_date)
-    const filteredSessionsForDisplay = sessionsData.filter(s => {
-      if (!s) return false;
-
-      if (!mtdFrom || !mtdTo) {
-        return !!(s.scheduled_date);
-      }
-
-      const bookedYmd = getSessionBookingCreatedIstDateString(s);
-      return !!(bookedYmd && bookedYmd >= mtdFrom && bookedYmd <= mtdTo);
-    });
-
-    // Get revenue by session type (only if charts are needed)
-    let revenueByType = { individual: 0, package: 0 };
-    if (shouldIncludeCharts) {
-      const revenueSessions = filteredSessionsForDisplay.filter(shouldIncludeInRevenue);
-      revenueByType = {
-        individual: revenueSessions
-          .filter(s => s.session_type !== 'package')
-          .reduce((sum, s) => sum + (parseFloat(s.price) || 0), 0),
-        package: revenueSessions
-          .filter(s => s.session_type === 'package')
-          .reduce((sum, s) => sum + (parseFloat(s.price) || 0), 0),
-      };
-    }
-
-    // Get top 3 doctors by revenue (filtered by date range)
-    const doctorRevenue = {};
-    filteredSessionsForDisplay.filter(shouldIncludeInRevenue).forEach(s => {
-      if (s.psychologist_id) {
-        if (!doctorRevenue[s.psychologist_id]) {
-          doctorRevenue[s.psychologist_id] = { revenue: 0, session_count: 0 };
-        }
-        doctorRevenue[s.psychologist_id].revenue += parseFloat(s.price) || 0;
-        doctorRevenue[s.psychologist_id].session_count += 1;
-      }
-    });
-
-    const topDoctors = Object.entries(doctorRevenue)
-      .sort((a, b) => b[1].revenue - a[1].revenue)
-      .slice(0, 3)
-      .map(([id, data]) => ({ psychologist_id: id, total_commission: data.revenue, session_count: data.session_count }));
-
-    // Get recent bookings: latest 3 by client booking instant
-    const recentSessionsFiltered = filteredSessionsForDisplay
-      .filter(shouldIncludeInRevenue)
-      .sort((a, b) => {
-        const createdA = new Date(getSessionBookingCreatedAtIso(a) || a.created_at || 0).getTime();
-        const createdB = new Date(getSessionBookingCreatedAtIso(b) || b.created_at || 0).getTime();
-        return createdB - createdA; // Latest booked first
-      })
-      .slice(0, 3);
-
-    // Get all unique psychologist IDs for both top doctors and recent sessions
-    const allPsychologistIds = [...new Set([
-      ...topDoctors.map(d => d.psychologist_id),
-      ...recentSessionsFiltered.map(s => s?.psychologist_id).filter(Boolean)
-    ])];
-    
-    // Get all unique client IDs for recent sessions
-    const allClientIds = [...new Set(recentSessionsFiltered.map(s => s?.client_id).filter(Boolean))];
 
     let allPsychologists = [];
     let allClients = [];
     
     if (allPsychologistIds.length > 0) {
-      const { data: psychologists } = await supabaseAdmin
-        .from('psychologists')
-        .select('id, first_name, last_name')
-        .in('id', allPsychologistIds);
+      const { data: psychologists } = await late(recentPsychP);
       allPsychologists = psychologists || [];
     }
     
     if (allClientIds.length > 0) {
-      const { data: clients } = await supabaseAdmin
-        .from('clients')
-        .select('id, first_name, last_name')
-        .in('id', allClientIds);
+      const { data: clients } = await late(recentClientsP);
       allClients = clients || [];
     }
 
@@ -1054,19 +1171,12 @@ const getDashboard = async (req, res) => {
     let packageTotalById = {};
     let sessionNumberMap = {}; // key: session.id -> position number in package
     if (recentPackageIds.length > 0) {
-      const { data: packagesList } = await supabaseAdmin
-        .from('packages')
-        .select('id, session_count')
-        .in('id', recentPackageIds);
+      const { data: packagesList } = await late(recentPackagesP);
       (packagesList || []).forEach(p => {
         packageTotalById[p.id] = p.session_count ?? 0;
       });
       const pkgBcf = appendBookingTimeSelectFragment(dashBookingTimeCol);
-      const { data: allPkgSessions } = await supabaseAdmin
-        .from('sessions')
-        .select(`id, client_id, package_id, created_at, ${pkgBcf} source`)
-        .in('package_id', recentPackageIds)
-        .order(dashBookingTimeCol, { ascending: true });
+      const { data: allPkgSessions } = await late(recentPkgSessionsP);
       const counterByClientPackage = {};
       (allPkgSessions || []).forEach(s => {
         if (s.client_id && s.package_id) {
@@ -1126,11 +1236,7 @@ const getDashboard = async (req, res) => {
         let monthCommission = 0;
         let monthDoctorWallet = 0;
         try {
-          const { data: monthCommissions } = await supabaseAdmin
-            .from('commission_history')
-            .select('commission_amount, session_amount')
-            .gte('session_date', monthStart)
-            .lte('session_date', monthEnd);
+          const { data: monthCommissions } = await late(monthCommissionsP[11 - i]);
           
           if (monthCommissions) {
             monthCommission = monthCommissions.reduce((sum, c) => sum + (parseFloat(c.commission_amount) || 0), 0);
@@ -1196,7 +1302,9 @@ const getDashboard = async (req, res) => {
         // - Revenue: Filter by scheduled_date within date range
         let allSessions = null;
         let allSessionsError = null;
-        ({ data: allSessions, error: allSessionsError } = await allSessionsQuery.order('created_at', { ascending: true }));
+        ({ data: allSessions, error: allSessionsError } = await late(allSessionsMainP));
+        // The lookups started for these sessions apply only when this first read worked.
+        const derived = allSessionsError ? null : await allSessionsDerivedP;
         if (allSessionsError && String(allSessionsError.message || '').includes('payment_id')) {
           allSessionsQuery = supabaseAdmin
             .from('sessions')
@@ -1239,13 +1347,8 @@ const getDashboard = async (req, res) => {
         if (allSessionsError) throw allSessionsError;
         
         // Get commission settings (same as doctors page)
-        const { data: commissions } = await supabaseAdmin
-          .from('doctor_commissions')
-          .select('psychologist_id, commission_amounts, commission_amount_individual, commission_amount_package, doctor_commission_first_session, doctor_commission_followup, doctor_commission_individual, doctor_commission_first_session_package, doctor_commission_followup_package, doctor_commission_packages')
-          .eq('is_active', true)
-          .in('psychologist_id', allPsychIds)
-          .order('effective_from', { ascending: false });
-        
+        const { data: commissions } = await late(dashCommissionsP);
+
         // Build commission amounts map
         const commissionAmountsMap = {};
         const seenPsychIds = new Set();
@@ -1264,10 +1367,7 @@ const getDashboard = async (req, res) => {
         });
         
         // Get packages (need full package data for packagePricesMap)
-        const { data: packages } = await supabaseAdmin
-          .from('packages')
-          .select('id, psychologist_id, package_type, name, price, session_count')
-          .in('psychologist_id', allPsychIds);
+        const { data: packages } = await late(dashPackagesP);
         
         const packageTypeMap = {};
         const packagePricesMap = {};
@@ -1289,10 +1389,12 @@ const getDashboard = async (req, res) => {
         const sessionIds = allSessions?.map(s => s.id).filter(Boolean) || [];
         let commissionHistory = [];
         if (sessionIds.length > 0) {
-          const { data: history } = await supabaseAdmin
-            .from('commission_history')
-            .select('session_id, commission_amount, session_amount, payment_status')
-            .in('session_id', sessionIds);
+          const { data: history } = derived && derived.historyP
+            ? await late(derived.historyP)
+            : await supabaseAdmin
+              .from('commission_history')
+              .select('session_id, commission_amount, session_amount, payment_status')
+              .in('session_id', sessionIds);
           commissionHistory = history || [];
         }
         
@@ -1313,11 +1415,13 @@ const getDashboard = async (req, res) => {
         
         // First session / first package: one rule for all finance screens and payouts
         // (utils/sessionCommission resolveFirstSessionFlags — whole client history, purchase-level).
-        const firstFlags = await resolveFirstSessionFlags(supabaseAdmin, allSessions || []);
+        const firstFlags = derived
+          ? await late(derived.flagsP)
+          : await resolveFirstSessionFlags(supabaseAdmin, allSessions || []);
         const clientFirstSessions = firstFlags.firstSessionIds;
 
         // Package profit nets per purchase (see packageCompanyShareFor).
-        const packageCompanyShare = await packageCompanyShareFor(allSessions || [], commissionRecordsMap, commissionHistoryMap, firstFlags);
+        const packageCompanyShare = await packageCompanyShareFor(allSessions || [], commissionRecordsMap, commissionHistoryMap, firstFlags, derived ? late(derived.sibsP) : null);
 
         // Calculate totals - separate completed vs pending
         // Apply different date filters for pending vs completed payouts
