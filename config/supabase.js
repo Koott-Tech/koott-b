@@ -1,4 +1,6 @@
 const { createClient } = require('@supabase/supabase-js');
+// Dev-only per-request database timing (DEBUG_DB_TIMING=1); a no-op otherwise.
+const dbTiming = require('../utils/dbTiming');
 
 // Prefer the shared NEXT_PUBLIC_* env vars so frontend and backend
 // use the same Supabase project URL; fall back to backend-only
@@ -20,7 +22,10 @@ const timedFetch = (input, init = {}) => {
   const url = typeof input === 'string' ? input : (input instanceof URL ? input.href : input?.url || '');
   const ms = /\/storage\/v1\//.test(url) ? Math.max(TIMEOUT_MS, 120000) : TIMEOUT_MS;
   const signal = init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
-  return fetch(input, { ...init, signal });
+  if (!dbTiming.ENABLED) return fetch(input, { ...init, signal });
+  const started = performance.now();
+  const what = `${(init.method || 'GET').toUpperCase()} ${url.replace(/^https?:\/\/[^/]+\/(rest|storage|auth)\/v1\//, '$1:').slice(0, 160)}`;
+  return fetch(input, { ...init, signal }).finally(() => dbTiming.record(started, performance.now(), what));
 };
 
 // Create client with anonymous key for user operations

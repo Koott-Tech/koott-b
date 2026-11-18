@@ -49,6 +49,9 @@ const financeRoutes = require('./routes/finance');
 const couponRoutes = require('./routes/coupons');
 
 const app = express();
+// Dev-only: database calls / time / sequential rounds per request as response headers
+// (DEBUG_DB_TIMING=1; utils/dbTiming.js). A pass-through otherwise.
+app.use(require('./utils/dbTiming').middleware);
 const PORT = process.env.PORT || 5001;
 
 // Trust exactly one reverse proxy (e.g. Cloudflare, Nginx). Using a number instead of
