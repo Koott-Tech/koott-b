@@ -22,6 +22,7 @@ const {
 const { assertClientPackageHasAvailableSlot } = require('../services/packageService');
 const { notifySessionTransfer } = require('../utils/sessionTransferNotifier');
 const { getMeetEventDurationMinutes } = require('../utils/sessionMeetDuration');
+const { early, late } = require('../utils/queryOverlap');
 function isPendingAdminSessionStatus(status) {
   return ['booked', 'scheduled', 'rescheduled', 'reschedule_requested', 'confirmed'].includes(
     String(status || '').toLowerCase()
@@ -529,8 +530,11 @@ const getAllSessions = async (req, res) => {
     }
     // Note: free_assessment exclusion already applied above
 
-    const { count: sessionsCount, error: countError } = await countQuery;
-    console.log('Total sessions count:', sessionsCount);
+    // The count and the page itself are independent: the count is sent now and read here,
+    // the page query (built below exactly as before) is sent right after it.
+    const countP = early(countQuery);
+    let sessionsCount;
+    let countError;
 
     // Now fetch the paginated sessions
     // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
@@ -629,7 +633,10 @@ const getAllSessions = async (req, res) => {
     console.log(canUseDatabasePagination
       ? 'Executing paginated sessions query...'
       : 'Executing query for all sessions (runtime filtering/sorting required)...');
-    const { data: sessions, error } = await query;
+    const pageP = early(query);
+    ({ count: sessionsCount, error: countError } = await late(countP));
+    console.log('Total sessions count:', sessionsCount);
+    const { data: sessions, error } = await late(pageP);
     console.log('Query result:', { sessionsCount: sessions?.length, error });
 
     if (error) {
@@ -647,16 +654,54 @@ const getAllSessions = async (req, res) => {
       });
     }
 
+    // Plans, every session of those plans, and client emails need only this page: all sent now.
+    const pagePackageIds = sessions && sessions.length > 0 ? [...new Set(sessions.map(s => s.package_id).filter(Boolean))] : [];
+    const pagePackagesP = pagePackageIds.length > 0
+      ? early(supabaseAdmin
+        .from('packages')
+        .select('id, name, package_type, price, description, session_count')
+        .in('id', pagePackageIds))
+      : null;
+    const pagePackageSessionsP = pagePackageIds.length > 0
+      ? early(supabaseAdmin
+        .from('sessions')
+        .select(`id, package_id, client_id, status, created_at, ${appendBookingTimeSelectFragment(adminBookingTimeCol)} source`)
+        .in('package_id', pagePackageIds)
+        .order(adminBookingTimeCol, { ascending: true }))
+      : null;
+    // Client emails (same chunks and retries as below, each chunk on its own).
+    const emailUserIds = [...new Set((sessions || []).map((s) => s?.client?.user_id).filter(Boolean))];
+    const emailChunksP = early((async () => {
+      const chunks = [];
+      for (let i = 0; i < emailUserIds.length; i += 100) chunks.push(emailUserIds.slice(i, i + 100));
+      return Promise.all(chunks.map(async (batch) => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const { data: users, error: usersError } = await supabaseAdmin
+              .from('users')
+              .select('id, email')
+              .in('id', batch);
+            if (usersError) throw usersError;
+            return users || [];
+          } catch (batchErr) {
+            if (attempt === 2) {
+              console.warn(`[getAllSessions] users email lookup failed for a batch (after retries):`, batchErr?.message || batchErr);
+            } else {
+              await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+            }
+          }
+        }
+        return [];
+      }));
+    })());
+
     // Fetch package data for sessions that have package_id
     // Since there's no direct foreign key relationship, fetch separately
     if (sessions && sessions.length > 0) {
       const packageIds = [...new Set(sessions.map(s => s.package_id).filter(Boolean))];
-      
+
       if (packageIds.length > 0) {
-        const { data: packages, error: packagesError } = await supabaseAdmin
-          .from('packages')
-          .select('id, name, package_type, price, description, session_count')
-          .in('id', packageIds);
+        const { data: packages, error: packagesError } = await late(pagePackagesP);
 
         if (!packagesError && packages) {
           const packagesMap = packages.reduce((acc, pkg) => {
@@ -665,12 +710,7 @@ const getAllSessions = async (req, res) => {
           }, {});
 
           // Fetch ALL sessions per package to determine session numbers and completed counts
-          const pkgBcf = appendBookingTimeSelectFragment(adminBookingTimeCol);
-          const { data: allPackageSessions, error: allPackageSessionsError } = await supabaseAdmin
-            .from('sessions')
-            .select(`id, package_id, client_id, status, created_at, ${pkgBcf} source`)
-            .in('package_id', packageIds)
-            .order(adminBookingTimeCol, { ascending: true });
+          const { data: allPackageSessions, error: allPackageSessionsError } = await late(pagePackageSessionsP);
 
           const completedCountsByClientPackage = {};
           const sessionNumberMap = {};
@@ -722,27 +762,9 @@ const getAllSessions = async (req, res) => {
         // Resilient lookup: chunk the ids and retry each batch. A single transient
         // "fetch failed" was dropping ALL client emails for the admin Bookings page.
         const emailById = new Map();
-        const idList = [...userIds];
-        const CHUNK = 100;
-        for (let i = 0; i < idList.length; i += CHUNK) {
-          const batch = idList.slice(i, i + CHUNK);
-          for (let attempt = 0; attempt < 3; attempt++) {
-            try {
-              const { data: users, error: usersError } = await supabaseAdmin
-                .from('users')
-                .select('id, email')
-                .in('id', batch);
-              if (usersError) throw usersError;
-              (users || []).forEach((u) => emailById.set(u.id, u.email));
-              break; // batch succeeded
-            } catch (batchErr) {
-              if (attempt === 2) {
-                console.warn(`[getAllSessions] users email lookup failed for a batch (after retries):`, batchErr?.message || batchErr);
-              } else {
-                await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
-              }
-            }
-          }
+        // Fetched above, as soon as the page arrived (assessment sessions are always empty here).
+        for (const users of await late(emailChunksP)) {
+          users.forEach((u) => emailById.set(u.id, u.email));
         }
         const attach = (s) => {
           if (s?.client && s.client.user_id) {
@@ -858,6 +880,29 @@ const getAllSessions = async (req, res) => {
       ? visibleSessions
       : visibleSessions.slice(startIndex, endIndex);
 
+    // Commission rows and transferred-from names need only the visible page: sent together.
+    const commPageIds = paginatedSessions
+      .filter((s) => s.session_type !== 'assessment' && s.type !== 'assessment')
+      .map((s) => s.id)
+      .filter(Boolean);
+    const commRowsP = commPageIds.length
+      ? early(supabaseAdmin
+        .from('commission_history')
+        .select('session_id, commission_amount, company_revenue, net_company_revenue')
+        .in('session_id', commPageIds))
+      : null;
+    const transferredIdsEarly = Array.from(new Set(
+      paginatedSessions
+        .filter((s) => s.original_psychologist_id && s.original_psychologist_id !== s.psychologist_id)
+        .map((s) => s.original_psychologist_id)
+    ));
+    const origPsychsP = transferredIdsEarly.length
+      ? early(supabaseAdmin
+        .from('psychologists')
+        .select('id, first_name, last_name')
+        .in('id', transferredIdsEarly))
+      : null;
+
     // Commission / net revenue (finance sessions table)
     try {
       const pageIds = paginatedSessions
@@ -865,10 +910,7 @@ const getAllSessions = async (req, res) => {
         .map((s) => s.id)
         .filter(Boolean);
       if (pageIds.length) {
-        const { data: commRows, error: commErr } = await supabaseAdmin
-          .from('commission_history')
-          .select('session_id, commission_amount, company_revenue, net_company_revenue')
-          .in('session_id', pageIds);
+        const { data: commRows, error: commErr } = await late(commRowsP);
         if (!commErr && commRows?.length) {
           const bySession = new Map(commRows.map((c) => [c.session_id, c]));
           for (const s of paginatedSessions) {
@@ -894,10 +936,7 @@ const getAllSessions = async (req, res) => {
           .map((s) => s.original_psychologist_id)
       ));
       if (transferredIds.length) {
-        const { data: origPsychs } = await supabaseAdmin
-          .from('psychologists')
-          .select('id, first_name, last_name')
-          .in('id', transferredIds);
+        const { data: origPsychs } = await late(origPsychsP);
         const nameMap = new Map((origPsychs || []).map((p) => [p.id, `${p.first_name || ''} ${p.last_name || ''}`.trim()]));
         for (const s of paginatedSessions) {
           if (s.original_psychologist_id && s.original_psychologist_id !== s.psychologist_id) {

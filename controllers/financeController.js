@@ -2622,6 +2622,12 @@ const getSessions = async (req, res) => {
       });
     }
 
+    // Therapist and client names need only this list: sent now, alongside the payments check.
+    const namesP = early(Promise.all([
+      selectByIdsChunked('psychologists', 'id, first_name, last_name', 'id', [...new Set(sessionsData.map(s => s?.psychologist_id).filter(Boolean))]),
+      selectByIdsChunked('clients', 'id, first_name, last_name, child_name, email, phone_number', 'id', [...new Set(sessionsData.map(s => s?.client_id).filter(Boolean))]),
+    ]));
+
     // Filter by successful payment status (paid, success, completed, cash)
     // when the caller wants paid finance rows only.
     const paymentIds = [...new Set(sessionsData.map(s => s.payment_id).filter(Boolean))];
@@ -2682,10 +2688,7 @@ const getSessions = async (req, res) => {
     // UUIDs overflows the PostgREST GET URL and the whole request fails ("fetch failed"),
     // which silently dropped ALL client/therapist names for FK-based rows.
     // Both lookups are independent — run them (and their chunks) concurrently.
-    const [psychRes, clientRes] = await Promise.all([
-      selectByIdsChunked('psychologists', 'id, first_name, last_name', 'id', psychologistIds),
-      selectByIdsChunked('clients', 'id, first_name, last_name, child_name, email, phone_number', 'id', clientIds),
-    ]);
+    const [psychRes, clientRes] = await late(namesP);
     psychologists.push(...(psychRes.data || []));
     clients.push(...(clientRes.data || []));
 
