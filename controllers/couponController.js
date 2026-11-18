@@ -231,6 +231,11 @@ const checkCoupon = async (req, res) => {
       return bad(res, 'A valid order amount is required.');
     }
 
+    // The coupon row is read alongside the caller's client row (validateCoupon reads it
+    // after the client lookup, as before, so errors surface in the same order).
+    const couponP = couponService.findByCode(code).then((ok) => ({ ok }), (err) => ({ err }));
+    const couponPromise = couponP.then((r) => { if ('err' in r) throw r.err; return r.ok; });
+    couponPromise.catch(() => {}); // read below; never an unhandled rejection
     // Resolve the caller's client row so per-user limits apply.
     let clientId = null;
     if (req.user?.id) {
@@ -239,7 +244,7 @@ const checkCoupon = async (req, res) => {
       clientId = client?.id || null;
     }
 
-    const result = await couponService.validateCoupon({ code, amount: orderAmount, clientId });
+    const result = await couponService.validateCoupon({ code, amount: orderAmount, clientId, couponPromise });
     if (!result.valid) return res.status(200).json({ success: false, message: result.reason });
 
     return res.json({

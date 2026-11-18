@@ -60,8 +60,10 @@ async function findByCode(code) {
  *
  * @param {{code:string, amount:number, clientId?:string}} args
  */
-async function validateCoupon({ code, amount, clientId }) {
-  const coupon = await findByCode(code);
+async function validateCoupon({ code, amount, clientId, couponPromise = null }) {
+  // couponPromise: findByCode(code) already on its way (started alongside the caller's own
+  // lookup); the same row either way.
+  const coupon = couponPromise ? await couponPromise : await findByCode(code);
   if (!coupon) return { valid: false, reason: 'That coupon code is not recognised.' };
 
   if (!coupon.is_active) {
@@ -89,12 +91,26 @@ async function validateCoupon({ code, amount, clientId }) {
     return { valid: false, reason: `This coupon needs a minimum order of ₹${minOrder}.` };
   }
 
-  // Count redemptions from the table rather than trusting redemption_count.
-  if (coupon.max_redemptions != null) {
-    const { count, error } = await supabaseAdmin
+  // Count redemptions from the table rather than trusting redemption_count. Both counts are
+  // sent together and checked in the same order as before (total first, then this client's).
+  const totalCountP = coupon.max_redemptions != null
+    ? supabaseAdmin
       .from('coupon_redemptions')
       .select('id', { count: 'exact', head: true })
-      .eq('coupon_id', coupon.id);
+      .eq('coupon_id', coupon.id)
+      .then((ok) => ({ ok }), (err) => ({ err }))
+    : null;
+  const userCountP = clientId && coupon.per_user_limit != null
+    ? supabaseAdmin
+      .from('coupon_redemptions')
+      .select('id', { count: 'exact', head: true })
+      .eq('coupon_id', coupon.id)
+      .eq('client_id', clientId)
+      .then((ok) => ({ ok }), (err) => ({ err }))
+    : null;
+  const read = async (p) => { const r = await p; if ('err' in r) throw r.err; return r.ok; };
+  if (coupon.max_redemptions != null) {
+    const { count, error } = await read(totalCountP);
     if (error) {
       console.error('[couponService] total redemption count failed:', error);
       return { valid: false, reason: 'We could not verify that coupon just now.' };
@@ -105,11 +121,7 @@ async function validateCoupon({ code, amount, clientId }) {
   }
 
   if (clientId && coupon.per_user_limit != null) {
-    const { count, error } = await supabaseAdmin
-      .from('coupon_redemptions')
-      .select('id', { count: 'exact', head: true })
-      .eq('coupon_id', coupon.id)
-      .eq('client_id', clientId);
+    const { count, error } = await read(userCountP);
     if (error) {
       console.error('[couponService] per-user redemption count failed:', error);
       return { valid: false, reason: 'We could not verify that coupon just now.' };
