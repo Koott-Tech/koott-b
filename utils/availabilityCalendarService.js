@@ -1,5 +1,6 @@
 const { calendar } = require('./googleOAuthClient');
 const { supabaseAdmin } = require('../config/supabase');
+const { early, late } = require('./queryOverlap');
 const googleCalendarService = require('./googleCalendarService');
 const {
   getRecurringBlocksForPsychologist,
@@ -308,37 +309,16 @@ class AvailabilityCalendarService {
       const startTime = Date.now();
       console.log(`🚀 Getting availability range for psychologist ${psychologistId} from ${startDate} to ${endDate}`);
       
-      // Get psychologist details including Google Calendar credentials
-      // Use supabaseAdmin to bypass RLS (backend service, proper auth already handled)
-      const { data: psychologist, error: psychError } = await supabaseAdmin
-        .from('psychologists')
-        .select('id, first_name, last_name, google_calendar_credentials')
-        .eq('id', psychologistId)
-        .single();
-      
-      if (psychError || !psychologist) {
-        throw new Error('Psychologist not found');
-      }
-
-      // SINGLE QUERY: Get availability from availability table (optimized - select only needed columns)
-      const { data: availabilityData, error: availabilityError } = await supabaseAdmin
+      // Every read below needs only the id and the dates: all are sent now and read in the
+      // original order (so a missing therapist or availability error surfaces as before).
+      const availabilityP = early(supabaseAdmin
         .from('availability')
         .select('id, psychologist_id, date, time_slots, is_available')
         .eq('psychologist_id', psychologistId)
         .gte('date', startDate)
         .lte('date', endDate)
-        .order('date', { ascending: true });
-      
-      if (availabilityError) {
-        console.error('Error fetching availability:', availabilityError);
-        throw availabilityError;
-      }
-
-      console.log(`📊 Found ${availabilityData.length} availability records in date range`);
-
-      // Get all booked sessions in the date range to filter them out (optimized - parallel queries)
-      // Check both regular therapy sessions and assessment sessions
-      const [sessionsResult, assessmentSessionsResult] = await Promise.allSettled([
+        .order('date', { ascending: true }));
+      const bookedP = Promise.allSettled([
         supabaseAdmin
           .from('sessions')
           .select('scheduled_date, scheduled_time, status')
@@ -354,6 +334,33 @@ class AvailabilityCalendarService {
           .lte('scheduled_date', endDate)
           .in('status', ['booked', 'reserved']) // Include reserved as they're also blocked
       ]);
+      const recurringBlocksP = early(getRecurringBlocksForPsychologist(psychologistId));
+
+      // Get psychologist details including Google Calendar credentials
+      // Use supabaseAdmin to bypass RLS (backend service, proper auth already handled)
+      const { data: psychologist, error: psychError } = await supabaseAdmin
+        .from('psychologists')
+        .select('id, first_name, last_name, google_calendar_credentials')
+        .eq('id', psychologistId)
+        .single();
+      
+      if (psychError || !psychologist) {
+        throw new Error('Psychologist not found');
+      }
+
+      // SINGLE QUERY: Get availability from availability table (optimized - select only needed columns)
+      const { data: availabilityData, error: availabilityError } = await late(availabilityP);
+      
+      if (availabilityError) {
+        console.error('Error fetching availability:', availabilityError);
+        throw availabilityError;
+      }
+
+      console.log(`📊 Found ${availabilityData.length} availability records in date range`);
+
+      // Get all booked sessions in the date range to filter them out (optimized - parallel queries)
+      // Check both regular therapy sessions and assessment sessions
+      const [sessionsResult, assessmentSessionsResult] = await bookedP;
 
       const bookedSessions = sessionsResult.status === 'fulfilled' ? sessionsResult.value.data : null;
       const sessionsError = sessionsResult.status === 'fulfilled' ? sessionsResult.value.error : sessionsResult.reason;
@@ -377,7 +384,7 @@ class AvailabilityCalendarService {
       console.log(`🔒 Found ${bookedSessions?.length || 0} booked regular sessions and ${bookedAssessmentSessions?.length || 0} booked assessment sessions in date range`);
 
       // Recurring blocks (e.g. block every Sunday) - only this psychologist
-      const recurringBlocks = await getRecurringBlocksForPsychologist(psychologistId);
+      const recurringBlocks = await late(recurringBlocksP);
 
       // SKIP Google Calendar check entirely to prevent any blocking
       // The scheduled cron job (every 10 minutes) will handle syncing and updating the database
