@@ -78,10 +78,22 @@ async function listPeople({ includeInactive = true } = {}) {
 }
 
 /** { 'user:<id>': 'Name', 'psychologist:<id>': 'Name', 'team:<id>': 'Team' } for the given refs. */
+// Names are looked up for every task reply and rarely change: remembered for a minute.
+const NAMES_TTL_MS = 60 * 1000;
+const namesCache = new Map();
 async function namesFor(refs) {
   const ids = { user: new Set(), psychologist: new Set(), team: new Set() };
-  refs.filter((r) => r && r.type && r.id && ids[r.type]).forEach((r) => ids[r.type].add(r.id));
   const out = {};
+  const now = Date.now();
+  refs.filter((r) => r && r.type && r.id && ids[r.type]).forEach((r) => {
+    const hit = namesCache.get(key(r.type, r.id));
+    if (hit && hit.at > now - NAMES_TTL_MS) out[key(r.type, r.id)] = hit.value;
+    else ids[r.type].add(r.id);
+  });
+  if (!ids.user.size && !ids.psychologist.size && !ids.team.size) {
+    Object.defineProperty(out, COMPLETE, { value: true, enumerable: false });
+    return out;
+  }
   const [u, p, t] = await Promise.all([
     ids.user.size ? supabaseAdmin.from('users').select('id, name, email, role').in('id', [...ids.user]) : { data: [] },
     ids.psychologist.size ? supabaseAdmin.from('psychologists').select('id, first_name, last_name, email').in('id', [...ids.psychologist]) : { data: [] },
@@ -92,6 +104,9 @@ async function namesFor(refs) {
   (u.data || []).forEach((x) => { out[key('user', x.id)] = { name: x.name || x.email, role: x.role }; });
   (p.data || []).forEach((x) => { out[key('psychologist', x.id)] = { name: psychName(x), role: 'psychologist' }; });
   (t.data || []).forEach((x) => { out[key('team', x.id)] = { name: `${x.name} team`, role: 'team' }; });
+  if (namesCache.size > 5000) namesCache.clear();
+  [...(u.data || []).map((x) => key('user', x.id)), ...(p.data || []).map((x) => key('psychologist', x.id)), ...(t.data || []).map((x) => key('team', x.id))]
+    .forEach((k) => namesCache.set(k, { value: out[k], at: now }));
   return out;
 }
 
@@ -113,10 +128,18 @@ async function teamIdsOf(person) {
   return ids;
 }
 
-/** Members of a team as persons. */
+/** Members of a team as persons (remembered like teamIdsOf; forgetTeams clears both). */
+const teamMembersCache = new Map();
 async function teamMembers(teamId) {
-  const { data } = await supabaseAdmin.from('team_members').select('person_type, person_id').eq('team_id', teamId);
-  return (data || []).map((m) => ({ type: m.person_type, id: m.person_id }));
+  const hit = teamMembersCache.get(teamId);
+  if (hit && hit.at > Date.now() - TEAM_IDS_TTL_MS) return hit.members;
+  const { data, error } = await supabaseAdmin.from('team_members').select('person_type, person_id').eq('team_id', teamId);
+  const members = (data || []).map((m) => ({ type: m.person_type, id: m.person_id }));
+  if (!error) {
+    if (teamMembersCache.size > 2000) teamMembersCache.clear();
+    teamMembersCache.set(teamId, { members, at: Date.now() });
+  }
+  return members;
 }
 
 /** A team by name (the teams automatic tasks go to), created on first use. */
@@ -133,7 +156,7 @@ async function teamByName(name) {
 }
 
 /** Forget remembered team lists (call after changing team_members). */
-function forgetTeams() { teamIdsCache.clear(); }
+function forgetTeams() { teamIdsCache.clear(); teamMembersCache.clear(); }
 
 /**
  * Who a task may be given to: an existing team, an active staff login (a STAFF_USER_ROLES
@@ -141,7 +164,22 @@ function forgetTeams() { teamIdsCache.clear(); }
  * screen only offers these, but the API used to accept any id of the right shape — a task
  * given to a client or a switched-off account was then seen by nobody.
  */
+// A team found valid is remembered for 30 s. People are always checked fresh: an account
+// switched off (HR offboarding, Admin, or directly) must stop receiving tasks at once.
+const ASSIGNEE_OK_TTL_MS = 30 * 1000;
+const assigneeOk = new Map();
 async function assigneeProblem(assignee) {
+  const k = assignee ? key(assignee.type, assignee.id) : '';
+  const hit = assignee?.type === 'team' ? assigneeOk.get(k) : null;
+  if (hit && hit > Date.now() - ASSIGNEE_OK_TTL_MS) return null;
+  const problem = await checkAssignee(assignee);
+  if (!problem && assignee?.type === 'team') {
+    if (assigneeOk.size > 2000) assigneeOk.clear();
+    assigneeOk.set(k, Date.now());
+  }
+  return problem;
+}
+async function checkAssignee(assignee) {
   const { type, id } = assignee || {};
   if (!id) return 'Pick who the task is for.';
   if (type === 'team') {

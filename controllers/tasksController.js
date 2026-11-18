@@ -340,9 +340,12 @@ async function createTask(fields, creator) {
   if (error) throw error;
   const task = Array.isArray(data) ? data[0] : data;
   if (!task) return null; // automatic task that already exists
-  await logEvent(task.id, creator, 'created', null, { title: task.title });
+  // History entry and notifications together (not one after the other).
   const who = creator.type === 'system' ? 'A new task was created automatically for you.' : 'You have a new task.';
-  await notify(await recipientsOf(task), task, 'assigned', who, creator, `assigned:${task.id}`);
+  await Promise.all([
+    logEvent(task.id, creator, 'created', null, { title: task.title }),
+    (async () => notify(await recipientsOf(task), task, 'assigned', who, creator, `assigned:${task.id}`))(),
+  ]);
   return task;
 }
 
@@ -502,35 +505,39 @@ async function updateTask(req, res) {
     const updated = (rows || [])[0];
     if (!updated) return fail(res, 409, 'Someone else changed this task a moment ago. Reload it and try again.');
 
+    // Follow-up work (history, notifications, the next repeat) runs together with building
+    // the reply: each was a database round trip awaited one after another.
+    const jobs = [];
     // History: one entry per field that changed.
     const tracked = ['title', 'status', 'priority', 'deadline', 'details', 'checklist', 'recurrence', 'link_label'];
     for (const f of tracked) {
       if (patch[f] !== undefined && JSON.stringify(task[f]) !== JSON.stringify(updated[f])) {
         const brief = (v) => (f === 'details' || f === 'checklist' ? null : v);
-        await logEvent(task.id, me, f === 'link_label' ? 'link' : f, brief(task[f]), brief(updated[f]));
+        jobs.push(logEvent(task.id, me, f === 'link_label' ? 'link' : f, brief(task[f]), brief(updated[f])));
       }
     }
     if (patch.assignee_id && (task.assignee_id !== updated.assignee_id || task.assignee_type !== updated.assignee_type)) {
-      await logEvent(task.id, me, 'assignee', { type: task.assignee_type, id: task.assignee_id }, { type: updated.assignee_type, id: updated.assignee_id });
-      await notify(await recipientsOf(updated), updated, 'assigned', 'A task was given to you.', me, `assigned:${task.id}:${updated.assignee_id}`);
+      jobs.push(logEvent(task.id, me, 'assignee', { type: task.assignee_type, id: task.assignee_id }, { type: updated.assignee_type, id: updated.assignee_id }));
+      jobs.push((async () => notify(await recipientsOf(updated), updated, 'assigned', 'A task was given to you.', me, `assigned:${task.id}:${updated.assignee_id}`))());
     }
     if (patch.status && patch.status !== task.status) {
       const label = { todo: 'To do', in_progress: 'In progress', waiting: 'Waiting', done: 'Done', cancelled: 'Archived' }[patch.status];
       const creator = task.creator_type === 'system' ? null : { type: task.creator_type, id: task.creator_id };
-      await notify([creator, ...(await recipientsOf(updated))], updated, 'status', `Status changed to ${label}.`, me);
+      jobs.push((async () => notify([creator, ...(await recipientsOf(updated))], updated, 'status', `Status changed to ${label}.`, me))());
       // A repeating task comes back with its next deadline once it is done.
       if (patch.status === 'done' && updated.recurrence) {
         const next = nextOccurrence(updated.recurrence, updated.deadline || new Date());
         if (next) {
-          await createTask({
+          jobs.push(createTask({
             ...updated, status: 'todo', deadline: next.toISOString(),
             checklist: (updated.checklist || []).map((c) => ({ ...c, done: false })),
             auto_key: `recur:${updated.id}:${next.toISOString().slice(0, 10)}`,
-          }, task.creator_type === 'system' ? { type: 'system' } : { type: task.creator_type, id: task.creator_id });
+          }, task.creator_type === 'system' ? { type: 'system' } : { type: task.creator_type, id: task.creator_id }));
         }
       }
     }
-    const [enriched] = await enrich([updated]);
+    const [[enriched], settled] = await Promise.all([enrich([updated]), Promise.allSettled(jobs)]);
+    settled.filter((r) => r.status === 'rejected').forEach((r) => console.warn('tasks: follow-up after update failed:', r.reason?.message || r.reason));
     return ok(res, { task: enriched });
   } catch (e) {
     return handle(res, e, 'update the task');
@@ -553,8 +560,10 @@ async function claimTask(req, res) {
     if (error) return handle(res, error, 'pick up the task');
     const updated = (rows || [])[0];
     if (!updated) return fail(res, 409, 'Someone already picked this task up.');
-    await logEvent(task.id, me, 'claimed', null, { type: me.type, id: me.id });
-    const [enriched] = await enrich([updated]);
+    const [, [enriched]] = await Promise.all([
+      logEvent(task.id, me, 'claimed', null, { type: me.type, id: me.id }),
+      enrich([updated]),
+    ]);
     return ok(res, { task: enriched });
   } catch (e) {
     return handle(res, e, 'pick up the task');
@@ -582,19 +591,26 @@ async function addComment(req, res) {
     const { data: comment, error } = await supabaseAdmin.from('task_comments')
       .insert({ task_id: task.id, author_type: me.type, author_id: me.id, body, mentions }).select('*').single();
     if (error) return handle(res, error, 'add the comment');
-    await logEvent(task.id, me, 'comment', null, null);
-
-    const mentionPeople = [];
-    for (const m of mentions) {
-      if (m.type === 'team') mentionPeople.push(...(await teamMembers(m.id)));
-      else mentionPeople.push(m);
-    }
-    await notify(mentionPeople, task, 'mention', 'You were mentioned in a task comment.', me);
-    const creator = task.creator_type === 'system' ? null : { type: task.creator_type, id: task.creator_id };
-    const others = [creator, ...(await recipientsOf(task))].filter((p) => p && !mentionPeople.some((m) => samePerson(m, p)));
-    await notify(others, task, 'comment', 'New comment on a task.', me);
-    const names = await namesFor([{ type: me.type, id: me.id }]);
-    const skippedNames = skipped.length ? await namesFor(skipped) : {};
+    // History, notifications and the names for the reply, all at once.
+    const notifyAll = async () => {
+      const mentionPeople = [];
+      for (const m of mentions) {
+        if (m.type === 'team') mentionPeople.push(...(await teamMembers(m.id)));
+        else mentionPeople.push(m);
+      }
+      const creator = task.creator_type === 'system' ? null : { type: task.creator_type, id: task.creator_id };
+      const others = [creator, ...(await recipientsOf(task))].filter((p) => p && !mentionPeople.some((m) => samePerson(m, p)));
+      await Promise.all([
+        notify(mentionPeople, task, 'mention', 'You were mentioned in a task comment.', me),
+        notify(others, task, 'comment', 'New comment on a task.', me),
+      ]);
+    };
+    const [, , names] = await Promise.all([
+      logEvent(task.id, me, 'comment', null, null),
+      notifyAll(),
+      namesFor([{ type: me.type, id: me.id }, ...skipped]),
+    ]);
+    const skippedNames = names;
     return ok(res, {
       comment: { ...comment, authorName: names[key(me.type, me.id)]?.name || 'You' },
       // Mentioned but not told: they cannot see this task (need to know). The panel says so.
