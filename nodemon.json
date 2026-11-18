@@ -1,0 +1,3 @@
+{
+  "ignore": ["tokens.json", "oauth-tokens.json", "logs/*", "coverage/*"]
+}
