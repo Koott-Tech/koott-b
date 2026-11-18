@@ -29,6 +29,7 @@
 const { supabaseAdmin } = require('../config/supabase');
 const {
   getRecurringBlocksForPsychologist,
+  getRecurringBlocksForPsychologists,
   filterSlotsByRecurringBlocks,
   normalizeSlotTime,
 } = require('./recurringBlocksHelper');
@@ -214,6 +215,11 @@ async function loadBusy(psychologistId, startDate, endDate, { ignoreClientId, ex
     ...new Set([...sessions.map((s) => s.package_id), ...packageByOrder.values()].filter(Boolean)),
   ]);
 
+  return buildBusy(sessions, assessmentsRes.data || [], locks, packageByOrder, types);
+}
+
+/** The busy map from rows already read (shared by loadBusy and getBookableSlotsMany). */
+function buildBusy(sessions, assessments, locks, packageByOrder, types) {
   const busy = {};
   const add = (date, time, minutes, source, id) => {
     const start = toMinutes(time);
@@ -225,7 +231,7 @@ async function loadBusy(psychologistId, startDate, endDate, { ignoreClientId, ex
     sessionLengthMinutes({ packageType: types.get(s.package_id), sessionType: s.session_type }),
     'session', s.id,
   ));
-  (assessmentsRes.data || []).forEach((a) => add(a.scheduled_date, a.scheduled_time, SESSION_MINUTES.individual, 'assessment', a.id));
+  (assessments || []).forEach((a) => add(a.scheduled_date, a.scheduled_time, SESSION_MINUTES.individual, 'assessment', a.id));
   locks.forEach((l) => add(
     l.scheduled_date, l.scheduled_time,
     sessionMinutesForPackageType(types.get(packageByOrder.get(l.order_id))),
@@ -255,10 +261,13 @@ async function getBookableSlots(psychologistId, startDate, endDate, kind = 'indi
     loadBusy(psychologistId, startDate, endDate, options),
   ]);
   if (availabilityRes.error) throw availabilityRes.error;
+  return daysFromRows(availabilityRes.data || [], recurringBlocks, busy, duration, nowInIst());
+}
 
-  const now = nowInIst();
+/** Free starts per day from rows already read (shared by getBookableSlots and getBookableSlotsMany). */
+function daysFromRows(availabilityRows, recurringBlocks, busy, duration, now) {
   const days = [];
-  (availabilityRes.data || []).forEach((row) => {
+  availabilityRows.forEach((row) => {
     if (!row.is_available || row.date < now.date) return;
     const hours = filterSlotsByRecurringBlocks(row.time_slots || [], row.date, recurringBlocks);
     const starts = cutSessions(workingWindows(hours), duration)
@@ -271,6 +280,111 @@ async function getBookableSlots(psychologistId, startDate, endDate, kind = 'indi
     });
   });
   return days;
+}
+
+/** Every row of a query, 1000 at a time (PostgREST caps a response at 1000 rows). */
+async function readAllRows(build) {
+  const rows = [];
+  for (let from = 0; ; from += 1000) {
+    const res = await build().range(from, from + 999);
+    if (res.error) return { data: rows, error: res.error };
+    rows.push(...(res.data || []));
+    if (!res.data || res.data.length < 1000) return { data: rows, error: null };
+  }
+}
+
+const groupBy = (rows, key) => {
+  const out = new Map();
+  (rows || []).forEach((r) => { const k = r[key]; if (!out.has(k)) out.set(k, []); out.get(k).push(r); });
+  return out;
+};
+
+/**
+ * getBookableSlots for many therapists at once: each table is read once for all of them
+ * (instead of six queries per therapist) and every therapist's own rows go through the same
+ * calculation. Returns Map(id → days, or an Error when that therapist's slots can't be
+ * worked out, as getBookableSlots would have thrown).
+ * `kindById`: Map(id → 'individual' | 'psychiatry_15' | …).
+ */
+async function getBookableSlotsMany(psychologistIds, startDate, endDate, kindById) {
+  const ids = [...new Set(psychologistIds)];
+  const result = new Map();
+  if (!ids.length) return result;
+  const nowIso = new Date().toISOString();
+  const [availabilityRes, blocksById, sessionsRes, assessmentsRes, locksRes] = await Promise.all([
+    readAllRows(() => supabaseAdmin
+      .from('availability')
+      .select('psychologist_id, date, time_slots, is_available')
+      .in('psychologist_id', ids)
+      .gte('date', startDate)
+      .lte('date', endDate)
+      .order('date', { ascending: true })
+      .order('id', { ascending: true })),
+    getRecurringBlocksForPsychologists(ids),
+    readAllRows(() => supabaseAdmin
+      .from('sessions')
+      .select('id, psychologist_id, scheduled_date, scheduled_time, package_id, session_type')
+      .in('psychologist_id', ids)
+      .gte('scheduled_date', startDate)
+      .lte('scheduled_date', endDate)
+      .in('status', ACTIVE_SESSION_STATUSES)
+      .order('id', { ascending: true })),
+    readAllRows(() => supabaseAdmin
+      .from('assessment_sessions')
+      .select('id, psychologist_id, scheduled_date, scheduled_time')
+      .in('psychologist_id', ids)
+      .gte('scheduled_date', startDate)
+      .lte('scheduled_date', endDate)
+      .in('status', ['booked', 'reserved'])
+      .order('id', { ascending: true })),
+    readAllRows(() => supabaseAdmin
+      .from('slot_locks')
+      .select('id, psychologist_id, scheduled_date, scheduled_time, order_id, client_id')
+      .in('psychologist_id', ids)
+      .gte('scheduled_date', startDate)
+      .lte('scheduled_date', endDate)
+      .in('status', ACTIVE_LOCK_STATUSES)
+      .gt('slot_expires_at', nowIso)
+      .order('id', { ascending: true })),
+  ]);
+  if (assessmentsRes.error) console.error('sessionSlots: assessment sessions unavailable:', assessmentsRes.error.message);
+  if (locksRes.error) console.error('sessionSlots: slot locks unavailable:', locksRes.error.message);
+
+  const locks = locksRes.error ? [] : locksRes.data;
+  const sessions = sessionsRes.error ? [] : sessionsRes.data;
+  const orderIds = [...new Set(locks.map((l) => l.order_id).filter(Boolean))];
+  const paymentRows = [];
+  for (let i = 0; i < orderIds.length; i += 100) {
+    const { data } = await supabaseAdmin
+      .from('payments')
+      .select('razorpay_order_id, package_id')
+      .in('razorpay_order_id', orderIds.slice(i, i + 100));
+    paymentRows.push(...(data || []));
+  }
+  const allPackageByOrder = new Map(paymentRows.map((p) => [p.razorpay_order_id, p.package_id]));
+  const pkgIds = [...new Set([...sessions.map((s) => s.package_id), ...allPackageByOrder.values()].filter(Boolean))];
+  const allTypes = new Map();
+  for (let i = 0; i < pkgIds.length; i += 100) {
+    (await packageTypesById(pkgIds.slice(i, i + 100))).forEach((v, k) => allTypes.set(k, v));
+  }
+
+  const availabilityBy = groupBy(availabilityRes.data, 'psychologist_id');
+  const sessionsBy = groupBy(sessions, 'psychologist_id');
+  const assessmentsBy = groupBy(assessmentsRes.error ? [] : assessmentsRes.data, 'psychologist_id');
+  const locksBy = groupBy(locks, 'psychologist_id');
+  const now = nowInIst();
+  ids.forEach((id) => {
+    if (sessionsRes.error) { result.set(id, sessionsRes.error); return; }
+    if (availabilityRes.error) { result.set(id, availabilityRes.error); return; }
+    const mySessions = sessionsBy.get(id) || [];
+    const myLocks = locksBy.get(id) || [];
+    const packageByOrder = new Map();
+    myLocks.forEach((l) => { if (l.order_id && allPackageByOrder.has(l.order_id)) packageByOrder.set(l.order_id, allPackageByOrder.get(l.order_id)); });
+    const busy = buildBusy(mySessions, assessmentsBy.get(id) || [], myLocks, packageByOrder, allTypes);
+    const duration = sessionMinutes(kindById.get(id) || 'individual');
+    result.set(id, daysFromRows(availabilityBy.get(id) || [], blocksById.get(id) || [], busy, duration, now));
+  });
+  return result;
 }
 
 /**
@@ -335,6 +449,7 @@ module.exports = {
   workingWindows,
   cutSessions,
   getBookableSlots,
+  getBookableSlotsMany,
   checkSlotBookable,
   findOverlaps,
   busyLabel,

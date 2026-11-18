@@ -13,7 +13,8 @@
  */
 
 const { supabaseAdmin } = require('../config/supabase');
-const { getBookableSlots, ACTIVE_SESSION_STATUSES } = require('./sessionSlots');
+const { getBookableSlotsMany, ACTIVE_SESSION_STATUSES } = require('./sessionSlots');
+const { early, late } = require('./queryOverlap');
 
 const PAID = ['success', 'captured', 'completed', 'paid', 'cash'];
 const CANCELLED = ['cancelled', 'canceled'];
@@ -54,12 +55,6 @@ async function fetchAll(build) {
   }
 }
 
-async function mapLimit(items, limit, fn) {
-  const queue = [...items];
-  await Promise.all(Array.from({ length: Math.min(limit, queue.length) }, async () => {
-    while (queue.length) await fn(queue.shift());
-  }));
-}
 
 /** Groups (with member ids) and every therapist with their group. */
 async function listGroups() {
@@ -183,9 +178,9 @@ async function groupReport({ dateFrom, dateTo } = {}) {
   if (from > to) [from, to] = [to, from];
   if ((Date.parse(to) - Date.parse(from)) / 864e5 > 366) return fail(400, 'Pick a range of one year or less');
 
-  const { ready, message, groups, therapists } = await listGroups();
-
-  const [sessions, payments] = await Promise.all([
+  // Sessions and payments need only the dates: sent with the group list. Open slots need
+  // the therapist list: sent as soon as it arrives. Each is read where it was awaited.
+  const salesP = early(Promise.all([
     fetchAll(() => supabaseAdmin
       .from('sessions')
       .select('psychologist_id, status, scheduled_date')
@@ -197,7 +192,16 @@ async function groupReport({ dateFrom, dateTo } = {}) {
       .in('status', PAID)
       .gte('created_at', `${from}T00:00:00+05:30`)
       .lt('created_at', `${shiftDay(to, 1)}T00:00:00+05:30`)),
-  ]);
+  ]));
+  const { ready, message, groups, therapists } = await listGroups();
+
+  // Open slots exist only from today on; a range fully in the past has none.
+  const slotFrom = from > today ? from : today;
+  const active = therapists.filter((t) => t.active);
+  const kindById = new Map(active.map((t) => [t.id, /psychiatr/i.test(t.designation) ? 'psychiatry_15' : 'individual']));
+  const slotsP = slotFrom <= to ? early(getBookableSlotsMany(active.map((t) => t.id), slotFrom, to, kindById)) : null;
+
+  const [sessions, payments] = await late(salesP);
 
   const blank = () => ({
     sales: 0, payments: 0, sessions: 0, booked: 0, completed: 0, cancelled: 0, noShow: 0, bookedAhead: 0, openSlots: 0,
@@ -224,18 +228,25 @@ async function groupReport({ dateFrom, dateTo } = {}) {
     st.payments += 1;
   }
 
-  // Open slots exist only from today on; a range fully in the past has none.
-  const slotFrom = from > today ? from : today;
   if (slotFrom <= to) {
-    await mapLimit(therapists.filter((t) => t.active), 4, async (t) => {
-      const kind = /psychiatr/i.test(t.designation) ? 'psychiatry_15' : 'individual';
-      try {
-        const days = await getBookableSlots(t.id, slotFrom, to, kind);
-        stats.get(t.id).openSlots = days.reduce((n, d) => n + d.slots.length, 0);
-      } catch (err) {
-        console.error(`therapist groups: slots unavailable for ${t.id}:`, err.message);
-      }
-    });
+    // One read per table for every active therapist (getBookableSlotsMany), each therapist's
+    // rows through the same slot calculation as getBookableSlots.
+    let byTherapist = null;
+    try {
+      byTherapist = await late(slotsP);
+    } catch (err) {
+      active.forEach((t) => console.error(`therapist groups: slots unavailable for ${t.id}:`, err.message));
+    }
+    if (byTherapist) {
+      active.forEach((t) => {
+        const days = byTherapist.get(t.id);
+        if (days instanceof Error) {
+          console.error(`therapist groups: slots unavailable for ${t.id}:`, days.message);
+          return;
+        }
+        stats.get(t.id).openSlots = (days || []).reduce((n, d) => n + d.slots.length, 0);
+      });
+    }
   }
 
   const withRates = (m) => ({

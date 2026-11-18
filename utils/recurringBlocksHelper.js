@@ -128,6 +128,46 @@ async function getRecurringBlocksForPsychologist(psychologistId) {
 }
 
 /**
+ * The same lists for many psychologists at once (each table read once, 1000 rows a page):
+ * Map(psychologistId → [...weekly, ...dated]), as getRecurringBlocksForPsychologist gives
+ * for each one. A table that can't be read counts as empty, as it does there.
+ */
+async function getRecurringBlocksForPsychologists(psychologistIds) {
+  const ids = [...new Set(psychologistIds)];
+  const readMany = async (table) => {
+    const rows = [];
+    try {
+      for (let from = 0; ; from += 1000) {
+        const { data, error } = await supabaseAdmin
+          .from(table)
+          .select('*')
+          .in('psychologist_id', ids)
+          .order('id', { ascending: true })
+          .range(from, from + 999);
+        if (error) {
+          if (!notMigrated(error)) console.error(`Error fetching ${table}:`, error);
+          return [];
+        }
+        rows.push(...(data || []));
+        if (!data || data.length < 1000) break;
+      }
+    } catch (err) {
+      console.error(`Error fetching ${table}:`, err);
+      return [];
+    }
+    return rows;
+  };
+  const [weekly, dated] = ids.length ? await Promise.all([
+    readMany('psychologist_recurring_blocks'),
+    readMany('psychologist_date_blocks'),
+  ]) : [[], []];
+  const out = new Map(ids.map((id) => [id, []]));
+  weekly.forEach((b) => out.get(b.psychologist_id)?.push(b));
+  dated.forEach((b) => out.get(b.psychologist_id)?.push(b));
+  return out;
+}
+
+/**
  * Filter availability time_slots for a single day by recurring blocks.
  * @param {Array<string>} timeSlots - e.g. ["09:00", "10:00", ...]
  * @param {string} dateStr - YYYY-MM-DD
@@ -157,6 +197,7 @@ module.exports = {
   normalizeTimeSlotsForStorage,
   isSlotBlockedByRecurring,
   getRecurringBlocksForPsychologist,
+  getRecurringBlocksForPsychologists,
   filterSlotsByRecurringBlocks,
   getDayName,
   DAYS
