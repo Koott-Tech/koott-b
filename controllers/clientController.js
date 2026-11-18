@@ -3040,11 +3040,9 @@ const getPsychologistPackages = async (req, res) => {
     const { psychologistId } = req.params;
     console.log(`📦 Getting packages for psychologist ${psychologistId}`);
 
-    const { ensureChildSpecialistPackagesSynced } = require('../utils/childSpecialistPricing');
-    const syncResult = await ensureChildSpecialistPackagesSynced(supabaseAdmin, psychologistId);
-    if (syncResult.synced) {
-      console.log(`📦 Auto-synced child specialist packages for ${psychologistId} (client route)`);
-    }
+    // (This used to sync child-specialist packages first via utils/childSpecialistPricing,
+    // which was removed with that feature in 2128132 — every call then failed with a 500.
+    // The list is the same one the public /api/public/psychologists/:id/packages returns.)
 
     // Get packages for this psychologist
     const { data: packages, error: packagesError } = await supabaseAdmin

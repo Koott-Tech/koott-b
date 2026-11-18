@@ -66,8 +66,9 @@ const getBetterParentingBySlug = async (req, res) => {
       .select('*')
       .eq('slug', slug)
       .eq('status', 'published')
-      .single();
+      .maybeSingle();
     if (error) throw error;
+    if (!data) return res.status(404).json(errorResponse('Page not found'));
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
     return res.json(successResponse(data, 'Page retrieved'));
   } catch (err) {
@@ -83,8 +84,9 @@ const getBetterParentingById = async (req, res) => {
       .from('better_parenting')
       .select('*')
       .eq('id', id)
-      .single();
+      .maybeSingle();
     if (error) throw error;
+    if (!data) return res.status(404).json(errorResponse('Page not found'));
     return res.json(successResponse(data, 'Page retrieved'));
   } catch (err) {
     return res.status(500).json(errorResponse('Failed to fetch page', err.message));

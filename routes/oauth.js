@@ -37,12 +37,14 @@ router.get('/oauth2/callback', async (req, res, next) => {
   }
 });
 
-// Get conference capabilities (diagnostic route)
-router.get('/conference-capabilities', async (req, res, next) => {
+// Get conference capabilities (diagnostic route). Admins only: it returns the calendar
+// account's settings. (It always failed before: calendar() is async and wasn't awaited.)
+const { authenticateToken, requireAdmin } = require('../middleware/auth');
+router.get('/conference-capabilities', authenticateToken, requireAdmin, async (req, res, next) => {
   try {
     console.log('🔍 Checking conference capabilities...');
-    
-    const cal = calendar();
+
+    const cal = await calendar();
     const { data } = await cal.calendarList.get({ calendarId: 'primary' });
     
     const allowedTypes = data.conferenceProperties?.allowedConferenceSolutionTypes || [];

@@ -376,11 +376,22 @@ const getPlatformAnalytics = async (req, res) => {
     // Use supabaseAdmin to bypass RLS (superadmin endpoint, proper auth already checked)
     let usersCountQuery = supabaseAdmin.from('users').select('*', { count: 'exact', head: true });
     let sessionsCountQuery = supabaseAdmin.from('sessions').select('*', { count: 'exact', head: true });
-    // Use RPC for DB-side aggregation to avoid loading all prices into memory
-    let totalRevenueQuery = supabaseAdmin.rpc('get_total_revenue', {
-      p_start_date: start_date || null,
-      p_end_date: end_date || null
-    });
+    // Total revenue = sum of sessions.price over the sessions in range (scheduled_date), as
+    // before the get_total_revenue RPC was introduced. That database function was never
+    // created (PGRST202 -> this screen always failed), so the sum is done here over every
+    // matching row, a page of prices at a time.
+    const totalRevenueQuery = (async () => {
+      let total = 0;
+      for (let from = 0; ; from += 1000) {
+        let q = supabaseAdmin.from('sessions').select('id, price').order('id', { ascending: true });
+        if (start_date) q = q.gte('scheduled_date', start_date);
+        if (end_date) q = q.lte('scheduled_date', end_date);
+        const { data, error } = await q.range(from, from + 999);
+        if (error) return { data: null, error };
+        (data || []).forEach((s) => { total += parseFloat(s.price || 0) || 0; });
+        if (!data || data.length < 1000) return { data: total, error: null };
+      }
+    })();
     let psychologistsCountQuery = supabaseAdmin.from('psychologists').select('*', { count: 'exact', head: true });
     let clientsCountQuery = supabaseAdmin.from('clients').select('*', { count: 'exact', head: true });
 
