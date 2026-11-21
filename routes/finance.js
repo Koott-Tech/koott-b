@@ -61,6 +61,11 @@ router.post('/expenses/:expenseId/approve', financeController.approveExpense);
 const razorpaySettlementController = require('../controllers/razorpaySettlementController');
 router.get('/razorpay-settlements/summary', razorpaySettlementController.getSummary);
 router.post('/razorpay-settlements', razorpaySettlementController.createSettlement);
+// Sales targets (per month) and run-rate forecast
+const financeTargetsController = require('../controllers/financeTargetsController');
+router.get('/forecast', financeTargetsController.getForecast);
+router.get('/targets', financeTargetsController.getTargets);
+router.put('/targets', financeTargetsController.setTargets);
 
 // Income Management
 router.get('/income', financeController.getIncome);
