@@ -6937,6 +6937,10 @@ const markPayoutAsPaid = async (req, res) => {
     }
 
     const { psychologist_id, month, year, dateFrom, dateTo, sessionIds } = req.body;
+    // Sent with a payout receipt: the TDS % shown on the receipt (deducted from the therapist's
+    // amount) and the receipt number. Without them (plain Mark as Paid) TDS stays 0 as before.
+    const tdsPercent = Math.min(30, Math.max(0, Number(req.body.tds_percent) || 0));
+    const receiptNo = req.body.receipt_no ? String(req.body.receipt_no).slice(0, 40) : null;
 
     if (!psychologist_id) {
       return res.status(400).json(
@@ -7130,14 +7134,14 @@ const markPayoutAsPaid = async (req, res) => {
         psychologist_id,
         payout_date: payoutDate,
         total_commission: Math.round(totalCommission * 100) / 100,
-        tds_amount: 0,
-        tds_percentage: 0,
-        net_payout: Math.round(totalDoctorWallet * 100) / 100,
+        tds_amount: Math.round(totalDoctorWallet * tdsPercent) / 100,
+        tds_percentage: tdsPercent,
+        net_payout: Math.round(totalDoctorWallet * (100 - tdsPercent)) / 100,
         payment_method: 'other',
         status: 'paid',
         processed_by: userId,
         processed_at: new Date().toISOString(),
-        notes: `Marked as paid for ${payoutPeriodLabel}`,
+        notes: `Marked as paid for ${payoutPeriodLabel}${receiptNo ? ` · receipt ${receiptNo} sent` : ''}`,
         created_by: userId,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
@@ -7208,7 +7212,7 @@ const markPayoutAsPaid = async (req, res) => {
       resourceId: payout.id,
       endpoint: '/api/finance/payouts/mark-paid',
       method: 'POST',
-      details: { psychologist_id, month, year, dateFrom, dateTo, session_count: completedSessionsInRange.length, amount: totalDoctorWallet },
+      details: { psychologist_id, month, year, dateFrom, dateTo, session_count: completedSessionsInRange.length, amount: totalDoctorWallet, tds_percent: tdsPercent, receipt_no: receiptNo },
       ip: req.ip,
       userAgent: req.headers['user-agent']
     }).catch(err => console.error('Audit log error:', err));
