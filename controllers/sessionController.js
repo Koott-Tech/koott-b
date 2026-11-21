@@ -2418,10 +2418,19 @@ const completeSession = async (req, res) => {
 // Mark session as no-show (psychologist or admin only — never automatic).
 // When session time passes, the session remains booked/pending until psychologist or admin
 // explicitly marks it as no-show or completed.
+/**
+ * Mark a session as a no-show, saying whose: no_show_by 'client' (default; what every no-show
+ * meant until now) or 'therapist' (a fine for therapists is planned). The status stays
+ * 'no_show' either way, so package slots, finance and reports are unchanged.
+ * Admin, superadmin and Operations (who run Bookings) mark either kind; a therapist can mark
+ * only a client no-show on their own session. Needs sessions.no_show_by (SQL 0025) for the
+ * therapist kind.
+ */
 const markSessionAsNoShow = async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { reason } = req.body; // Optional reason for no-show
+    const noShowBy = req.body?.no_show_by === 'therapist' ? 'therapist' : 'client';
     const userId = req.user.id;
     const userRole = req.user.role;
 
@@ -2464,9 +2473,12 @@ const markSessionAsNoShow = async (req, res) => {
           errorResponse('You do not have permission to mark this session as no-show')
         );
       }
-    } else if (userRole !== 'admin') {
+      if (noShowBy === 'therapist') {
+        return res.status(403).json(errorResponse('A therapist no-show is marked by Admin or Operations.'));
+      }
+    } else if (!['admin', 'superadmin', 'operations'].includes(userRole)) {
       return res.status(403).json(
-        errorResponse('Only psychologists and admins can mark sessions as no-show')
+        errorResponse('Only Admin, Operations and the session therapist can mark a no-show')
       );
     }
 
@@ -2483,12 +2495,22 @@ const markSessionAsNoShow = async (req, res) => {
     }
 
     // Update session status
+    const noShowPatch = { status: 'no_show', no_show_by: noShowBy, updated_at: new Date().toISOString() };
+    // Before SQL 0025 the column doesn't exist: a client no-show still saves (as before); a
+    // therapist no-show can't be recorded, so it says to run the SQL instead of mislabelling.
+    const missingColumn = (e) => e && (e.code === '42703' || e.code === 'PGRST204' || /no_show_by/.test(e.message || ''));
+    {
+      const probe = await supabaseAdmin.from('sessions').select('no_show_by').eq('id', sessionId).maybeSingle();
+      if (missingColumn(probe.error)) {
+        if (noShowBy === 'therapist') {
+          return res.status(503).json(errorResponse('Therapist no-shows need backend/supabase/RUN_PENDING_0025.sql to be run in Supabase first.'));
+        }
+        delete noShowPatch.no_show_by;
+      }
+    }
     const { data: updatedSession, error: updateError } = await supabaseAdmin
       .from('sessions')
-      .update({
-        status: 'no_show',
-        updated_at: new Date().toISOString()
-      })
+      .update(noShowPatch)
       .eq('id', sessionId)
       .select(`
         *,

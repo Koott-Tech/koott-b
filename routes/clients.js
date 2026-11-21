@@ -26,6 +26,10 @@ router.get('/sessions/:sessionId', clientController.getSession);
 // router.post('/book-session', clientController.bookSession); // DISABLED - Use payment flow instead
 router.put('/sessions/:sessionId/cancel', clientController.cancelSession);
 router.post('/sessions/:sessionId/reschedule-request', clientController.requestReschedule);
+// Less than 24 h (or a change the system can't make alone): a request to Operations (a task).
+router.post('/sessions/:sessionId/change-request', clientController.requestSessionChange);
+// 24 h or more before a single session: move it to another therapist (locks both therapists).
+router.post('/sessions/:sessionId/switch-therapist', serializeByTherapist, clientController.switchTherapist);
 router.put('/sessions/:sessionId/reschedule', serializeByTherapist, clientController.rescheduleSession);
 router.post('/sessions/:sessionId/feedback', clientController.submitSessionFeedback);
 

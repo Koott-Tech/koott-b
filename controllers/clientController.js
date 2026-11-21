@@ -750,6 +750,11 @@ const getSessions = async (req, res) => {
           allSessions.forEach((x) => { const r = byS.get(x.id); if (r) x.cancel_request = { status: 'pending', requested_at: r.created_at }; });
         }
       } catch (_) { /* table not set up yet: no badges */ }
+      // A cancel / reschedule / switch request sent to Operations (an open task): "Request sent".
+      try {
+        const open = await require('../utils/clientRequests').openRequestsFor((allSessions || []).map((x) => x.id).filter(Boolean));
+        allSessions.forEach((x) => { const r = open.get(x.id); if (r) x.change_request = r; });
+      } catch (_) { /* tasks not set up yet: no badges */ }
 
       res.json(
         successResponse({
@@ -1494,14 +1499,27 @@ const bookSession = async (req, res) => {
   }
 };
 
+
+/** 409 the client dashboard turns into the "less than 24 hours" popup (request / WhatsApp). */
+const within24h = (res, kind, hours) => res.status(409).json({
+  success: false,
+  code: 'WITHIN_24H',
+  kind,
+  hoursLeft: Math.max(0, Math.round(hours * 10) / 10),
+  message: kind === 'cancel'
+    ? `Your session is less than ${require('../utils/clientRequests').CLIENT_CHANGE_HOURS} hours away, so it can't be cancelled here and isn't refunded. You can send a request to our team or talk to us on WhatsApp.`
+    : `Your session is less than ${require('../utils/clientRequests').CLIENT_CHANGE_HOURS} hours away, so it can't be changed here. You can send a request to our team or talk to us on WhatsApp.`,
+});
+
 // Cancel a session
 /**
- * The client cancels a session from their profile.
- *   48 h or more before it: cancelled now and refunded automatically through Razorpay
+ * The client cancels a session from their profile (refund policy: 24 hours).
+ *   24 h or more before it: cancelled now and refunded automatically through Razorpay
  *     (if that refund cannot go through, Operations gets it as a refund request).
- *   Less than 48 h before: a cancellation REQUEST goes to Operations; the session stays
- *     booked until Operations approves (Refund / Cancel without refund / Keep the session).
- * The 48 can be changed with CANCEL_AUTO_REFUND_HOURS.
+ *   Less than 24 h before: not cancelled here and not refunded. The dashboard offers to send
+ *     a request (an Operations task, requestSessionChange) or to talk to Operations on
+ *     WhatsApp; this answers 409 WITHIN_24H.
+ * The 24 can be changed with CLIENT_CHANGE_HOURS.
  */
 const cancelSession = async (req, res) => {
   try {
@@ -1522,31 +1540,14 @@ const cancelSession = async (req, res) => {
     if (!start || start.getTime() <= Date.now()) return res.status(400).json(errorResponse('This session has already started.'));
 
     const hoursLeft = (start.getTime() - Date.now()) / 3600000;
-    const limit = Number(process.env.CANCEL_AUTO_REFUND_HOURS) || 48;
-
-    if (hoursLeft < limit) {
-      // Within 48 h: Operations decides. A request already sent is just shown again.
-      const { data: open } = await supabaseAdmin.from('refund_requests').select('id, status, created_at')
-        .eq('session_id', session.id).eq('source', 'client_request').in('status', ['pending', 'failed']).maybeSingle();
-      if (open) {
-        return res.json(successResponse({ outcome: 'requested', requestId: open.id, requestedAt: open.created_at },
-          'Your cancellation request is with our team. We will let you know soon.'));
-      }
-      const request = await createRefundRequest({
-        sessionId: session.id, source: 'client_request', requestedBy: { type: 'client', id: client.id },
-        reason: reason || `Asked to cancel ${Math.max(1, Math.round(hoursLeft))} h before the session`,
-      });
-      if (request) {
-        return res.json(successResponse({ outcome: 'requested', requestId: request.id, requestedAt: request.created_at },
-          `Your session is within ${limit} hours, so your cancellation request has been sent to our team. Your session stays booked until they reply.`));
-      }
-      // Nothing was paid (free / credit session): nothing to decide, cancel it now.
-    }
+    const { CLIENT_CHANGE_HOURS } = require('../utils/clientRequests');
+    // Less than 24 h: not here (no refund). The dashboard shows the request / WhatsApp popup.
+    if (hoursLeft < CLIENT_CHANGE_HOURS) return within24h(res, 'cancel', hoursLeft);
 
     const done = await cancelSessionCore(session.id, { status: 'canceled' });
     if (!done.ok) return res.status(409).json(errorResponse(done.message));
 
-    // 48 h or more before (or nothing paid): refund automatically.
+    // 24 h or more before (or nothing paid): refund automatically.
     let refund = null;
     const request = await createRefundRequest({
       sessionId: session.id, source: 'client', requestedBy: { type: 'client', id: client.id }, reason: reason || 'Cancelled by the client (48 h or more before)',
@@ -1926,6 +1927,12 @@ const rescheduleSession = async (req, res) => {
       hoursUntilSession: hoursUntilSession.toFixed(2),
       rescheduleCount
     });
+
+    // Less than 24 h before: not here. The dashboard offers a request (Operations task) or
+    // WhatsApp instead (409 WITHIN_24H).
+    if (hoursUntilSession < require('../utils/clientRequests').CLIENT_CHANGE_HOURS) {
+      return within24h(res, 'reschedule', hoursUntilSession);
+    }
 
     // Decide if this reschedule needs admin approval:
     // - Always if within 24 hours
@@ -4748,6 +4755,130 @@ const bookSessionWithCredit = async (req, res) => {
   }
 };
 
+/* -------------------------------------------------------------------------------------
+ * Client change requests and therapist switch (utils/clientRequests.js)
+ * ----------------------------------------------------------------------------------- */
+
+async function clientAndSession(req) {
+  const { data: client } = await supabaseAdmin.from('clients')
+    .select('id, first_name, last_name, child_name, email, phone_number')
+    .eq('id', req.user.client_id || req.user.id).maybeSingle();
+  if (!client) return { error: [404, 'Client profile not found'] };
+  const { data: session } = await supabaseAdmin.from('sessions').select('*')
+    .eq('id', req.params.sessionId).eq('client_id', client.id).maybeSingle();
+  if (!session) return { error: [404, 'Session not found'] };
+  return { client, session };
+}
+
+const CHANGEABLE = ['booked', 'scheduled', 'rescheduled', 'reschedule_requested', 'pending'];
+
+/**
+ * POST /api/clients/sessions/:sessionId/change-request  { kind: cancel|reschedule|switch, note? }
+ * Sends the request to Operations as a task (one open task per session and kind).
+ */
+const requestSessionChange = async (req, res) => {
+  try {
+    const { createClientRequest, KINDS, hoursUntil } = require('../utils/clientRequests');
+    const kind = String(req.body?.kind || '');
+    if (!KINDS[kind]) return res.status(400).json(errorResponse('Choose what you want to change.'));
+    const found = await clientAndSession(req);
+    if (found.error) return res.status(found.error[0]).json(errorResponse(found.error[1]));
+    const { client, session } = found;
+    if (!CHANGEABLE.includes(String(session.status || '').toLowerCase())) {
+      return res.status(400).json(errorResponse('This session can no longer be changed.'));
+    }
+    const hrs = hoursUntil(session);
+    if (hrs !== null && hrs <= 0) return res.status(400).json(errorResponse('This session has already started.'));
+    const { task, existing } = await createClientRequest({ session, client, kind, note: req.body?.note });
+    return res.status(existing ? 200 : 201).json(successResponse({
+      requested: true, existing, kind, requested_at: task?.created_at || new Date().toISOString(),
+    }, existing
+      ? 'Your request is already with our team. We will contact you soon.'
+      : 'Your request has been sent to our team. We will contact you soon.'));
+  } catch (error) {
+    console.error('requestSessionChange:', error.message || error);
+    return res.status(500).json(errorResponse('Could not send your request. Please try WhatsApp.'));
+  }
+};
+
+/**
+ * POST /api/clients/sessions/:sessionId/switch-therapist  { psychologist_id, new_date, new_time }
+ * 24 hours or more before a single (non-package) session, move it to another therapist at a
+ * time that therapist has free, when they cost the same or less than what was paid. Uses the
+ * admin transfer (new Meet link + calendar, old event removed, both told, commission recalculated).
+ * Anything else answers with a code the dashboard turns into the request / WhatsApp popup.
+ */
+const switchTherapist = async (req, res) => {
+  try {
+    const { CLIENT_CHANGE_HOURS, hoursUntil, isPackageSession } = require('../utils/clientRequests');
+    const { psychologist_id: newPsychId, new_date, new_time } = req.body || {};
+    if (!newPsychId || !new_date || !new_time) return res.status(400).json(errorResponse('Choose a therapist and a time.'));
+    const found = await clientAndSession(req);
+    if (found.error) return res.status(found.error[0]).json(errorResponse(found.error[1]));
+    const { session } = found;
+    if (!CHANGEABLE.includes(String(session.status || '').toLowerCase())) {
+      return res.status(400).json(errorResponse('This session can no longer be changed.'));
+    }
+    if (String(newPsychId) === String(session.psychologist_id)) {
+      return res.status(400).json(errorResponse('That is already your therapist. To change the time, use Change date & time.'));
+    }
+    const hrs = hoursUntil(session);
+    if (hrs === null || hrs <= 0) return res.status(400).json(errorResponse('This session has already started.'));
+    if (hrs < CLIENT_CHANGE_HOURS) return within24h(res, 'switch', hrs);
+    if (isPackageSession(session)) {
+      return res.status(409).json({ success: false, code: 'NEEDS_TEAM', kind: 'switch',
+        message: 'This session is part of a package with your therapist, so our team needs to arrange the switch. Send a request or talk to us on WhatsApp.' });
+    }
+
+    const { data: newPsych } = await supabaseAdmin.from('psychologists')
+      .select('id, first_name, last_name, is_active, individual_session_price').eq('id', newPsychId).maybeSingle();
+    if (!newPsych || newPsych.is_active === false) return res.status(404).json(errorResponse('That therapist is not available.'));
+
+    // Same kind of session (individual / couple) with the new therapist, at no more than was paid.
+    const couple = String(session.session_type || '').toLowerCase().includes('couple');
+    const { data: plan } = await supabaseAdmin.from('packages').select('price, package_type')
+      .eq('psychologist_id', newPsych.id).eq('package_type', couple ? 'couple' : 'individual').maybeSingle();
+    const newPrice = Number(plan?.price ?? (couple ? NaN : newPsych.individual_session_price));
+    let paid = Number(session.price) || 0;
+    if (session.payment_id) {
+      const { data: pay } = await supabaseAdmin.from('payments').select('amount').eq('id', session.payment_id).maybeSingle();
+      if (pay && Number(pay.amount) > 0) paid = Number(pay.amount);
+    }
+    if (!Number.isFinite(newPrice) || newPrice > paid) {
+      return res.status(409).json({ success: false, code: 'NEEDS_TEAM', kind: 'switch',
+        message: `${[newPsych.first_name, newPsych.last_name].filter(Boolean).join(' ')}'s sessions cost more than you paid, so our team needs to arrange this switch. Send a request or talk to us on WhatsApp.` });
+    }
+
+    // The new therapist must have this time free (working hours, blocks, other bookings).
+    const { checkSlotBookable } = require('../utils/sessionSlots');
+    const slot = await checkSlotBookable({
+      psychologistId: newPsych.id, date: formatDate(new_date), time: formatTime(new_time),
+      packageType: couple ? 'couple' : 'individual', excludeSessionId: session.id,
+    });
+    if (!slot.ok) return res.status(409).json(errorResponse(slot.message || 'That time is no longer free. Please choose another.'));
+
+    // Hand over to the admin transfer (it only reads params and body).
+    const { transferSession } = require('./sessionController');
+    const result = await new Promise((resolve) => {
+      const fakeRes = {
+        statusCode: 200,
+        status(code) { this.statusCode = code; return this; },
+        json(payload) { resolve({ status: this.statusCode, payload }); return this; },
+      };
+      Promise.resolve(transferSession({
+        params: { sessionId: session.id },
+        body: { new_psychologist_id: newPsych.id, new_date: formatDate(new_date), new_time: formatTime(new_time) },
+        user: req.user,
+      }, fakeRes)).catch((e) => resolve({ status: 500, payload: errorResponse(e.message || 'Could not switch') }));
+    });
+    if (result.status >= 400) return res.status(result.status).json(result.payload);
+    return res.json(successResponse(result.payload?.data || {}, `Your session is now with ${newPsych.first_name}. You'll get the new joining link on WhatsApp and email.`));
+  } catch (error) {
+    console.error('switchTherapist:', error.message || error);
+    return res.status(500).json(errorResponse('Could not switch therapist. Please try again or talk to us on WhatsApp.'));
+  }
+};
+
 module.exports = {
   getProfile,
   updateProfile,
@@ -4762,6 +4893,8 @@ module.exports = {
   submitSessionFeedback,
   getClientPackages,
   bookRemainingSession,
+  requestSessionChange,
+  switchTherapist,
   reserveTimeSlot,
   getFreeAssessmentAvailabilityForReschedule,
   getPaymentCredit,
