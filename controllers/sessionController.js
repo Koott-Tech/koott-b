@@ -1,5 +1,6 @@
 const { supabaseAdmin } = require('../config/supabase');
 const { recordSlotBooking } = require('../utils/slotEvents');
+const { attachPaymentChannel } = require('../utils/paymentChannel');
 const { 
   successResponse, 
   errorResponse,
@@ -960,6 +961,9 @@ const getAllSessions = async (req, res) => {
       paginatedCount: paginatedSessions.length
     });
 
+    // Razorpay or Bank per booking (staff-only routes: admin, operations, finance).
+    await attachPaymentChannel(paginatedSessions);
+
     res.json(
       successResponse({
         sessions: paginatedSessions,
@@ -1284,6 +1288,7 @@ const getSessionById = async (req, res) => {
     });
 
     session.booking_created_at = getSessionBookingCreatedAtIso(session);
+    await attachPaymentChannel(session);
 
     res.json(
       successResponse({ session })

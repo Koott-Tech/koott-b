@@ -1,7 +1,7 @@
 const { supabaseAdmin } = require('../config/supabase');
 const { successResponse, errorResponse } = require('../utils/helpers');
 const { computeSessionDoctorWallet, resolveFirstSessionFlags, isPackageSessionLike } = require('../utils/sessionCommission');
-const { paymentsForSessions, sessionFeeShare, feeOf, FEE_PERCENT } = require('../utils/paymentChannel');
+const { paymentsForSessions, sessionFeeShare, feeOf, FEE_PERCENT, isRazorpayExpense, attachPaymentChannel } = require('../utils/paymentChannel');
 const auditLogger = require('../utils/auditLogger');
 const {
   getSessionBookingCreatedAtIso,
@@ -1952,8 +1952,11 @@ const getDashboard = async (req, res) => {
     // This represents the company's commission from revenue received for sessions originally booked in this period
     const incomeForSelectedRange = calculateIncome(incomeData, mtdFrom, mtdTo);
     const netRevenueExcludingRefunds = totalRevenueFromSessions - totalRefundAmount;
-    // Razorpay's fee is a cost of receiving the money (direct UPI/bank has none).
-    const netProfitForSelectedRange = netRevenueExcludingRefunds + incomeForSelectedRange - totalDoctorWallet - expensesForSelectedRange - razorpayFees;
+    // Razorpay's fee reaches net profit as an expense: Finance records each Razorpay payout
+    // (collected - received) in the "Razorpay fees" category, so it is inside
+    // expensesForSelectedRange. razorpayFees (per booking) is only the expected figure.
+    const razorpayFeesRecorded = calculateExpenses((expensesData || []).filter(isRazorpayExpense), mtdFrom, mtdTo);
+    const netProfitForSelectedRange = netRevenueExcludingRefunds + incomeForSelectedRange - totalDoctorWallet - expensesForSelectedRange;
     
     // For MTD/QTD/YTD metrics, use totalCompanyCommission (sessions originally booked in those periods)
     const calculateRefundTotal = (sessions, fromDate, toDate, opts = {}) => {
@@ -2050,7 +2053,8 @@ const getDashboard = async (req, res) => {
         total_company_commission_completed: Math.round(totalCompanyCommissionCompleted || 0),
         total_doctor_wallet: Math.round(totalDoctorWallet || 0),
         refund_total: Math.round(totalRefundAmount || 0),
-        razorpay_fees: Math.round(razorpayFees || 0),
+        razorpay_fees: Math.round(razorpayFees || 0), // expected, from the bookings
+        razorpay_fees_recorded: Math.round(razorpayFeesRecorded || 0), // approved settlement expenses in range
         razorpay_fees_estimated: Math.round(razorpayFeesEstimated || 0),
         revenue_razorpay: Math.round(revenueRazorpay || 0),
         revenue_direct: Math.round(revenueDirect || 0),
@@ -3168,7 +3172,7 @@ const getDoctorBookings = async (req, res) => {
     let query = supabaseAdmin
       .from('sessions')
       .select(
-        `id,${docSelBcf}created_at,source,scheduled_date,scheduled_time,status,payment_id,client_id`,
+        `id,${docSelBcf}created_at,source,scheduled_date,scheduled_time,status,payment_id,client_id,price,package_group_id`,
         { count: 'exact' }
       )
       .eq('psychologist_id', psychologistId)
@@ -3221,10 +3225,13 @@ const getDoctorBookings = async (req, res) => {
     const userEmailById = new Map(users.map((u) => [u.id, u.email || null]));
     const clientById = new Map(clients.map((c) => [c.id, c]));
 
+    await attachPaymentChannel(rows); // Razorpay or Bank per booking
     const bookings = rows.map((s) => {
       const c = clientById.get(s.client_id);
       return {
         id: s.id,
+        payment_channel: s.payment_channel || null,
+        gateway_fee: s.gateway_fee || 0,
         order_id: s.payment_id || s.id,
         booked_at: getSessionBookingCreatedAtIso(s),
         session_date: s.scheduled_date || null,

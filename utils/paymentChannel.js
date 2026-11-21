@@ -23,6 +23,10 @@ const FEE_PERCENT = (() => {
   return Number.isFinite(n) && n >= 0 && n < 20 ? n : 2.36;
 })();
 
+// Razorpay's fee is booked as an expense when Razorpay settles (controllers/razorpaySettlementController).
+const RAZORPAY_EXPENSE_CATEGORY = 'Razorpay fees';
+const isRazorpayExpense = (e) => /razorpay/i.test(String(e?.category || '')) || /razorpay/i.test(String(e?.custom_category || ''));
+
 // Manual-booking methods that go through Razorpay (everything else lands in our account directly).
 const RAZORPAY_METHODS = new Set(['razorpay', 'razorpay_link', 'payment_link']);
 
@@ -162,8 +166,32 @@ function sessionFeeShare(info, sessionPrice) {
   return (info.fee * price) / info.paymentAmount;
 }
 
+/**
+ * Staff screens (admin / operations / superadmin / finance): put how each booking was paid on
+ * the session rows — payment_channel 'razorpay' | 'direct', gateway_fee (this session's share),
+ * gateway_fee_estimated. Client and therapist screens don't call this. Never throws.
+ */
+async function attachPaymentChannel(sessions) {
+  const list = (Array.isArray(sessions) ? sessions : [sessions]).filter((s) => s && s.id && s.type !== 'assessment');
+  if (!list.length) return;
+  try {
+    const info = await paymentsForSessions(list);
+    for (const s of list) {
+      const i = info.get(s.id);
+      s.payment_channel = i?.channel || null;
+      s.gateway_fee = i ? Math.round(sessionFeeShare(i, s.price) * 100) / 100 : 0;
+      s.gateway_fee_estimated = !!(i && i.estimated && i.channel === 'razorpay');
+    }
+  } catch (e) {
+    console.warn('attachPaymentChannel (non-blocking):', e?.message || e);
+  }
+}
+
 module.exports = {
+  attachPaymentChannel,
   FEE_PERCENT,
+  RAZORPAY_EXPENSE_CATEGORY,
+  isRazorpayExpense,
   RAZORPAY_METHODS,
   channelOf,
   feeOf,

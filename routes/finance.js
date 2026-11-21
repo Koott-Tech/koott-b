@@ -57,6 +57,10 @@ router.post('/expenses', financeController.createExpense);
 router.put('/expenses/:expenseId', financeController.updateExpense);
 router.delete('/expenses/:expenseId', financeController.deleteExpense);
 router.post('/expenses/:expenseId/approve', financeController.approveExpense);
+// Razorpay payouts: collected − received = Razorpay fee, saved as an expense
+const razorpaySettlementController = require('../controllers/razorpaySettlementController');
+router.get('/razorpay-settlements/summary', razorpaySettlementController.getSummary);
+router.post('/razorpay-settlements', razorpaySettlementController.createSettlement);
 
 // Income Management
 router.get('/income', financeController.getIncome);
