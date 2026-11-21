@@ -3,6 +3,8 @@ const { successResponse, errorResponse } = require('../utils/helpers');
 const { computeSessionDoctorWallet, resolveFirstSessionFlags, isPackageSessionLike } = require('../utils/sessionCommission');
 const { paymentsForSessions, sessionFeeShare, feeOf, FEE_PERCENT, isRazorpayExpense, attachPaymentChannel } = require('../utils/paymentChannel');
 const { assetAdjustments } = require('../utils/financialStatements');
+/** TDS deducted from every therapist payout (fixed by the company). */
+const PAYOUT_TDS_PERCENT = 10;
 const auditLogger = require('../utils/auditLogger');
 const {
   getSessionBookingCreatedAtIso,
@@ -6937,9 +6939,10 @@ const markPayoutAsPaid = async (req, res) => {
     }
 
     const { psychologist_id, month, year, dateFrom, dateTo, sessionIds } = req.body;
-    // Sent with a payout receipt: the TDS % shown on the receipt (deducted from the therapist's
-    // amount) and the receipt number. Without them (plain Mark as Paid) TDS stays 0 as before.
-    const tdsPercent = Math.min(30, Math.max(0, Number(req.body.tds_percent) || 0));
+    // TDS on therapist payouts is fixed at 10% (professional fees): deducted from the therapist's
+    // amount and owed to the government until deposited. Same for plain Mark as Paid and for
+    // Mark as Paid with a receipt; receipt_no is sent when a payout receipt was emailed.
+    const tdsPercent = PAYOUT_TDS_PERCENT;
     const receiptNo = req.body.receipt_no ? String(req.body.receipt_no).slice(0, 40) : null;
 
     if (!psychologist_id) {
