@@ -2,6 +2,7 @@ const { supabaseAdmin } = require('../config/supabase');
 const { successResponse, errorResponse } = require('../utils/helpers');
 const { computeSessionDoctorWallet, resolveFirstSessionFlags, isPackageSessionLike } = require('../utils/sessionCommission');
 const { paymentsForSessions, sessionFeeShare, feeOf, FEE_PERCENT, isRazorpayExpense, attachPaymentChannel } = require('../utils/paymentChannel');
+const { assetAdjustments } = require('../utils/financialStatements');
 const auditLogger = require('../utils/auditLogger');
 const {
   getSessionBookingCreatedAtIso,
@@ -1945,7 +1946,11 @@ const getDashboard = async (req, res) => {
     // Use total company commission (completed + pending) for net profit calculation
     
     // Calculate expenses for the selected date range (uses mtdFrom/mtdTo which defaults to current month)
-    const expensesForSelectedRange = calculateExpenses(expensesData, mtdFrom, mtdTo);
+    // Purchases recorded as fixed assets aren't expenses; their depreciation is (same as the P&L).
+    const assetAdj = await assetAdjustments(mtdFrom || null, mtdTo || new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10))
+      .catch(() => ({ depreciation: 0, capitalizedIds: new Set() }));
+    const expensesForSelectedRange = calculateExpenses((expensesData || []).filter((e) => !assetAdj.capitalizedIds.has(e.id)), mtdFrom, mtdTo)
+      + assetAdj.depreciation;
     
     // Net profit = Company commission from sessions ORIGINALLY BOOKED in date range - expenses in date range
     // Note: totalCompanyCommission includes commissions for sessions ORIGINALLY BOOKED in the date range (uses original_scheduled_date)
@@ -2055,6 +2060,7 @@ const getDashboard = async (req, res) => {
         refund_total: Math.round(totalRefundAmount || 0),
         razorpay_fees: Math.round(razorpayFees || 0), // expected, from the bookings
         razorpay_fees_recorded: Math.round(razorpayFeesRecorded || 0), // approved settlement expenses in range
+        depreciation: Math.round(assetAdj.depreciation || 0), // included in total_expenses
         razorpay_fees_estimated: Math.round(razorpayFeesEstimated || 0),
         revenue_razorpay: Math.round(revenueRazorpay || 0),
         revenue_direct: Math.round(revenueDirect || 0),

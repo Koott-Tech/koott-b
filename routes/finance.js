@@ -66,6 +66,21 @@ const financeTargetsController = require('../controllers/financeTargetsControlle
 router.get('/forecast', financeTargetsController.getForecast);
 router.get('/targets', financeTargetsController.getTargets);
 router.put('/targets', financeTargetsController.setTargets);
+// Profit & Loss, Balance Sheet, fixed assets, balance sheet items, expense headings
+const fsc = require('../controllers/financialStatementsController');
+router.get('/reports/profit-loss', fsc.profitLoss);
+router.get('/reports/balance-sheet', fsc.balanceSheetReport);
+router.get('/assets', fsc.listAssets);
+router.post('/assets', fsc.createAsset);
+router.post('/assets/from-expense/:expenseId', fsc.assetFromExpense);
+router.put('/assets/:id', fsc.updateAsset);
+router.delete('/assets/:id', fsc.deleteAsset);
+router.get('/balance-items', fsc.listItems);
+router.post('/balance-items', fsc.saveItem);
+router.put('/balance-items/:id', fsc.saveItem);
+router.delete('/balance-items/:id', fsc.deleteItem);
+router.get('/expense-groups', fsc.listExpenseGroups);
+router.put('/expense-groups', fsc.setExpenseGroup);
 
 // Income Management
 router.get('/income', financeController.getIncome);
