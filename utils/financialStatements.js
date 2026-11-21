@@ -128,10 +128,16 @@ async function sessionLedger(fromYmd, toYmd) {
   const raw = await allRows(() => {
     let q = supabaseAdmin.from('sessions').select(cols)
       .not('psychologist_id', 'is', null).neq('psychologist_id', assessmentPsych)
-      .neq('session_type', 'free_assessment').in('status', STATUSES)
-      .lte(col, hi.toISOString());
-    if (lo) q = q.gte(col, lo.toISOString());
-    return q.order(col, { ascending: true });
+      .neq('session_type', 'free_assessment').in('status', STATUSES);
+    if (col === 'booking_created_at') {
+      // No booking date saved → its created date counts (same rule as the dashboard).
+      const range = (c) => [lo && `${c}.gte.${lo.toISOString()}`, `${c}.lte.${hi.toISOString()}`].filter(Boolean).join(',');
+      q = q.or(`and(${range('booking_created_at')}),and(booking_created_at.is.null,${range('created_at')})`);
+    } else {
+      q = q.lte(col, hi.toISOString());
+      if (lo) q = q.gte(col, lo.toISOString());
+    }
+    return q.order('created_at', { ascending: true }).order('id', { ascending: true });
   });
   const sessions = raw.filter((s) => {
     const d = getSessionBookingCreatedIstDateString(s);

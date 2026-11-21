@@ -4066,24 +4066,31 @@ const getExpenses = async (req, res) => {
       userAgent: req.headers['user-agent']
     }).catch(err => console.error('Audit log error:', err));
 
-    // For subscription expenses, also fetch history if subscription_id exists
+    // For subscription expenses, also fetch history (every month of the same subscription).
+    // One query for all subscriptions on the page, not one per row, so long periods stay fast.
+    const subIds = [...new Set((expenses || []).filter((e) => e.expense_type === 'subscription' && e.subscription_id).map((e) => e.subscription_id))];
+    const historyBySub = new Map();
+    for (let i = 0; i < subIds.length; i += 100) {
+      let historyRes = await supabaseAdmin
+        .from('expenses')
+        .select('id, date, amount, total_amount, description, subscription_id')
+        .in('subscription_id', subIds.slice(i, i + 100))
+        .order('date', { ascending: false });
+      if (historyRes.error && String(historyRes.error.message || '').includes('column expenses.date does not exist')) {
+        historyRes = await supabaseAdmin
+          .from('expenses')
+          .select('id, amount, total_amount, description, created_at, subscription_id')
+          .in('subscription_id', subIds.slice(i, i + 100))
+          .order('created_at', { ascending: false });
+      }
+      (historyRes.data || []).forEach((h) => {
+        if (!historyBySub.has(h.subscription_id)) historyBySub.set(h.subscription_id, []);
+        historyBySub.get(h.subscription_id).push(h);
+      });
+    }
     const expensesWithHistory = await Promise.all((expenses || []).map(async (expense) => {
       if (expense.expense_type === 'subscription' && expense.subscription_id) {
-        let history = [];
-        let historyRes = await supabaseAdmin
-          .from('expenses')
-          .select('id, date, amount, total_amount, description')
-          .eq('subscription_id', expense.subscription_id)
-          .order('date', { ascending: false });
-        if (historyRes.error && String(historyRes.error.message || '').includes('column expenses.date does not exist')) {
-          historyRes = await supabaseAdmin
-            .from('expenses')
-            .select('id, amount, total_amount, description, created_at')
-            .eq('subscription_id', expense.subscription_id)
-            .order('created_at', { ascending: false });
-        }
-        history = historyRes.data || [];
-        expense.history = history || [];
+        expense.history = historyBySub.get(expense.subscription_id) || [];
       }
       // Use custom_category if available, otherwise use category
       if (expense.custom_category) {

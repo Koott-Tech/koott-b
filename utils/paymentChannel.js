@@ -147,6 +147,25 @@ async function paymentsForSessions(sessions) {
   const idMap = new Map(byId.map((p) => [p.id, p]));
   const groupMap = new Map();
   byGroup.forEach((p) => { if (p.package_group_id && !groupMap.has(p.package_group_id)) groupMap.set(p.package_group_id, p); });
+
+  // Package sessions with no payment of their own (a record-only package links only session 1;
+  // sessions booked later from a package link none): use the payment of another session in the
+  // same package.
+  const orphanGroups = [...new Set(list
+    .filter((s) => !(s.payment_id && idMap.get(s.payment_id)) && s.package_group_id && !groupMap.has(s.package_group_id))
+    .map((s) => s.package_group_id))];
+  if (orphanGroups.length) {
+    const siblingPay = new Map();
+    for (let i = 0; i < orphanGroups.length; i += 100) {
+      const { data } = await supabaseAdmin.from('sessions').select('package_group_id, payment_id')
+        .in('package_group_id', orphanGroups.slice(i, i + 100)).not('payment_id', 'is', null);
+      (data || []).forEach((r) => { if (!siblingPay.has(r.package_group_id)) siblingPay.set(r.package_group_id, r.payment_id); });
+    }
+    const missing = [...new Set([...siblingPay.values()].filter((id) => !idMap.has(id)))];
+    (await chunked('id', missing)).forEach((p) => idMap.set(p.id, p));
+    siblingPay.forEach((pid, g) => { const p = idMap.get(pid); if (p) groupMap.set(g, p); });
+  }
+
   for (const s of list) {
     const p = (s.payment_id && idMap.get(s.payment_id)) || (s.package_group_id && groupMap.get(s.package_group_id)) || null;
     if (!p) continue;

@@ -65,8 +65,12 @@ async function dailySales(fromYmd, toYmd) {
       .neq('psychologist_id', assessmentPsych)
       .neq('session_type', 'free_assessment')
       .in('status', STATUSES)
-      .gte(col, lo.toISOString()).lte(col, hi.toISOString())
-      .order(col, { ascending: true })
+      // No booking date saved → its created date counts (same rule as the dashboard).
+      .or(col === 'booking_created_at'
+        ? `and(booking_created_at.gte.${lo.toISOString()},booking_created_at.lte.${hi.toISOString()}),and(booking_created_at.is.null,created_at.gte.${lo.toISOString()},created_at.lte.${hi.toISOString()})`
+        : `and(created_at.gte.${lo.toISOString()},created_at.lte.${hi.toISOString()})`)
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
       .range(start, start + 999);
     if (error) throw error;
     for (const s of data || []) {
