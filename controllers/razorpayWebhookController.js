@@ -14,6 +14,7 @@
  */
 
 const { supabaseAdmin } = require('../config/supabase');
+const { recordRazorpayFee } = require('../utils/paymentChannel');
 const { getRazorpayConfig, verifyWebhookSignature } = require('../config/razorpay');
 const { getSlotLockByOrderId, updateSlotLockStatus, releaseSlotLock } = require('../services/slotLockService');
 const { createSessionFromSlotLock } = require('../services/sessionCreationService');
@@ -498,6 +499,8 @@ const processPaymentCapturedUnlocked = async (payload, eventId, skipSignatureChe
       }),
       paymentUpdate,
     ]);
+    // Channel + Razorpay's real fee (the captured payment entity carries fee/tax in paise).
+    if (paymentRecord) recordRazorpayFee(paymentRecord.id, payment);
     if (lockUpdateResult && !lockUpdateResult.success) {
       console.error('❌ Failed to update slot lock status');
       // Don't return error - try to proceed with session creation anyway

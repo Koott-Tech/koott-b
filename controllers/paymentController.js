@@ -1,4 +1,5 @@
 const { supabaseAdmin } = require('../config/supabase');
+const { recordRazorpayFee } = require('../utils/paymentChannel');
 const { ensureClientPackageRecord, assertClientPackageHasAvailableSlot } = require('../services/packageService');
 const { 
   getRazorpayConfig, 
@@ -2259,6 +2260,8 @@ const handlePaymentSuccess = async (req, res) => {
       .eq('status', 'pending') // Only update if still pending (atomic check-and-set)
       .select('*')
       .single();
+    // Mark it as a Razorpay payment (fee comes with the webhook's captured entity, else estimated).
+    if (updatedPayment) recordRazorpayFee(paymentRecord.id, params.payment?.entity);
 
     if (paymentStatusUpdateError || !updatedPayment) {
       // If update failed or no rows updated, another request already processed this payment

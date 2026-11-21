@@ -21,6 +21,7 @@ const {
 } = require('../utils/sessionTitleFormatter');
 const emailService = require('../utils/emailService');
 const { generateCertificate } = require('../utils/certificateService');
+const { markManualChannel } = require('../utils/paymentChannel');
 
 /** Statuses that still occupy a therapist's slot (a cancelled/no-show/completed row does not). */
 const SLOT_OCCUPYING_STATUSES = ['booked', 'scheduled', 'confirmed', 'reschedule_requested', 'rescheduled'];
@@ -388,6 +389,8 @@ const createManualPackageBooking = async (req, res) => {
       delete paymentInsert[missing];
     }
     if (payErr) { console.error('[createManualPackageBooking] payment failed:', payErr); return res.status(500).json(errorResponse('Failed to create payment record')); }
+    // Razorpay payment link → Razorpay (fee kept by them); UPI / bank / cash → direct to us.
+    await markManualChannel(payment.id, payment_method, req.body.gateway_fee);
 
     const { randomUUID } = require('crypto');
     const packageGroupId = randomUUID();
@@ -568,6 +571,8 @@ const createRecordOnlyPackage = async (req, res) => {
       completed_at: paidDate, created_at: nowIso,
       razorpay_params: { notes: { record_only: true, package_record: true, admin_created: true, created_by: req.user?.id } },
     }).select('id').single();
+    // Razorpay payment link → Razorpay (fee kept by them); UPI / bank / cash → direct to us.
+    if (payment?.id) await markManualChannel(payment.id, payment_method, req.body.gateway_fee);
 
     const allowed = ['booked', 'completed', 'cancelled', 'no_show', 'rescheduled'];
     const created = [];
@@ -945,6 +950,8 @@ const createManualBooking = async (req, res) => {
     }
 
     paymentRecord = payment;
+    // Razorpay payment link → Razorpay (fee kept by them); UPI / bank / cash → direct to us.
+    await markManualChannel(payment.id, normalizedPaymentMethod, req.body.gateway_fee);
     console.log('✅ [MANUAL BOOKING] Payment record created:', payment.id);
 
     // ============================================
@@ -1605,6 +1612,8 @@ const createRecordOnlyBooking = async (req, res) => {
       );
     }
     paymentRecord = payment;
+    // Razorpay payment link → Razorpay (fee kept by them); UPI / bank / cash → direct to us.
+    await markManualChannel(payment.id, normalizedPaymentMethod, req.body.gateway_fee);
 
     // Session data: no Meet creation; use meet_link from body if provided
     const allowedStatuses = ['booked', 'completed', 'cancelled', 'no_show', 'rescheduled', 'refund_request'];
@@ -4278,7 +4287,7 @@ const updateSession = async (req, res) => {
     }
 
     // Update payment details if provided
-    if (payment_method || transaction_id || razorpay_order_id || razorpay_payment_id) {
+    if (payment_method || transaction_id || razorpay_order_id || razorpay_payment_id || req.body.payment_channel) {
       const { data: payment } = await supabaseAdmin
         .from('payments')
         .select('id')
@@ -4296,6 +4305,11 @@ const updateSession = async (req, res) => {
           .from('payments')
           .update(paymentUpdate)
           .eq('id', payment.id);
+        // Channel only changes when the edit form says so explicitly (a website payment's
+        // stored method can be 'upi' and is still a Razorpay payment).
+        if (req.body.payment_channel === 'razorpay' || req.body.payment_channel === 'direct') {
+          await markManualChannel(payment.id, req.body.payment_channel, req.body.gateway_fee);
+        }
       }
     }
 

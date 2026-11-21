@@ -1,6 +1,7 @@
 const { supabaseAdmin } = require('../config/supabase');
 const { successResponse, errorResponse } = require('../utils/helpers');
 const { computeSessionDoctorWallet, resolveFirstSessionFlags, isPackageSessionLike } = require('../utils/sessionCommission');
+const { paymentsForSessions, sessionFeeShare, feeOf, FEE_PERCENT } = require('../utils/paymentChannel');
 const auditLogger = require('../utils/auditLogger');
 const {
   getSessionBookingCreatedAtIso,
@@ -857,6 +858,8 @@ const getDashboard = async (req, res) => {
             : null,
           flagsP: early(resolveFirstSessionFlags(supabaseAdmin, list)),
           sibsP: early(fetchPackageSiblings(list)),
+          // How each session's money came in (Razorpay -> fee, direct -> none).
+          feesP: early(paymentsForSessions(list)),
         };
       });
       dashCommissionsP = early(supabaseAdmin
@@ -1263,6 +1266,13 @@ const getDashboard = async (req, res) => {
     let totalDoctorWallet = 0; // Total doctor wallet for sessions ORIGINALLY BOOKED in date range (uses original_scheduled_date, for revenue calculation)
     let totalRevenueFromSessions = 0; // Calculate total revenue from sessions ORIGINALLY BOOKED in date range (uses original_scheduled_date)
     let totalRefundAmount = 0; // Total refunded amount in selected range
+    // Payment channel (utils/paymentChannel): Razorpay keeps a fee and settles the rest; direct
+    // UPI/bank has none. The fee is the company's cost - therapist shares are unchanged.
+    let razorpayFees = 0; // fees on revenue in range (incl. refunded: Razorpay keeps its fee)
+    let razorpayFeesEstimated = 0; // part of razorpayFees that is an estimate (real fee not known yet)
+    let revenueRazorpay = 0;
+    let revenueDirect = 0;
+    let revenueNoPayment = 0; // sessions with no payment record found
     let pendingPayout = 0; // Doctor wallet for BOOKED (not yet completed) sessions — work pending
     let payout = 0; // Doctor wallet for COMPLETED sessions — earned/ready to pay out
     let completedDoctorWalletInRange = 0; // Total doctor wallet from completed sessions in range (= payout)
@@ -1418,6 +1428,9 @@ const getDashboard = async (req, res) => {
         const firstFlags = derived
           ? await late(derived.flagsP)
           : await resolveFirstSessionFlags(supabaseAdmin, allSessions || []);
+        const paymentInfoBySession = (derived && derived.feesP
+          ? await late(derived.feesP)
+          : await paymentsForSessions(allSessions || []).catch(() => new Map())) || new Map();
         const clientFirstSessions = firstFlags.firstSessionIds;
 
         // Package profit nets per purchase (see packageCompanyShareFor).
@@ -1622,6 +1635,14 @@ const getDashboard = async (req, res) => {
               totalDoctorWallet += toDoctorWallet;
             }
             totalRevenueFromSessions += sessionPrice;
+            const payInfo = paymentInfoBySession.get(s.id);
+            if (!payInfo) revenueNoPayment += sessionPrice;
+            else if (payInfo.channel === 'razorpay') {
+              revenueRazorpay += sessionPrice;
+              const feeShare = sessionFeeShare(payInfo, sessionPrice);
+              razorpayFees += feeShare;
+              if (payInfo.estimated) razorpayFeesEstimated += feeShare;
+            } else revenueDirect += sessionPrice;
           }
 
           // 2. PAYOUT — completion_date in range, regardless of when session was booked
@@ -1931,7 +1952,8 @@ const getDashboard = async (req, res) => {
     // This represents the company's commission from revenue received for sessions originally booked in this period
     const incomeForSelectedRange = calculateIncome(incomeData, mtdFrom, mtdTo);
     const netRevenueExcludingRefunds = totalRevenueFromSessions - totalRefundAmount;
-    const netProfitForSelectedRange = netRevenueExcludingRefunds + incomeForSelectedRange - totalDoctorWallet - expensesForSelectedRange;
+    // Razorpay's fee is a cost of receiving the money (direct UPI/bank has none).
+    const netProfitForSelectedRange = netRevenueExcludingRefunds + incomeForSelectedRange - totalDoctorWallet - expensesForSelectedRange - razorpayFees;
     
     // For MTD/QTD/YTD metrics, use totalCompanyCommission (sessions originally booked in those periods)
     const calculateRefundTotal = (sessions, fromDate, toDate, opts = {}) => {
@@ -2028,6 +2050,12 @@ const getDashboard = async (req, res) => {
         total_company_commission_completed: Math.round(totalCompanyCommissionCompleted || 0),
         total_doctor_wallet: Math.round(totalDoctorWallet || 0),
         refund_total: Math.round(totalRefundAmount || 0),
+        razorpay_fees: Math.round(razorpayFees || 0),
+        razorpay_fees_estimated: Math.round(razorpayFeesEstimated || 0),
+        revenue_razorpay: Math.round(revenueRazorpay || 0),
+        revenue_direct: Math.round(revenueDirect || 0),
+        revenue_no_payment: Math.round(revenueNoPayment || 0),
+        razorpay_fee_percent: FEE_PERCENT,
         revenue_change: revenueGrowthMoM ? `${revenueGrowthMoM > 0 ? '+' : ''}${revenueGrowthMoM}%` : null,
         revenue_change_type: parseFloat(revenueGrowthMoM) >= 0 ? 'increase' : 'decrease',
         profit_change: revenueGrowthMoM ? `${revenueGrowthMoM > 0 ? '+' : ''}${revenueGrowthMoM}%` : null,
@@ -2754,6 +2782,14 @@ const getSessions = async (req, res) => {
     const totalVisibleSessions = finalSessions.length;
     const offset = (safePage - 1) * safeLimit;
     const paginatedSessions = finalSessions.slice(offset, offset + safeLimit);
+    // How each shown booking was paid: Razorpay (fee kept by Razorpay) or direct to our account.
+    const pagePayInfo = await paymentsForSessions(paginatedSessions).catch(() => new Map());
+    paginatedSessions.forEach((s) => {
+      const info = pagePayInfo.get(s.id);
+      s.payment_channel = info?.channel || null;
+      s.gateway_fee = info ? Math.round(sessionFeeShare(info, s.price) * 100) / 100 : 0;
+      s.gateway_fee_estimated = !!(info && info.estimated && info.channel === 'razorpay');
+    });
 
     /* not awaited: the reply does not depend on it */ auditLogger.logAction({
       userId: req.user.id,
@@ -3331,7 +3367,11 @@ const getSessionDetails = async (req, res) => {
             'debit_card': 'Card Payment',
             'upi': 'UPI Payment',
             'wallet': 'Wallet Payment',
-            'online': 'Online Payment'
+            'online': 'Online Payment',
+            'razorpay': 'Razorpay',
+            'razorpay_link': 'Razorpay payment link',
+            'bank_transfer': 'Bank Transfer',
+            'cheque': 'Cheque',
           };
           paymentMethodDisplay = methodMap[paymentMethod.toLowerCase()] || 'Online Payment';
         } else if (paymentMethod === 'cash') {
@@ -3353,6 +3393,12 @@ const getSessionDetails = async (req, res) => {
           notes: payment.notes,
           razorpay_params: payment.razorpay_params
         };
+        // Razorpay (fee kept by Razorpay, rest settled later) or direct to our account.
+        const chan = (await paymentsForSessions([session]).catch(() => new Map())).get(session.id) || feeOf(payment);
+        paymentDetails.payment_channel = chan.channel;
+        paymentDetails.gateway_fee = Math.round((chan.fee || 0) * 100) / 100;
+        paymentDetails.gateway_fee_estimated = !!(chan.estimated && chan.channel === 'razorpay');
+        paymentDetails.net_received = Math.round(((Number(payment.amount) || 0) - (chan.fee || 0)) * 100) / 100;
       }
     }
 
