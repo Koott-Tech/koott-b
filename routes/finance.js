@@ -81,6 +81,11 @@ router.put('/balance-items/:id', fsc.saveItem);
 router.delete('/balance-items/:id', fsc.deleteItem);
 router.get('/expense-groups', fsc.listExpenseGroups);
 router.put('/expense-groups', fsc.setExpenseGroup);
+// TDS on therapist payouts: deducted, deposited (challans), due dates, per-therapist totals
+const tdsController = require('../controllers/tdsController');
+router.get('/tds', tdsController.getTds);
+router.post('/tds/deposits', tdsController.addDeposit);
+router.delete('/tds/deposits/:id', tdsController.deleteDeposit);
 
 // Income Management
 router.get('/income', financeController.getIncome);

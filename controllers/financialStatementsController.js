@@ -197,7 +197,7 @@ const ITEM_HINTS = {
   cash_bank: ['Bank – current account', 'Cash in hand'],
   current_asset: ['Advances to staff', 'Prepaid expenses', 'GST input credit', 'Other receivables'],
   non_current_asset: ['Security deposit (rent)', 'Long-term deposits'],
-  current_liability: ['GST payable', 'TDS paid to government (enter negative)', 'Salaries payable', 'Other payables'],
+  current_liability: ['GST payable', 'Salaries payable', 'Other payables'], // TDS payments: Finance → TDS
   non_current_liability: ['Bank loan', 'Loan from directors'],
   equity: ["Share capital / Owner's capital", 'Opening reserves (before the system)', 'Drawings (enter negative)'],
 };

@@ -7130,7 +7130,8 @@ const markPayoutAsPaid = async (req, res) => {
     const payoutDate = new Date().toISOString().split('T')[0];
     const payoutPeriodLabel = (month && year)
       ? new Date(year, month - 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
-      : `${monthStart} to ${monthEnd}`;
+      : (monthStart && monthEnd) ? `${monthStart} to ${monthEnd}`
+        : `${completedSessionsInRange.length} selected session${completedSessionsInRange.length === 1 ? '' : 's'}`;
     const { data: payout, error: payoutError } = await supabaseAdmin
       .from('payouts')
       .insert([{

@@ -312,11 +312,13 @@ async function therapistPayouts(asOf) {
 /** Balance Sheet as at `asOf`. */
 async function balanceSheet(asOf) {
   const assetsRes = await loadAssets();
-  const [pl, manual, rzp, pay] = await Promise.all([
+  const { depositedUpTo } = require('../controllers/tdsController');
+  const [pl, manual, rzp, pay, tdsDeposited] = await Promise.all([
     profitAndLoss(null, asOf, { assets: assetsRes.assets }),
     manualItemsAsOf(asOf),
     razorpayReceivable(asOf),
     therapistPayouts(asOf),
+    depositedUpTo(asOf).catch(() => 0),
   ]);
   const earned = pl.expenses.therapist_fees; // therapist share of everything booked to date
   const live = assetsRes.assets.filter((a) => a.purchase_date <= asOf && !(a.disposed_date && a.disposed_date <= asOf));
@@ -342,7 +344,7 @@ async function balanceSheet(asOf) {
   const therapistPayable = r2(earned - pay.paid);
   const currentLiabilities = [
     { name: 'Payable to therapists', amount: therapistPayable, computed: true, detail: `Earned ${rs(earned)} − paid ${rs(pay.paid)}` },
-    { name: 'TDS deducted on therapist payouts', amount: r2(pay.tds), computed: true, detail: 'Enter "TDS paid to government" below (as a negative) once deposited' },
+    { name: 'TDS payable (deducted from therapists, not yet paid to government)', amount: r2(pay.tds - tdsDeposited), computed: true, detail: `Deducted ${rs(pay.tds)} − paid to government ${rs(tdsDeposited)} (Finance → TDS)` },
     ...(m.current_liability || []),
   ];
   const nonCurrentLiabilities = [...(m.non_current_liability || [])];
