@@ -26,6 +26,33 @@ const needSql = (res) => res.status(503).json(errorResponse('This needs the data
 const fail = (res, e, msg) => { console.error(msg, e); return res.status(500).json(errorResponse(msg)); };
 const validDate = (s) => YMD.test(String(s || '')) && !Number.isNaN(Date.parse(`${s}T00:00:00Z`));
 
+/**
+ * The period to compare with.
+ *  - One month from the 1st (this month, last month): the previous month, same days
+ *    (1–21 Nov → 1–21 Oct; a full month → the full previous month).
+ *  - Longer periods from the 1st (quarter, financial year, year to date): the same dates a
+ *    year earlier (1 Apr – 21 Nov 2026 → 1 Apr – 21 Nov 2025).
+ *  - Any other range: the same number of days just before it.
+ */
+function previousPeriod(from, to) {
+  const [fy, fm, fd] = from.split('-').map(Number);
+  const [ty, tm, td] = to.split('-').map(Number);
+  if (fd === 1) {
+    const span = (ty - fy) * 12 + (tm - fm) + 1;
+    const months = span === 1 ? 1 : 12;
+    const shift = (y, m, d, endOfMonth) => {
+      const t = new Date(Date.UTC(y, m - 1 - months, 1));
+      const last = new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth() + 1, 0)).getUTCDate();
+      return `${t.getUTCFullYear()}-${String(t.getUTCMonth() + 1).padStart(2, '0')}-${String(endOfMonth ? last : Math.min(d, last)).padStart(2, '0')}`;
+    };
+    const toIsMonthEnd = td === new Date(Date.UTC(ty, tm, 0)).getUTCDate();
+    return [shift(fy, fm, 1, false), shift(ty, tm, td, toIsMonthEnd)];
+  }
+  const days = Math.round((Date.parse(to) - Date.parse(from)) / 864e5) + 1;
+  const pTo = new Date(Date.parse(`${from}T00:00:00Z`) - 864e5).toISOString().slice(0, 10);
+  return [new Date(Date.parse(`${pTo}T00:00:00Z`) - (days - 1) * 864e5).toISOString().slice(0, 10), pTo];
+}
+
 // ---------------------------------------------------------------- reports
 const profitLoss = async (req, res) => {
   if (!guard(req, res)) return;
@@ -38,9 +65,7 @@ const profitLoss = async (req, res) => {
     const current = await FS.profitAndLoss(from, to);
     let previous = null;
     if (compare) {
-      const days = Math.round((Date.parse(to) - Date.parse(from)) / 864e5) + 1;
-      const pTo = new Date(Date.parse(`${from}T00:00:00Z`) - 864e5).toISOString().slice(0, 10);
-      const pFrom = new Date(Date.parse(`${pTo}T00:00:00Z`) - (days - 1) * 864e5).toISOString().slice(0, 10);
+      const [pFrom, pTo] = previousPeriod(from, to);
       previous = await FS.profitAndLoss(pFrom, pTo);
     }
     return res.json(successResponse({ ...current, previous, assets_ready: await FS.tableReady('fixed_assets') }));
@@ -265,4 +290,5 @@ module.exports = {
   listAssets, createAsset, updateAsset, deleteAsset, assetFromExpense,
   listItems, saveItem, deleteItem,
   listExpenseGroups, setExpenseGroup,
+  previousPeriod,
 };

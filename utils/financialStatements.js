@@ -26,8 +26,12 @@ const { channelOf, isRazorpayExpense } = require('./paymentChannel');
 const STATUSES = ['booked', 'pending', 'completed', 'rescheduled', 'reschedule_requested', 'no_show', 'noshow', 'refunded', 'cancelled'];
 const DAY = 864e5;
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const rs = (n) => `₹${Math.round(Number(n) || 0).toLocaleString('en-IN')}`;
 const ymdToMs = (ymd) => Date.parse(`${ymd}T00:00:00Z`);
 const addDays = (ymd, n) => new Date(ymdToMs(ymd) + n * DAY).toISOString().slice(0, 10);
+const todayIST = () => new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
+// Depreciation only for days that have passed (a filter ending later in the month mustn't book future days).
+const capToday = (ymd) => { const t = todayIST(); return ymd > t ? t : ymd; };
 
 // ---------------------------------------------------------------- expense headings
 const PL_GROUPS = [
@@ -213,7 +217,7 @@ async function profitAndLoss(fromYmd, toYmd, preloaded = {}) {
   let depreciation = 0; let disposalGain = 0;
   const depByCategory = {};
   for (const a of assets) {
-    const d = depreciationBetween(a, fromYmd, toYmd);
+    const d = fromYmd && fromYmd > capToday(toYmd) ? 0 : depreciationBetween(a, fromYmd, capToday(toYmd));
     if (d > 0) { depreciation += d; depByCategory[a.category] = (depByCategory[a.category] || 0) + d; }
     if (a.disposed_date && a.disposed_date <= toYmd && (!fromYmd || a.disposed_date >= fromYmd)) {
       disposalGain += (Number(a.disposal_amount) || 0) - ((Number(a.cost) || 0) - accumulatedDepreciation(a, a.disposed_date));
@@ -319,7 +323,7 @@ async function balanceSheet(asOf) {
   const byCat = {};
   for (const a of live) {
     const c = byCat[a.category] = byCat[a.category] || { name: a.category, cost: 0, depreciation: 0, net: 0, count: 0 };
-    const dep = accumulatedDepreciation(a, asOf);
+    const dep = accumulatedDepreciation(a, capToday(asOf));
     c.cost += Number(a.cost) || 0; c.depreciation += dep; c.net += (Number(a.cost) || 0) - dep; c.count += 1;
   }
   const fixed = Object.values(byCat).map((c) => ({ ...c, cost: r2(c.cost), depreciation: r2(c.depreciation), net: r2(c.net) }));
@@ -327,7 +331,7 @@ async function balanceSheet(asOf) {
   const m = manual.bySection;
 
   const nonCurrentAssets = [
-    ...fixed.map((f) => ({ name: `${f.name} (net)`, amount: f.net, computed: true, detail: `Cost ${f.cost} − depreciation ${f.depreciation}` })),
+    ...fixed.map((f) => ({ name: `${f.name} (net)`, amount: f.net, computed: true, detail: `Cost ${rs(f.cost)} − depreciation ${rs(f.depreciation)}` })),
     ...(m.non_current_asset || []),
   ];
   const currentAssets = [
@@ -337,7 +341,7 @@ async function balanceSheet(asOf) {
   ];
   const therapistPayable = r2(earned - pay.paid);
   const currentLiabilities = [
-    { name: 'Payable to therapists', amount: therapistPayable, computed: true, detail: `Earned ${r2(earned)} − paid ${r2(pay.paid)}` },
+    { name: 'Payable to therapists', amount: therapistPayable, computed: true, detail: `Earned ${rs(earned)} − paid ${rs(pay.paid)}` },
     { name: 'TDS deducted on therapist payouts', amount: r2(pay.tds), computed: true, detail: 'Enter "TDS paid to government" below (as a negative) once deposited' },
     ...(m.current_liability || []),
   ];
@@ -373,7 +377,8 @@ async function balanceSheet(asOf) {
 async function assetAdjustments(fromYmd, toYmd) {
   const { assets } = await loadAssets();
   let depreciation = 0;
-  for (const a of assets) depreciation += Math.max(0, depreciationBetween(a, fromYmd, toYmd));
+  const end = capToday(toYmd);
+  if (!fromYmd || fromYmd <= end) for (const a of assets) depreciation += Math.max(0, depreciationBetween(a, fromYmd, end));
   return { depreciation, capitalizedIds: new Set(assets.map((a) => a.expense_id).filter(Boolean)) };
 }
 
