@@ -124,6 +124,7 @@ router.get('/payouts/pending', financeController.getPendingPayouts);
 router.get('/payouts/doctors', financeController.getDoctorPayouts);
 router.get('/payouts/:payoutId', financeController.getPayoutDetails);
 router.post('/payouts', financeController.processPayout);
-router.post('/payouts/mark-paid', financeController.markPayoutAsPaid);
+// One at a time per therapist, so a double click can't pay the same sessions twice.
+router.post('/payouts/mark-paid', serializeByTherapist, financeController.markPayoutAsPaid);
 
 module.exports = router;

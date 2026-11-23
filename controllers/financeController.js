@@ -4420,10 +4420,30 @@ const updateExpense = async (req, res) => {
       }
     }
 
+    // A Razorpay settlement's fee is always collected − received: it can't be edited on its own;
+    // change collected / received and the fee follows.
+    const { data: stl } = await supabaseAdmin.from('expenses').select('settlement_gross, settlement_received').eq('id', expenseId).maybeSingle()
+      .then((r) => r, () => ({ data: null }));
+    if (stl && stl.settlement_gross != null) {
+      const wantsSettlement = req.body.settlement_gross !== undefined || req.body.settlement_received !== undefined;
+      if (wantsSettlement) {
+        const g = Math.round((req.body.settlement_gross !== undefined ? Number(req.body.settlement_gross) : Number(stl.settlement_gross)) * 100) / 100;
+        const r = Math.round((req.body.settlement_received !== undefined ? Number(req.body.settlement_received) : Number(stl.settlement_received)) * 100) / 100;
+        if (!(g > 0) || !(r >= 0) || r > g) {
+          return res.status(400).json(errorResponse('Received must be between 0 and what Razorpay collected.'));
+        }
+        const fee = Math.round((g - r) * 100) / 100;
+        Object.assign(updateData, { settlement_gross: g, settlement_received: r, amount: fee, total_amount: fee });
+        if (description === undefined) updateData.description = `Razorpay settlement: collected ₹${g.toLocaleString('en-IN')}, received ₹${r.toLocaleString('en-IN')}`;
+      } else if (updateData.amount !== undefined) {
+        return res.status(400).json(errorResponse('This is a Razorpay settlement: its fee is collected − received. Change those amounts instead of the fee.'));
+      }
+    }
+
     // Only perform update if there are actual changes (besides updated_at)
     let updatedExpense;
     let error;
-    
+
     if (Object.keys(updateData).length > 1) {
       const { data, error: updateError } = await supabaseAdmin
         .from('expenses')
@@ -4498,6 +4518,14 @@ const deleteExpense = async (req, res) => {
       return res.status(404).json(
         errorResponse('Expense not found')
       );
+    }
+
+    // A purchase moved to Fixed Assets is still linked to its expense: remove the asset first,
+    // so the asset never points at an expense that is gone.
+    const { data: linkedAsset } = await supabaseAdmin.from('fixed_assets').select('id, name').eq('expense_id', expenseId).maybeSingle()
+      .then((r) => r, () => ({ data: null }));
+    if (linkedAsset) {
+      return res.status(409).json(errorResponse(`This expense is the fixed asset "${linkedAsset.name}". Remove it from Fixed Assets first.`));
     }
 
     // Delete expense
@@ -7101,6 +7129,22 @@ const markPayoutAsPaid = async (req, res) => {
 
     if (commissionError) {
       console.error('Error fetching commission history:', commissionError);
+      return res.status(500).json(errorResponse('Could not check which sessions are already paid. Nothing was marked.'));
+    }
+
+    // Never pay a session twice: drop sessions already settled (a repeat click, the same month
+    // marked again, or a double click — the route also runs one request per therapist at a time).
+    const alreadyPaid = new Set((commissionHistory || [])
+      .filter((ch) => String(ch.payment_status || '').toLowerCase() === 'paid')
+      .map((ch) => ch.session_id));
+    for (let i = completedSessionsInRange.length - 1; i >= 0; i -= 1) {
+      if (alreadyPaid.has(completedSessionsInRange[i].id)) completedSessionsInRange.splice(i, 1);
+    }
+    for (let i = payoutSessionIds.length - 1; i >= 0; i -= 1) {
+      if (alreadyPaid.has(payoutSessionIds[i])) payoutSessionIds.splice(i, 1);
+    }
+    if (completedSessionsInRange.length === 0) {
+      return res.status(409).json(errorResponse('These sessions are already marked as paid. Nothing new to pay.'));
     }
 
     // Calculate totals
