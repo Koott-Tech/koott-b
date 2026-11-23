@@ -2593,6 +2593,7 @@ const getSessions = async (req, res) => {
         package_session_number,
         session_count,
         package_id,
+        package_group_id,
         payment_verified,
         payment_verified_at
       `, { count: 'exact' })
