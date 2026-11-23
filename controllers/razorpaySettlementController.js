@@ -18,9 +18,9 @@ const { channelOf, RAZORPAY_EXPENSE_CATEGORY, isRazorpayExpense } = require('../
 const PAID_STATUSES = new Set(['success', 'paid', 'completed', 'captured']);
 const money = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
-async function settlementColumnsReady() {
-  const { error } = await supabaseAdmin.from('expenses').select('settlement_gross, settlement_received').limit(1);
-  return !error;
+const { schemaReady } = require('../utils/schemaReady');
+function settlementColumnsReady() {
+  return schemaReady('expenses', 'settlement_gross, settlement_received'); // remembered
 }
 
 async function allRows(table, columns, apply) {

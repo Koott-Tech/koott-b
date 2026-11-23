@@ -28,9 +28,9 @@ function guard(req, res) {
   return true;
 }
 
-async function depositsReady() {
-  const { error } = await supabaseAdmin.from('tds_deposits').select('id').limit(1);
-  return !error;
+const { schemaReady } = require('../utils/schemaReady');
+function depositsReady() {
+  return schemaReady('tds_deposits'); // remembered: no round trip per request
 }
 
 /** Deposit due date for TDS deducted in month 'YYYY-MM'. */

@@ -511,6 +511,9 @@ const getDashboard = async (req, res) => {
       mtdFrom = dateFrom || getISTDateString(startOfMonth);
       mtdTo = dateTo || getISTDateString(today);
     }
+    // Fixed assets (depreciation, purchases recorded as assets) — read now, used at the end.
+    const assetAdjP = assetAdjustments(mtdFrom || null, mtdTo || new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10))
+      .catch(() => ({ depreciation: 0, capitalizedIds: new Set() }));
 
     // Check if we should use stored monthly snapshot
     let filterYear = today.getFullYear();
@@ -1949,8 +1952,7 @@ const getDashboard = async (req, res) => {
     
     // Calculate expenses for the selected date range (uses mtdFrom/mtdTo which defaults to current month)
     // Purchases recorded as fixed assets aren't expenses; their depreciation is (same as the P&L).
-    const assetAdj = await assetAdjustments(mtdFrom || null, mtdTo || new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10))
-      .catch(() => ({ depreciation: 0, capitalizedIds: new Set() }));
+    const assetAdj = await assetAdjP; // started at the top, alongside the other reads
     const expensesForSelectedRange = calculateExpenses((expensesData || []).filter((e) => !assetAdj.capitalizedIds.has(e.id)), mtdFrom, mtdTo)
       + assetAdj.depreciation;
     
@@ -2703,10 +2705,13 @@ const getSessions = async (req, res) => {
       ? sessionsData
       : sessionsData.filter(s => (s.payment_id && successfulPaymentIds.includes(s.payment_id)) || isPaidWithoutPaymentRow(s));
 
+    // Razorpay / Bank for the rows, looked up alongside the commission rows (not after them).
+    const payInfoP = paymentsForSessions(sessionsForResponse).catch(() => new Map());
+
     // Get commission data for each session
     const sessionIds = sessionsForResponse.map(s => s?.id).filter(Boolean);
     let commissions = [];
-    
+
     if (sessionIds.length > 0) {
       const { data: commissionData, error: commissionError } = await supabaseAdmin
         .from('commission_history')
@@ -2796,7 +2801,7 @@ const getSessions = async (req, res) => {
     const offset = (safePage - 1) * safeLimit;
     const paginatedSessions = finalSessions.slice(offset, offset + safeLimit);
     // How each shown booking was paid: Razorpay (fee kept by Razorpay) or direct to our account.
-    const pagePayInfo = await paymentsForSessions(paginatedSessions).catch(() => new Map());
+    const pagePayInfo = await payInfoP;
     paginatedSessions.forEach((s) => {
       const info = pagePayInfo.get(s.id);
       s.payment_channel = info?.channel || null;

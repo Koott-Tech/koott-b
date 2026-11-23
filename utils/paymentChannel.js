@@ -133,12 +133,11 @@ async function paymentsForSessions(sessions) {
   const cols = ready ? `${PAYMENT_FEE_COLUMNS}, payment_channel, gateway_fee` : PAYMENT_FEE_COLUMNS;
   const chunked = async (column, ids) => {
     const unique = [...new Set(ids.filter(Boolean))];
-    const rows = [];
-    for (let i = 0; i < unique.length; i += 100) {
-      const { data } = await supabaseAdmin.from('payments').select(cols).in(column, unique.slice(i, i + 100));
-      if (data) rows.push(...data);
-    }
-    return rows;
+    const parts = [];
+    for (let i = 0; i < unique.length; i += 100) parts.push(unique.slice(i, i + 100));
+    // All chunks at once (one round trip, however many sessions).
+    const res = await Promise.all(parts.map((p) => supabaseAdmin.from('payments').select(cols).in(column, p)));
+    return res.flatMap((r) => r.data || []);
   };
   const [byId, byGroup] = await Promise.all([
     chunked('id', list.map((s) => s.payment_id)),

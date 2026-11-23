@@ -94,9 +94,9 @@ function bookValue(a, ymd) {
 }
 
 // ---------------------------------------------------------------- loaders
-async function tableReady(table, cols = 'id') {
-  const { error } = await supabaseAdmin.from(table).select(cols).limit(1);
-  return !error;
+const { schemaReady } = require('./schemaReady');
+function tableReady(table, cols = 'id') {
+  return schemaReady(table, cols); // remembered: no round trip per request
 }
 
 async function allRows(build) {
@@ -173,14 +173,15 @@ async function sessionLedger(fromYmd, toYmd) {
   return { revenue, refunds, therapist, count: sessions.length };
 }
 
-async function expenseLedger(fromYmd, toYmd, capitalizedIds) {
-  const [rows, cats] = await Promise.all([
+async function expenseLedger(fromYmd, toYmd, capitalizedIdsOrPromise) {
+  const [rows, cats, capitalizedIds] = await Promise.all([
     allRows(() => {
       let q = supabaseAdmin.from('expenses').select('id, date, category, custom_category, amount, total_amount, approval_status').eq('approval_status', 'approved').lte('date', toYmd);
       if (fromYmd) q = q.gte('date', fromYmd);
       return q;
     }),
     supabaseAdmin.from('expense_categories').select('name, pl_group').then((r) => (r.error ? supabaseAdmin.from('expense_categories').select('name') : r)),
+    Promise.resolve(capitalizedIdsOrPromise),
   ]);
   const override = {};
   (cats.data || []).forEach((c) => { override[String(c.name).toLowerCase()] = c.pl_group || null; });
@@ -217,9 +218,10 @@ async function incomeLedger(fromYmd, toYmd) {
 // ---------------------------------------------------------------- statements
 /** Profit & Loss for [from, to]. from null = from the start of the books. */
 async function profitAndLoss(fromYmd, toYmd, preloaded = {}) {
-  const { assets } = preloaded.assets ? { assets: preloaded.assets } : await loadAssets();
-  const capitalizedIds = new Set(assets.map((a) => a.expense_id).filter(Boolean));
-  const [s, ex, inc] = await Promise.all([sessionLedger(fromYmd, toYmd), expenseLedger(fromYmd, toYmd, capitalizedIds), incomeLedger(fromYmd, toYmd)]);
+  // Everything at once: assets, sessions, expenses, income (each is its own query).
+  const assetsP = preloaded.assets ? Promise.resolve({ assets: preloaded.assets }) : (preloaded.assetsP || loadAssets());
+  const capIdsP = assetsP.then(({ assets: a }) => new Set(a.map((x) => x.expense_id).filter(Boolean)));
+  const [{ assets }, s, ex, inc] = await Promise.all([assetsP, sessionLedger(fromYmd, toYmd), expenseLedger(fromYmd, toYmd, capIdsP), incomeLedger(fromYmd, toYmd)]);
   let depreciation = 0; let disposalGain = 0;
   const depByCategory = {};
   for (const a of assets) {
@@ -317,10 +319,11 @@ async function therapistPayouts(asOf) {
 
 /** Balance Sheet as at `asOf`. */
 async function balanceSheet(asOf) {
-  const assetsRes = await loadAssets();
+  const assetsP = loadAssets();
   const { depositedUpTo } = require('../controllers/tdsController');
-  const [pl, manual, rzp, pay, tdsDeposited] = await Promise.all([
-    profitAndLoss(null, asOf, { assets: assetsRes.assets }),
+  const [assetsRes, pl, manual, rzp, pay, tdsDeposited] = await Promise.all([
+    assetsP,
+    profitAndLoss(null, asOf, { assetsP }),
     manualItemsAsOf(asOf),
     razorpayReceivable(asOf),
     therapistPayouts(asOf),

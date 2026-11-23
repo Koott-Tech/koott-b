@@ -62,13 +62,14 @@ const profitLoss = async (req, res) => {
     const to = validDate(req.query.to) ? req.query.to : today;
     if (to < from) return res.status(400).json(errorResponse('"To" date is before "From".'));
     const compare = String(req.query.compare || '') === 'previous';
-    const current = await FS.profitAndLoss(from, to);
-    let previous = null;
-    if (compare) {
-      const [pFrom, pTo] = previousPeriod(from, to);
-      previous = await FS.profitAndLoss(pFrom, pTo);
-    }
-    return res.json(successResponse({ ...current, previous, assets_ready: await FS.tableReady('fixed_assets') }));
+    // This period and the previous one at the same time.
+    const [pFrom, pTo] = compare ? previousPeriod(from, to) : [null, null];
+    const [current, previous, assetsReady] = await Promise.all([
+      FS.profitAndLoss(from, to),
+      compare ? FS.profitAndLoss(pFrom, pTo) : null,
+      FS.tableReady('fixed_assets'),
+    ]);
+    return res.json(successResponse({ ...current, previous, assets_ready: assetsReady }));
   } catch (e) { return fail(res, e, 'Could not build the Profit & Loss.'); }
 };
 

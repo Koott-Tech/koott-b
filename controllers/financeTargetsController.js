@@ -35,9 +35,9 @@ function period(q) {
   return { from, to, months };
 }
 
-async function targetsReady() {
-  const { error } = await supabaseAdmin.from('finance_targets').select('month').limit(1);
-  return !error;
+const { schemaReady } = require('../utils/schemaReady');
+function targetsReady() {
+  return schemaReady('finance_targets', 'month'); // remembered: no round trip per request
 }
 
 async function loadTargets(months) {
