@@ -606,7 +606,13 @@ app.get('/api/public/psychologists/:psychologistId/details', cachePublic(10 * 60
       phd_college: psychologist.phd_college ?? null,
       area_of_expertise: psychologist.area_of_expertise ?? formattedPsychologist.area_of_expertise ?? [],
       specialist_category: psychologist.specialist_category ?? null,
-      better_parent_pricing: psychologist.better_parent_pricing ?? null
+      better_parent_pricing: psychologist.better_parent_pricing ?? null,
+      // The Koott 2.0 profile blocks (SQL 0031). Sent parsed, so the page does not have to
+      // know the stored line format; absent columns simply come back empty.
+      registration_number: psychologist.registration_number ?? null,
+      intro_video_url: psychologist.intro_video_url ?? null,
+      intro_video_thumb: psychologist.intro_video_thumb ?? null,
+      ...require('./utils/profileLists').profileLists(psychologist)
     });
 
     res.json({
