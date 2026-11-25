@@ -4879,6 +4879,56 @@ const switchTherapist = async (req, res) => {
   }
 };
 
+
+/**
+ * GET /clients/refunds — the signed-in client's own refunds, newest first.
+ *
+ * Read-only. The admin side already has /refunds for the whole queue; this one is
+ * scoped to one client so the account area can show "Active refunds: 1" and the
+ * Refunds screen without handing a client anyone else's rows. It returns the few
+ * fields those screens draw, not the whole record.
+ */
+const getClientRefunds = async (req, res) => {
+  try {
+    const clientId = await resolveClientIdForRequest(req);
+    if (!clientId) return res.json(successResponse({ refunds: [] }));
+
+    const { data, error } = await supabaseAdmin
+      .from('refund_requests')
+      .select(`
+        id, session_id, status, currency, amount_paid, amount_suggested, amount_refunded,
+        reason, failure_reason, created_at, updated_at, decided_at, refunded_at,
+        session:sessions(
+          id, scheduled_date, scheduled_time, session_type, status, amount, price,
+          coupon_code, discount_amount, booking_created_at,
+          psychologist:psychologists!sessions_psychologist_id_fkey(id, first_name, last_name, designation, profile_picture_url)
+        )
+      `)
+      .eq('client_id', clientId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching client refunds:', error);
+      return res.status(500).json(errorResponse('Failed to fetch refunds'));
+    }
+    return res.json(successResponse({ refunds: data || [] }));
+  } catch (error) {
+    console.error('Error getting client refunds:', error);
+    return res.status(500).json(errorResponse('Internal server error while fetching refunds'));
+  }
+};
+
+/** The same client lookup the other handlers do, in one place. */
+const resolveClientIdForRequest = async (req) => {
+  if (req.user?.client_id) return req.user.client_id;
+  const { data: byUserId } = await supabaseAdmin
+    .from('clients').select('id').eq('user_id', req.user.id).maybeSingle();
+  if (byUserId?.id) return byUserId.id;
+  const { data: byId } = await supabaseAdmin
+    .from('clients').select('id').eq('id', req.user.id).maybeSingle();
+  return byId?.id || null;
+};
+
 module.exports = {
   getProfile,
   updateProfile,
@@ -4892,6 +4942,7 @@ module.exports = {
   rescheduleSession,
   submitSessionFeedback,
   getClientPackages,
+  getClientRefunds,
   bookRemainingSession,
   requestSessionChange,
   switchTherapist,

@@ -53,6 +53,8 @@ router.put('/assessments/sessions/:assessmentSessionId/reschedule', assessmentBo
 
 // Get client packages
 router.get('/packages', clientController.getClientPackages);
+// The client's own refunds, read-only (the admin queue lives at /refunds).
+router.get('/refunds', clientController.getClientRefunds);
 
 // Payment credit and booking with existing payment
 router.get('/payment-credit/:transactionId', clientController.getPaymentCredit);
