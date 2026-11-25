@@ -66,7 +66,11 @@ async function computeSnapshot() {
     try {
       const days = await getBookableSlots(t.id, from, to, kind);
       const first = days[0]?.slots?.[0];
-      next.set(t.id, first ? { startsAt: first.startsAt, date: days[0].date, time: first.time } : null);
+      // slots = how many free starts are left on that first free day, so a card can say
+      // "Today, 8:25 PM · +2 slots" without asking for the day's slots again.
+      next.set(t.id, first
+        ? { startsAt: first.startsAt, date: days[0].date, time: first.time, slots: days[0].slots.length }
+        : null);
     } catch (err) {
       console.error(`therapist listing: slots unavailable for ${t.id}:`, err.message);
       next.set(t.id, null);
@@ -177,7 +181,11 @@ async function listingOrder(list = 'default') {
   return {
     list,
     patternApplied: applied,
-    order: cards.map(({ therapist }) => ({ id: therapist.id, nextAvailableAt: next.get(therapist.id)?.startsAt || null })),
+    order: cards.map(({ therapist }) => ({
+      id: therapist.id,
+      nextAvailableAt: next.get(therapist.id)?.startsAt || null,
+      slotsOnDay: next.get(therapist.id)?.slots ?? null,
+    })),
   };
 }
 
