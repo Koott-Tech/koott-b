@@ -9,8 +9,10 @@
  *           { found: true, auth, name }  number already on a client: signed in
  *           { attached: true }           signed-in client (Bearer): number saved to them
  *           { found: false }             new visitor: kept as a lead
- *   POST /api/phone-verification/create-account  { phoneToken, name, email, age?, emergency?, psychologistId? }
- *        -> { auth, created }  client account from "About yourself", signed in
+ *   POST /api/phone-verification/create-account
+ *        { phoneToken, name, email, age?, emergency?, gender?, yearOfBirth?, psychologistId? }
+ *        -> { auth, created }  client account from "About yourself" (booking flow) or
+ *                              "A little about you" (the login sheet), signed in
  *
  * Per-IP limits here; per-number limits (resend gap, sends per hour, tries per
  * code) live in the service.
@@ -108,6 +110,9 @@ router.post('/create-account', limiter(10), async (req, res) => {
       email,
       age: req.body?.age,
       emergency: req.body?.emergency,
+      // The login sheet's "A little about you" (migration 0032).
+      gender: req.body?.gender,
+      yearOfBirth: req.body?.yearOfBirth,
       psychologistId: uuidOrNull(req.body?.psychologistId),
       trusted: !isDummyToken(req.body?.phoneToken),
     });

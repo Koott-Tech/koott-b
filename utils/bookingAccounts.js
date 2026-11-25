@@ -161,10 +161,20 @@ async function afterVerified(phone, { signedInUserId = null, psychologistId = nu
  * Create the client account for a verified number from "About yourself" and sign
  * them in. Returns { auth, created } or { conflict: 'email' }.
  */
-async function createAccount({ phone, name, email, age, emergency, psychologistId, trusted = true }) {
+async function createAccount({
+  phone, name, email, age, emergency, gender, yearOfBirth, psychologistId, trusted = true,
+}) {
   const cleanEmail = String(email).trim().toLowerCase();
   const cleanName = String(name).trim().slice(0, 120);
-  const ageNum = Number.isInteger(Number(age)) && Number(age) > 0 && Number(age) < 130 ? Number(age) : null;
+  // The login sheet asks for a year of birth rather than an age (migration 0032); the
+  // booking flow still sends an age. Either one fills `age`, which the rest of the app reads.
+  const thisYear = new Date().getFullYear();
+  const year = Number(yearOfBirth);
+  const birthYear = Number.isInteger(year) && year >= 1900 && year <= thisYear ? year : null;
+  const fromYear = birthYear ? thisYear - birthYear : null;
+  const given = Number.isInteger(Number(age)) && Number(age) > 0 && Number(age) < 130 ? Number(age) : null;
+  const ageNum = given ?? fromYear;
+  const cleanGender = String(gender || '').trim().slice(0, 40) || null;
   const emergencyContact = String(emergency || '').trim().slice(0, 40) || null;
   const leadDetails = {
     name: cleanName, email: cleanEmail, age: ageNum, emergency_contact: emergencyContact,
@@ -217,12 +227,20 @@ async function createAccount({ phone, name, email, age, emergency, psychologistI
     child_age: 1,
     phone_verified_at: now(),
     age: ageNum,
-    emergency_contact: emergencyContact
+    emergency_contact: emergencyContact,
+    gender: cleanGender,
+    year_of_birth: birthYear
   };
   let { data: client, error: clientError } = await supabaseAdmin.from('clients').insert(row).select('*').single();
+  // Before a migration has been run the account is still created, without its columns:
+  // 0032 added gender and year_of_birth, 0010 the three before them.
   if (clientError?.code === 'PGRST204') {
-    const { phone_verified_at, age: _a, emergency_contact, ...base } = row;
-    ({ data: client, error: clientError } = await supabaseAdmin.from('clients').insert(base).select('*').single());
+    const { gender: _g, year_of_birth: _y, ...with0010 } = row;
+    ({ data: client, error: clientError } = await supabaseAdmin.from('clients').insert(with0010).select('*').single());
+    if (clientError?.code === 'PGRST204') {
+      const { phone_verified_at, age: _a, emergency_contact, ...base } = with0010;
+      ({ data: client, error: clientError } = await supabaseAdmin.from('clients').insert(base).select('*').single());
+    }
   }
   if (clientError) {
     await supabaseAdmin.from('users').delete().eq('id', user.id);
