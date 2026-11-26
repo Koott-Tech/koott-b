@@ -204,7 +204,9 @@ const updateProfile = async (req, res) => {
     // HIGH-RISK FIX: Mass assignment protection - explicit allowlist
     // child_name / child_age intentionally NOT in this list — Koott is not a child-focused
     // platform; any such fields in the request body are silently dropped.
-    const allowedFields = ['first_name', 'last_name', 'phone_number'];
+    // client_message is what the booking flow's "Notes to your therapist" sheet
+    // writes: a line the client wants their therapist to read before the session.
+    const allowedFields = ['first_name', 'last_name', 'phone_number', 'client_message'];
     const updateData = {};
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {

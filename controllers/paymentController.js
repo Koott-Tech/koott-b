@@ -1278,6 +1278,11 @@ const createPaymentOrder = async (req, res) => {
           contact: clientPhone || ''
         },
         notes: orderOptions.notes,
+        /* When the slot was held, say until when. The booking flow counts down to
+           this on the payment-failed screen, so "we are holding your slot" is the
+           real hold in slot_locks and not a number on a screen. Null when the
+           hold could not be taken (legacy mode). */
+        slotHeldUntil: slotLockResult?.data?.slot_expires_at || null,
         theme: {
           color: '#3b82f6'
         }
