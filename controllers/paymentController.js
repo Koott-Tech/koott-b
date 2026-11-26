@@ -729,6 +729,8 @@ const createPaymentOrder = async (req, res) => {
       amount, 
       packageId,
       sessionType,
+      sessionMode,
+      sessionPlace,
       clientName,
       clientEmail,
       clientPhone,
@@ -988,7 +990,12 @@ const createPaymentOrder = async (req, res) => {
         clientName: clientName,
         clientEmail: clientEmail,
         couponCode: appliedCoupon ? appliedCoupon.coupon.code : '',
-        clientTimeZone: isValidZone(clientTimeZone) ? clientTimeZone : ''
+        clientTimeZone: isValidZone(clientTimeZone) ? clientTimeZone : '',
+        // How and where the session is held, from the booking flow's "Session
+        // mode" screen. The session row is written when the payment succeeds,
+        // so the answers travel with the order to get there.
+        sessionMode: ['video', 'audio', 'chat'].includes(sessionMode) ? sessionMode : '',
+        sessionPlace: ['online', 'in_person'].includes(sessionPlace) ? sessionPlace : ''
       }
     };
 
@@ -1937,6 +1944,12 @@ const handlePaymentSuccess = async (req, res) => {
       sessionData.package_id = actualPackageId;
     }
 
+    // What the client answered on the "Session mode" screen, carried here on the
+    // order's notes.
+    const orderNotes = paymentRecord?.razorpay_params?.notes || {};
+    if (['video', 'audio', 'chat'].includes(orderNotes.sessionMode)) sessionData.session_mode = orderNotes.sessionMode;
+    if (['online', 'in_person'].includes(orderNotes.sessionPlace)) sessionData.session_place = orderNotes.sessionPlace;
+
     if (sessionData.package_id) {
       const { data: pkgForQuota, error: pkgQuotaErr } = await supabaseAdmin
         .from('packages')
@@ -1988,11 +2001,25 @@ const handlePaymentSuccess = async (req, res) => {
     // Don't add meet data yet - will be added asynchronously
 
     // Try to insert session - if duplicate key error, another request already created it
-    const { data: session, error: sessionError } = await supabaseAdmin
+    let { data: session, error: sessionError } = await supabaseAdmin
       .from('sessions')
       .insert([sessionData])
       .select('*')
       .single();
+
+    /* 0033 adds session_mode and session_place. Until it is run those columns
+       are not there, and a paid booking must never fail over the answer to one
+       screen — so the row goes in without them. */
+    if (sessionError?.code === '42703' && (sessionData.session_mode || sessionData.session_place)) {
+      console.warn('⚠️ sessions.session_mode/session_place missing — run migration 0033; booking without them');
+      delete sessionData.session_mode;
+      delete sessionData.session_place;
+      ({ data: session, error: sessionError } = await supabaseAdmin
+        .from('sessions')
+        .insert([sessionData])
+        .select('*')
+        .single());
+    }
 
     if (sessionError) {
       console.error('❌ Session creation failed:', sessionError);

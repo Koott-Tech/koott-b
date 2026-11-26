@@ -794,7 +794,7 @@ const getSessions = async (req, res) => {
 const bookSession = async (req, res) => {
   try {
     console.log('🚀 Starting session booking process...');
-    const { psychologist_id, package_id, scheduled_date, scheduled_time, price } = req.body;
+    const { psychologist_id, package_id, scheduled_date, scheduled_time, price, session_mode, session_place } = req.body;
 
     // Validate required fields
     if (!psychologist_id || !scheduled_date || !scheduled_time) {
@@ -1061,12 +1061,31 @@ const bookSession = async (req, res) => {
       sessionData.package_id = package_id;
     }
 
+    // How and where the session is held, which the Koott 2.0 booking flow asks
+    // on its "Session mode" screen. Anything else the client sends is ignored.
+    if (['video', 'audio', 'chat'].includes(session_mode)) sessionData.session_mode = session_mode;
+    if (['online', 'in_person'].includes(session_place)) sessionData.session_place = session_place;
+
     // Use supabaseAdmin to bypass RLS (backend has proper auth/authorization)
-    const { data: session, error: sessionError } = await supabaseAdmin
+    let { data: session, error: sessionError } = await supabaseAdmin
       .from('sessions')
       .insert([sessionData])
       .select('*')
       .single();
+
+    /* 0033 adds session_mode and session_place. Until that migration is run the
+       columns are not there, and a booking must not fail over the answer to one
+       screen — so the row goes in without them and the booking goes through. */
+    if (sessionError?.code === '42703' && (sessionData.session_mode || sessionData.session_place)) {
+      console.warn('⚠️ sessions.session_mode/session_place missing — run migration 0033; booking without them');
+      delete sessionData.session_mode;
+      delete sessionData.session_place;
+      ({ data: session, error: sessionError } = await supabaseAdmin
+        .from('sessions')
+        .insert([sessionData])
+        .select('*')
+        .single());
+    }
 
     if (sessionError) {
       console.error('❌ Session creation failed:', sessionError);
